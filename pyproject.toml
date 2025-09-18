@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panic"
+dynamic = ["version"]
+description = "PANIC: Pattern Analysis of Neural Imaging in Conditioning"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Jurjen Heij", email = "jurjenheij@gmail.com" }]
+maintainers = [{ name = "Jurjen Heij", email = "jurjenheij@gmail.com" }]
+keywords = ["neuroimaging", "preprocessing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Topic :: Scientific/Engineering",
+]
+requires-python = ">=3.10"
+
+dependencies = [
+    "lazyfmri @ git+https://github.com/gjheij/lazyfmri.git",
+    "nilearn",
+    "nibabel",
+    "scikit-learn",
+    "numpy",
+    "pandas",
+    "pyyaml",
+    "tqdm",
+    "joblib"
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "flake8"]
+
+[tool.setuptools_scm]
+write_to = "panic/version.py"
+
+[tool.setuptools.packages.find]
+include = ["panic*"]
+
+[tool.setuptools.package-data]
+panic = ["config.yml"]
+
+[project.scripts]
+panic = "panic.cli:main"

@@ -1,0 +1,67 @@
+label_dict:
+  CS-: 0
+  CS+_noUCS: 1
+
+# roi_dict:
+#   lateral: [7001]
+#   basal: [7003]
+#   central: [7005]
+#   medial: [7006]
+#   total: [7001, 7003, 7005, 7006]
+
+roi_dict: "/mnt/d/fMRI/HRA/sourcedata/sub-017/struct/masks/nifti"
+general_settings:
+  project_dir: "/mnt/d/fMRI/HRA"
+  save_dir: "/mnt/d/fMRI/HRA/derivatives/decoding"
+  # save_dir: "/tmp/decoding"
+  method: lss
+  source: stglm
+  n_jobs: 10                                   # this one actually parallizes
+  standardize: zscore
+
+fitted_derivative: false
+
+decoding_settings:
+  n_permutations: 10000
+  fold_interval: 3
+  variance_threshold: 1e-12
+
+  # Pipeline settings: DO NOT CHANGE THE HEADER NAMES ('SCALER', 'CV', 'ESTIMATOR', etc)
+  # preprocessing
+  scaler:
+    name: StandardScaler
+    args:
+      with_mean: true
+      with_std: true
+
+  # select test/training labels
+  cv:
+    name: StratifiedKFold
+    args:
+      n_splits: 3
+      shuffle: False
+
+  # estimator
+  estimator:
+    name: SVC
+    args:
+      C: 1
+      kernel: linear
+      class_weight: balanced
+
+  # select features (e.g., percentile or SelectKBest)
+  feature_selection:
+    name: SelectPercentile
+    args:
+      percentile: 20                            # make sure this plays nice with line 47
+      score_func: f_classif
+
+  # grid search
+  gridsearch:
+    name: GridSearchCV
+    args:
+      param_grid:
+        select__percentile: [10, 20, 40, 100]
+        clf__C: [0.01, 0.1, 1, 10]
+      scoring: balanced_accuracy                # https://scikit-learn.org/stable/modules/model_evaluation.html#scoring-string-names
+      n_jobs: 1                                 # keep this at 1 to avoid nesting
