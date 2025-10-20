@@ -1,42 +1,49 @@
 label_dict:
-  CS-: 0
-  CS+_noUCS: 1
+  face: 0     # class 1
+  house: 1    # class 2
 
-# roi_dict:
-#   lateral: [7001]
-#   basal: [7003]
-#   central: [7005]
-#   medial: [7006]
-#   total: [7001, 7003, 7005, 7006]
-
-roi_dict: "/mnt/d/fMRI/HRA/sourcedata/sub-017/struct/masks/nifti"
+roi_dict: <some nifti file or path with nifti files>
 general_settings:
-  project_dir: "/mnt/d/fMRI/HRA"
-  save_dir: "/mnt/d/fMRI/HRA/derivatives/decoding"
-  # save_dir: "/tmp/decoding"
-  method: lss
-  source: stglm
-  n_jobs: 10                                   # this one actually parallizes
-  standardize: zscore
+  project_dir: <path to project root>
+  save_dir: <some output folder>
+  method: LSA                 # or LSS, if you have GLMsingle: use 'lss', 'lsa'
+  source: halfpipe            # or 'stglm', 'glmsingle'
+  standardize: zscore         # best to keep this
 
 fitted_derivative: false
 
 decoding_settings:
-  n_permutations: 10000
-  fold_interval: 3
-  variance_threshold: 1e-12
+  fold_interval: 3            # if not LORO/LOSO, iterate over labels
+  n_permutations: 250         # permutations for ROI-decoding/searchlight
+  early_stop_alpha: 0.05      # enable early stopping
+  early_stop_batch: 32        # check after X permutations if significance can be reached
+  variance_threshold: 1e-12   # avoid flat time series
+  permute_both_sets: false    # false: only permute training labels
+  permute_within_groups: true # true: LOSO/LORO set up; see 'outer_cv'
+
+  parallel:
+    n_jobs: 1                 # this one actually parallizes over permutations/batches
+    batch_size: 16            # batch size Parallel process
+    backend: "loky"           # backend for Parallel process
+    prefer: "processes"       # preference for Parallel process
+    verbose: 0                # verbosity of Parallel process
 
   # Pipeline settings: DO NOT CHANGE THE HEADER NAMES ('SCALER', 'CV', 'ESTIMATOR', etc)
-  # preprocessing
+  # preprocessing | if 'standardize' is null
   scaler:
     name: StandardScaler
     args:
       with_mean: true
       with_std: true
 
+  # outer cv
+  outer_cv:
+    name: LeaveOneGroupOut
+    args: {}
+
   # select test/training labels
   cv:
-    name: StratifiedKFold
+    name: StratifiedGroupKFold
     args:
       n_splits: 3
       shuffle: False
@@ -53,7 +60,7 @@ decoding_settings:
   feature_selection:
     name: SelectPercentile
     args:
-      percentile: 20                            # make sure this plays nice with line 47
+      percentile: 5
       score_func: f_classif
 
   # grid search
@@ -61,7 +68,13 @@ decoding_settings:
     name: GridSearchCV
     args:
       param_grid:
-        select__percentile: [10, 20, 40, 100]
+        select__percentile: [10, 20, 40, 100] # see 'feature_selection'
         clf__C: [0.01, 0.1, 1, 10]
-      scoring: balanced_accuracy                # https://scikit-learn.org/stable/modules/model_evaluation.html#scoring-string-names
-      n_jobs: 1                                 # keep this at 1 to avoid nesting
+      scoring: balanced_accuracy
+      n_jobs: 1               # keep this at 1 to avoid nesting
+
+  searchlight:
+    alpha: 0.05               # value for FDR correction
+    radius_mm: 10             # radius around center
+    locked:                   # no gridsearch within searchlight..
+      clf__C: 1.0

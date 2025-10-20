@@ -2,10 +2,10 @@ from panic.utils import get_config_path
 from panic.decode import ClassifySubject
 
 
-def test_panic():
+def test_groups():
 
     cfg_file = get_config_path()
-    subject = "sub-017"
+    subject = "sub-1"
     decoder = ClassifySubject(
         subject,
         cfg_file,

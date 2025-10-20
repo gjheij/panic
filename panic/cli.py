@@ -185,7 +185,8 @@ def action_run(args):
         decoder = ClassifySubject(
             subj,
             str(cfg_to_use),
-            save_imgs=args.save_imgs
+            save_imgs=args.save_imgs,
+            searchlight=args.searchlight
         )
 
         decoder._fit()
@@ -251,6 +252,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--save-imgs",
         action='store_true',
         help="Save the resampled masks as new nifti files ('_desc-resampled.nii.gz' is appended)", 
+        required=False
+    )    
+
+    sp.add_argument(
+        "--searchlight",
+        action='store_true',
+        help="Run a searchlight analysis (see subsection 'searchlight' in config file)", 
         required=False
     )    
 

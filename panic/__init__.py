@@ -39,6 +39,8 @@ from . import utils
 from . import decode
 from . import simulate
 from . import noise
+from . import searchlight
+from . import factory
 
 __all__ = [
     "data",
@@ -46,5 +48,7 @@ __all__ = [
     "logger",
     "utils",
     "simulate",
-    "noise"
+    "noise",
+    "searchlight",
+    "factory"
 ]

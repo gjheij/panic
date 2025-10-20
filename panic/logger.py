@@ -31,7 +31,10 @@ def get_logger(name="PANIC", level=logging.INFO, use_tqdm=True, logfile=None):
 
     if not logger.handlers:
         handler = TqdmSafeHandler() if use_tqdm else logging.StreamHandler()
-        fmt = logging.Formatter("[%(levelname)s] %(name)s - %(message)s")
+        fmt = logging.Formatter(
+            "[%(asctime)s] [%(levelname)s] %(name)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
         handler.setFormatter(fmt)
         logger.addHandler(handler)
 

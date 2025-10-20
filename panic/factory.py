@@ -229,6 +229,10 @@ def selector_from_config(cfg, estimator_factory=None, *, task=None, random_state
         args:
           estimator: { name: LinearSVC, args: { C: 1.0, dual: false } }
     """
+
+    if not cfg:
+        return None
+        
     name = cfg.get("name", "SelectKBest")
     if name not in _FS_REGISTRY:
         raise ValueError(f"Unknown feature selector '{name}'. Allowed: {sorted(_FS_REGISTRY)}")
