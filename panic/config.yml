@@ -2,10 +2,10 @@ label_dict:
   face: 0     # class 1
   house: 1    # class 2
 
-roi_dict: <some nifti file or path with nifti files>
+roi_dict: "/mnt/d/fMRI/Development/Haxby/derivatives/rois/sub-1/sub-1_task-objectviewing_roi-vt.nii.gz"
 general_settings:
-  project_dir: <path to project root>
-  save_dir: <some output folder>
+  project_dir: "/mnt/d/fMRI/logs/halfpipe/Haxby"
+  save_dir: "/tmp/haxby_searchlight"
   method: LSA                 # or LSS, if you have GLMsingle: use 'lss', 'lsa'
   source: halfpipe            # or 'stglm', 'glmsingle'
   standardize: zscore         # best to keep this
@@ -14,7 +14,7 @@ fitted_derivative: false
 
 decoding_settings:
   fold_interval: 3            # if not LORO/LOSO, iterate over labels
-  n_permutations: 250         # permutations for ROI-decoding/searchlight
+  n_permutations: 10         # permutations for ROI-decoding/searchlight
   early_stop_alpha: 0.05      # enable early stopping
   early_stop_batch: 32        # check after X permutations if significance can be reached
   variance_threshold: 1e-12   # avoid flat time series

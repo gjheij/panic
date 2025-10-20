@@ -63,12 +63,71 @@ general_settings:
   n_jobs: 10
 
 decoding_settings:
-  param_grid:
-    "select__k": [100, 200, 300, "all"]
-    "svc__C": [0.01, 0.1, 1, 10]
-  internal_folds: 3
-  internal_interval: 3
-  n_permutations: 1000
+  fold_interval: 3            # if not LORO/LOSO, iterate over labels
+  n_permutations: 10         # permutations for ROI-decoding/searchlight
+  early_stop_alpha: 0.05      # enable early stopping
+  early_stop_batch: 32        # check after X permutations if significance can be reached
+  variance_threshold: 1e-12   # avoid flat time series
+  permute_both_sets: false    # false: only permute training labels
+  permute_within_groups: true # true: LOSO/LORO set up; see 'outer_cv'
+
+  parallel:
+    n_jobs: 1                 # this one actually parallizes over permutations/batches
+    batch_size: 16            # batch size Parallel process
+    backend: "loky"           # backend for Parallel process
+    prefer: "processes"       # preference for Parallel process
+    verbose: 0                # verbosity of Parallel process
+
+  # Pipeline settings: DO NOT CHANGE THE HEADER NAMES ('SCALER', 'CV', 'ESTIMATOR', etc)
+  # preprocessing | if 'standardize' is null
+  scaler:
+    name: StandardScaler
+    args:
+      with_mean: true
+      with_std: true
+
+  # outer cv
+  outer_cv:
+    name: LeaveOneGroupOut
+    args: {}
+
+  # select test/training labels
+  cv:
+    name: StratifiedGroupKFold
+    args:
+      n_splits: 3
+      shuffle: False
+
+  # estimator
+  estimator:
+    name: SVC
+    args:
+      C: 1
+      kernel: linear
+      class_weight: balanced
+
+  # select features (e.g., percentile or SelectKBest)
+  feature_selection:
+    name: SelectPercentile
+    args:
+      percentile: 5
+      score_func: f_classif
+
+  # grid search
+  gridsearch:
+    name: GridSearchCV
+    args:
+      param_grid:
+        select__percentile: [10, 20, 40, 100] # see 'feature_selection'
+        clf__C: [0.01, 0.1, 1, 10]
+      scoring: balanced_accuracy
+      n_jobs: 1               # keep this at 1 to avoid nesting
+
+  searchlight:
+    alpha: 0.05               # value for FDR correction
+    radius_mm: 10             # radius around center
+    locked:                   # no gridsearch within searchlight..
+      clf__C: 1.0
 ```
 
 # Command-line usage
@@ -106,25 +165,29 @@ panic run ... --set general_settings.project_dir=/some/other/path
 Example shell script:
 
 ```bash
-subjs=("015" "016" "017" "018" "019" "020" "021" "022")
-sources=("stglm")  # or: "glmsingle"
-methods=("lsa" "lss")
+subjs=$(seq 1 6)
+sources=("halfpipe") # "glmsingle" "stglm")
+methods=("LSA")
 
-proj_dir="/mnt/d/fMRI/HRA"
-work_dir="${DIR_LOGS}"
+# proj_dir="/mnt/d/fMRI/HRA"
+proj_dir="/mnt/d/fMRI/Development/Haxby"
+work_dir="${proj_dir}/logs"
 mkdir -p "${work_dir}" 2>/dev/null
 n_cpus=4
+searchlight=1
+# src="glmsingle"
+# method="lsa" # for GLMsingle, 'lsa' denotes model D
 
-# Default keys
+# default settings
 set_keys=(
     general_settings.project_dir="${proj_dir}"
     general_settings.save_dir="${proj_dir}/derivatives/decoding"
     general_settings.n_jobs="${n_cpus}"
 )
 
-for src in "${sources[@]}"; do
-    for method in "${methods[@]}"; do
-        for subID in "${subjs[@]}"; do
+for src in ${sources[@]}; do
+    for method in ${methods[@]}; do
+        for subID in ${subjs[@]}; do
             job=$(
                 decide_job_type \
                 "panic" \
@@ -135,11 +198,18 @@ for src in "${sources[@]}"; do
                 "main"
             )
 
+            # use 'panic run --help' for more
             use_keys=(
-                "${set_keys[@]}"
+                ${set_keys[@]}
                 general_settings.source="${src}"
                 general_settings.method="${method}"
-                roi_dict="${DIR_DATA_SOURCE}/sub-${subID}/struct/masks/nifti"
+            )
+
+            # to use DB's manual masks:
+            bold_mask=$(find ${proj_dir}/derivatives/fmriprep/sub-${subID}/anat -type f -name "*brain_mask.nii.gz" -and -not -name "*space-*")
+            use_keys+=(
+                # roi_dict="${DIR_DATA_SOURCE}/sub-${subID}/struct/masks/nifti"
+                roi_dict="${bold_mask}"
             )
 
             cmd=(
@@ -147,9 +217,14 @@ for src in "${sources[@]}"; do
                 run
                 --subject "sub-${subID}"
                 --set "${use_keys[@]}"
+                # --save-imgs
             )
 
-            eval "${cmd[@]}"
+            if [[ ${searchlight} -eq 1 ]]; then
+                cmd+=(--searchlight)
+            fi
+
+            eval ${cmd[@]}
         done
     done
 done

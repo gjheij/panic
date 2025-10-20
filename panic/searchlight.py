@@ -280,96 +280,6 @@ def _neighbors_ball_mm(zooms, r_mm):
     return np.asarray(offs, dtype=int)
 
 
-def _folds_for_labels(cfg, labels, groups=None):
-    """
-    Generate outer cross-validation folds for decoding, mirroring the ROI path
-    behavior while supporting both group-based and legacy split schemes.
-
-    Depending on the decoding configuration, this function either:
-    
-    - Uses a configured cross-validation splitter (e.g., StratifiedKFold, LeaveOneGroupOut)
-      if ``permute_within_groups=True`` in ``cfg``; or
-    - Falls back to a legacy deterministic scheme that selects every *k*-th
-      trial within each class as the test set.
-
-    :param dict cfg:
-        Decoding settings dictionary. Expected keys include:
-        
-        * ``"permute_within_groups"`` – bool indicating whether to use group-aware CV.
-        * ``"outer_cv"`` – configuration passed to :func:`factory.cv_from_config`
-          (only used when ``permute_within_groups=True``).
-        * ``"fold_interval"`` – integer specifying the interval for legacy
-          “every-third” folding (used when ``permute_within_groups=False``).
-    :param array_like labels:
-        Label vector of shape ``(n_samples,)`` containing class assignments.
-        Must contain binary or categorical values.
-    :param array_like groups:
-        Optional group labels of shape ``(n_samples,)`` used when
-        group-aware cross-validation is enabled (e.g., runs or subjects).
-
-    :returns:
-        A list of tuples ``(train_idx, test_idx)``, where each element contains
-        the integer indices for the training and test sets of one outer fold.
-    :rtype:
-        list[tuple[numpy.ndarray, numpy.ndarray]]
-
-    **Behavior**
-        - If ``permute_within_groups=True``:
-          - Uses :func:`factory.cv_from_config(cfg["outer_cv"])`
-            to instantiate a cross-validation splitter.
-          - Generates folds by calling ``split(dummy_X, labels, groups)`` where
-            ``dummy_X`` is a placeholder array (since most splitters ignore features).
-        - If ``permute_within_groups=False``:
-          - Implements the legacy “every *k*-th within-class” strategy:
-            samples in each class are partitioned such that every *k*-th
-            sample (as determined by ``fold_interval``) is assigned to the
-            test set in one fold.
-          - Training indices are the complement of test indices.
-
-    **Example**
-        .. code-block:: python
-
-            cfg = {
-                "permute_within_groups": True,
-                "outer_cv": {"type": "LeaveOneGroupOut"}
-            }
-            folds = _folds_for_labels(cfg, labels, groups=runs)
-            print(f"{len(folds)} outer folds generated")
-
-        .. code-block:: python
-
-            # Legacy "every third" fallback
-            cfg = {"permute_within_groups": False, "fold_interval": 3}
-            folds = _folds_for_labels(cfg, labels)
-            print(len(folds))  # → 3
-
-    .. note::
-       - When using the legacy folding mode, the labels are assumed to be
-         binary and balanced across classes.
-       - The group-aware path provides compatibility with the ROI decoding
-         configuration logic (via :func:`factory.cv_from_config`).
-       - The “every-third” approach ensures that each sample appears once
-         in the test set across all folds, similar to manual k-fold CV.
-    """
-
-    if cfg.get("permute_within_groups"):
-        outer = factory.cv_from_config(cfg["outer_cv"])
-        dummy_X = np.zeros_like(labels)  # not used by splitter
-        folds = [(tr, te) for tr, te in outer.split(dummy_X, labels, groups)]
-    else:
-        # legacy “every third within class” (your define_folds)
-        labs = np.asarray(labels)
-        n_trials = len(labs)
-        z_idx = np.where(labs == 0)[0]
-        o_idx = np.where(labs == 1)[0]
-        folds = []
-        k = int(cfg["fold_interval"])
-        for off in range(k):
-            te = np.concatenate([z_idx[off::k], o_idx[off::k]])
-            tr = np.setdiff1d(np.arange(n_trials), te)
-            folds.append((tr, te))
-    return folds
-
 def _one_center(
     center_ijk,
     offsets,
@@ -713,7 +623,7 @@ def permutation_searchlight(
     centers = np.column_stack(np.where(col_index_vol >= 0))  # shape (N, 3)
 
     # 2) folds exactly like your ROI path
-    folds = _folds_for_labels(cfg, y, groups)
+    folds = utils._folds_for_labels(cfg, y, groups)
 
     # 3) memmap X once
     tmpdir = os.path.expanduser(tmpdir)
