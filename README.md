@@ -229,3 +229,67 @@ for src in ${sources[@]}; do
     done
 done
 ```
+
+# Configuration of `scikit-learn`-pipelines
+
+Because `scikit-learn` is so consistent with its I/O, we can use the configuration file to flexibly generate decoding/classification pipelines.
+However, the metric that is ultimately used for classification is the delta value between the observed and permutation-derived null-distribution by permuting the labels a bunch of times.
+This procedure will be performed regardless of method-of-choice.
+If you are only interested in the observed accuracy, you could set the permutations to a small number.
+Below, I highlight several classifiers that are supported by `panic`:
+
+> [!NOTE]
+> The package has been built around ``SVM``. The other implementations have not been thoroughly tested.
+> It basically rests on sklearn's I/O consistency.
+> Please open an issue in case you encounter problems.
+
+## Linear classifiers
+
+| Classifier                           | [factory](panic/factory.py) name              | Best for                                | Notes / Typical config                                                          |
+| ------------------------------------ | ------------------------------ | --------------------------------------- | ------------------------------------------------------------------------------- |
+| **[LogisticRegression](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.LogisticRegression.html)**               | `"LogisticRegression"`         | Standard binary/multiclass decoding     | Robust and interpretable; use `penalty='l2'` or `'elasticnet'`, `solver='saga'` |
+| **[LinearDiscriminantAnalysis (LDA)](https://scikit-learn.org/stable/modules/generated/sklearn.discriminant_analysis.LinearDiscriminantAnalysis.html)** | `"LinearDiscriminantAnalysis"` | ROI & searchlight decoding              | Fast, stable; use `solver='lsqr', shrinkage='auto'` for p≫n                     |
+| **[RidgeClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.RidgeClassifier.html)**                  | `"RidgeClassifier"`            | fMRI decoding (multivariate, linear)    | Equivalent to L2-logistic regression but faster                                 |
+| **[SGDClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDClassifier.html)**                    | `"SGDClassifier"`              | Large datasets or regularization sweeps | Supports `loss='hinge'`, `'log_loss'`, `'modified_huber'`                       |
+| **[LinearSVC](https://scikit-learn.org/stable/modules/generated/sklearn.svm.LinearSVC.html)**                        | `"LinearSVC"`                  | Common in searchlight decoding          | Often used with `C=1`, `dual=False` if n_samples > n_features                   |
+
+## Kernel & non-linear classifiers
+
+| Classifier                               | [factory](panic/factory.py) name             | Best for                      | Notes / Typical config                                               |
+| ---------------------------------------- | ----------------------------- | ----------------------------- | -------------------------------------------------------------------- |
+| **[SVC](https://scikit-learn.org/stable/modules/generated/sklearn.svm.SVC.html)** (RBF kernel)                     | `"SVC"`                       | Nonlinear decision boundaries | Slow on high-dim fMRI, but fine for ROI-level decoding               |
+| **[GaussianProcessClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.gaussian_process.GaussianProcessClassifier.html)**            | `"GaussianProcessClassifier"` | Small datasets                | Probabilistic output; interpretable kernel-based                     |
+| **[RandomForestClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.RandomForestClassifier.html)**               | `"RandomForestClassifier"`    | ROI-level decoding            | Handles nonlinearities; robust to noise, but slower for permutations |
+| **[GradientBoostingClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.GradientBoostingClassifier.html) / XGBoost** | (you can add)                 | Nonlinear decoding            | Better performance on structured ROI data; slower for searchlight    |
+| **[KNeighborsClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.neighbors.KNeighborsClassifier.html)**                 | `"KNeighborsClassifier"`      | Small, low-dimensional ROIs   | Parameter-free, but not great for high-dim voxel patterns            |
+
+## Sparse / feature-selection–oriented
+
+| Classifier                                           | Module   | Benefit                    | Notes                                                         |
+| ---------------------------------------------------- | -------- | -------------------------- | ------------------------------------------------------------- |
+| **[LogisticRegressionCV](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.LogisticRegressionCV.html)**                             | sklearn  | built-in CV for C tuning   | Helps control sparsity in high-dim ROI                        |
+| **Lasso (L1) LogisticRegression**                    | sklearn  | feature sparsity           | Use `penalty='l1'`, `solver='saga'`; yields sparse brain maps |
+| **[ElasticNetCV](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.ElasticNetCV.html)**                                     | sklearn  | L1+L2 mixed regularization | Good middle ground for interpretability vs. accuracy          |
+
+4. Probabilistic and Bayesian options
+
+| Classifier                                | Source               | Strength                         | Comment                                           |
+| ----------------------------------------- | -------------------- | -------------------------------- | ------------------------------------------------- |
+| **[NaiveBayes (GaussianNB)](https://scikit-learn.org/stable/modules/generated/sklearn.naive_bayes.GaussianNB.html)**               | sklearn              | very fast baseline               | OK for sanity checks; poor with correlated voxels |
+| **[BayesianRidgeClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.BayesianRidge.html)**               | sklearn.linear_model | stable under small samples       | slower but provides uncertainty estimates         |
+| **LogisticRegressionCV with refit=False** | sklearn              | yields probability distributions | integrates well with permutation inference        |
+
+The following aliases are supported:
+
+```python
+_ALIASES = {
+    "SVM": "SVC",
+    "LinearSVM": "LinearSVC",
+    "LR": "LogisticRegression",
+    "LDA": "LinearDiscriminantAnalysis",
+    "QDA": "QuadraticDiscriminantAnalysis",
+    "RF": "RandomForestClassifier",
+    "ET": "ExtraTreesClassifier",
+    "GPC": "GaussianProcessClassifier",
+}
+```

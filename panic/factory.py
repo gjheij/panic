@@ -15,6 +15,30 @@ from sklearn.preprocessing import (
     StandardScaler, MinMaxScaler, RobustScaler, MaxAbsScaler,
     QuantileTransformer, PowerTransformer, Normalizer
 )
+
+from sklearn.discriminant_analysis import (
+    LinearDiscriminantAnalysis,
+    QuadraticDiscriminantAnalysis
+)
+
+from sklearn.naive_bayes import (
+    GaussianNB,
+    BernoulliNB,
+    MultinomialNB
+)
+
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    AdaBoostClassifier, 
+    BaggingClassifier
+)
+
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.neural_network import MLPClassifier
+
 from sklearn import svm, linear_model, ensemble
 from sklearn.calibration import CalibratedClassifierCV
 import inspect
@@ -51,14 +75,41 @@ _ESTIMATOR_REGISTRY = {
     "SVR": svm.SVR,
     "LinearSVR": svm.LinearSVR,
 
-    # Common classifiers
+    # Linear / generalized linear classifiers
     "LogisticRegression": linear_model.LogisticRegression,
     "LogisticRegressionCV": linear_model.LogisticRegressionCV,
-    "SGDClassifier": linear_model.SGDClassifier,
     "RidgeClassifier": linear_model.RidgeClassifier,
-    "RandomForestClassifier": ensemble.RandomForestClassifier,
+    "SGDClassifier": linear_model.SGDClassifier,
+    "Perceptron": linear_model.Perceptron,
+    "PassiveAggressiveClassifier": linear_model.PassiveAggressiveClassifier,
 
-    # Common regressors
+    # Discriminant analysis
+    "LinearDiscriminantAnalysis": LinearDiscriminantAnalysis,
+    "QuadraticDiscriminantAnalysis": QuadraticDiscriminantAnalysis,
+
+    # Naive Bayes
+    "GaussianNB": GaussianNB,
+    "BernoulliNB": BernoulliNB,
+    "MultinomialNB": MultinomialNB,
+
+    # Neighbors
+    "KNeighborsClassifier": KNeighborsClassifier,
+
+    # Trees & ensembles
+    "DecisionTreeClassifier": DecisionTreeClassifier,
+    "RandomForestClassifier": ensemble.RandomForestClassifier,
+    "ExtraTreesClassifier": ExtraTreesClassifier,
+    "GradientBoostingClassifier": GradientBoostingClassifier,
+    "AdaBoostClassifier": AdaBoostClassifier,
+    "BaggingClassifier": BaggingClassifier,
+
+    # Gaussian Process
+    "GaussianProcessClassifier": GaussianProcessClassifier,
+
+    # Neural nets
+    "MLPClassifier": MLPClassifier,
+
+    # Regressors you already expose
     "RandomForestRegressor": ensemble.RandomForestRegressor,
 }
 
@@ -90,8 +141,14 @@ _SCORE_FUNCS = {
 
 # Optional: simple aliases
 _ALIASES = {
-    "SVM": "SVC",           # "SVM" -> SVC by default
-    "LinearSVM": "LinearSVC"
+    "SVM": "SVC",
+    "LinearSVM": "LinearSVC",
+    "LR": "LogisticRegression",
+    "LDA": "LinearDiscriminantAnalysis",
+    "QDA": "QuadraticDiscriminantAnalysis",
+    "RF": "RandomForestClassifier",
+    "ET": "ExtraTreesClassifier",
+    "GPC": "GaussianProcessClassifier",
 }
 
 def scaler_from_config(cfg: dict | None):
@@ -232,7 +289,6 @@ def selector_from_config(cfg, estimator_factory=None, *, task=None, random_state
 
     if not cfg:
         return None
-        
     name = cfg.get("name", "SelectKBest")
     if name not in _FS_REGISTRY:
         raise ValueError(f"Unknown feature selector '{name}'. Allowed: {sorted(_FS_REGISTRY)}")
