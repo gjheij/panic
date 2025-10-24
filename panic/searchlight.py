@@ -657,7 +657,7 @@ def permutation_searchlight(
             groups=groups,
             n_perms=n_perms,
             seed=int(center_seeds[ix]),
-            locked_params=locked_params,
+            locked=locked_params,
             searchlight=True,
             save_dir=save_dir,
             **kwargs
