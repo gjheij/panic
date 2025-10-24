@@ -20,6 +20,7 @@ decoding_settings:
   variance_threshold: 1e-12   # avoid flat time series
   permute_both_sets: false    # false: only permute training labels
   permute_within_groups: true # true: LOSO/LORO set up; see 'outer_cv'
+  scoring: balanced_accuracy  # scoring metric for decoder
 
   parallel:
     n_jobs: 1                 # this one actually parallizes over permutations/batches
@@ -60,7 +61,7 @@ decoding_settings:
   feature_selection:
     name: SelectPercentile
     args:
-      percentile: 5
+      percentile: 10
       score_func: f_classif
 
   # grid search
@@ -70,7 +71,6 @@ decoding_settings:
       param_grid:
         select__percentile: [10, 20, 40, 100] # see 'feature_selection'
         clf__C: [0.01, 0.1, 1, 10]
-      scoring: balanced_accuracy
       n_jobs: 1               # keep this at 1 to avoid nesting
 
   searchlight:
