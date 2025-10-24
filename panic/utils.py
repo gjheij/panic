@@ -40,79 +40,83 @@ def dump_yaml(data: Dict[str, Any], path: Path) -> None:
         yaml.safe_dump(data, f, sort_keys=False)
 
 
-
 def recon_contribution(roi, lin_roi, contrib_path, output_file=None):
     """
     Reconstruct per-trial and mean contribution maps into a 4D NIfTI image.
 
-    This function takes voxelwise contribution values (e.g., classifier weights ×
-    activation values) from a decoding analysis and reprojects them into the
-    3D space of an ROI or brain mask. It outputs a 4D image with one volume per
-    trial and an additional final volume representing the mean contribution map
-    across all trials.
+    This function takes a matrix of per-trial voxel contributions (e.g., model
+    weights × activations) defined over an ROI and projects them back into the
+    3D image space of a reference NIfTI. It returns (or saves) a 4D image with
+    one volume per trial plus a final volume that is the voxelwise mean across
+    trials.
 
-    :param str | nibabel.Nifti1Image roi:
-        Reference NIfTI image or file path defining spatial dimensions and affine.
-        Typically the ROI mask or the beta image from which voxel indices were derived.
-    :param str lin_roi:
-        Path to a ``.npy`` file containing the **linear voxel indices** of the ROI.
-        These indices must correspond exactly to the columns of the contribution array.
-    :param str contrib_path:
-        Path to a ``.npy`` file containing the per-trial contributions matrix with shape
-        ``(n_trials, n_voxels_in_roi)``.
-    :param str | None output_file:
-        Optional file path to save the reconstructed 4D NIfTI image.  
-        If ``None``, the function returns a :class:`nibabel.Nifti1Image` object instead.
+    Parameters
+    ----------
+    roi : str or nibabel.Nifti1Image
+        Reference image (or path to it) that supplies the target spatial shape
+        and affine. Typically an ROI mask or a reference beta/mean image.
+        Only ``img.shape[:3]`` and ``img.affine`` are used.
+    lin_roi : str
+        Path to a ``.npy`` file containing the **linear voxel indices** (1D) of
+        the ROI in the reference image. These indices must match the column
+        order of ``contrib`` and assume **NumPy C-order raveling**
+        (i.e., consistent with ``np.ravel`` / ``reshape(..., order='C')``).
+    contrib_path : str
+        Path to a ``.npy`` file with shape ``(n_trials, n_voxels_in_roi)`` containing
+        per-trial contribution values. A 1D array of shape ``(n_voxels_in_roi,)`` is
+        also accepted and will be treated as a single trial.
+    output_file : str or None, optional
+        If provided, the reconstructed 4D NIfTI is written to this path and the
+        function returns ``None``. If ``None`` (default), a
+        :class:`nibabel.Nifti1Image` is returned instead.
 
-    :returns:
-        The 4D reconstructed contribution image (if ``output_file`` is ``None``),
-        otherwise ``None`` after saving to disk.
+    Returns
+    -------
+    img4d : nibabel.Nifti1Image or None
+        If ``output_file`` is ``None``, returns a NIfTI image with shape
+        ``(X, Y, Z, n_trials + 1)`` where the last volume is the mean across
+        trials. If ``output_file`` is set, returns ``None`` after saving.
 
-        The output image has shape ``(X, Y, Z, n_trials + 1)``, where the final
-        volume corresponds to the voxelwise average across all trials.
-    :rtype:
-        nibabel.Nifti1Image or None
+    Notes
+    -----
+    - Linear indices in ``lin_roi`` must reference the flattened reference grid
+      in **C-order** (as produced by ``np.ravel``). If your indices were created
+      with Fortran-order or a different flattening convention, the reconstruction
+      will be spatially misaligned.
+    - The output affine is copied from the reference image. The reference header
+      is not propagated; modify as needed before saving if header fields matter.
+    - Inputs are loaded via :func:`numpy.load` and must be saved as ``.npy``.
+    - A copy-safe path is used: the function allocates a zero-filled 1D buffer
+      per volume, assigns ROI values by index, then reshapes to 3D.
 
-    **Computation Details**
-        - Loads the ROI reference to determine the target 3D spatial shape and affine.
-        - Loads ROI voxel indices and the contribution matrix.
-        - Reconstructs one 3D map per trial by inserting contribution values into the
-          corresponding ROI voxels.
-        - Computes the mean contribution map and appends it as the final volume.
-        - Assembles all volumes into a 4D NIfTI image.
-        - Optionally saves the result to disk if ``output_file`` is provided.
+    Examples
+    --------
+    Return an in-memory 4D image:
 
-    **Example**
-        .. code-block:: python
+    >>> img = recon_contribution(
+    ...     roi="roi_mask.nii.gz",
+    ...     lin_roi="roi_linidx.npy",
+    ...     contrib_path="sub-01_contrib.npy"
+    ... )
+    >>> import nibabel as nib
+    >>> nib.save(img, "sub-01_contrib_4d.nii.gz")
 
-            img = recon_contribution(
-                roi="roi_mask.nii.gz",
-                lin_roi="roi_linidx.npy",
-                contrib_path="sub-01_contrib.npy"
-            )
-            nib.save(img, "sub-01_contrib_4d.nii.gz")
+    Save directly to disk:
 
-        .. code-block:: python
+    >>> recon_contribution(
+    ...     roi="roi_mask.nii.gz",
+    ...     lin_roi="roi_linidx.npy",
+    ...     contrib_path="sub-01_contrib.npy",
+    ...     output_file="sub-01_contrib_4d.nii.gz"
+    ... )
 
-            # Direct save mode
-            recon_contribution(
-                roi="roi_mask.nii.gz",
-                lin_roi="roi_linidx.npy",
-                contrib_path="sub-01_contrib.npy",
-                output_file="sub-01_contrib_4d.nii.gz"
-            )
-
-    .. note::
-       - The ROI linear indices must exactly match the voxel order used when
-         generating the contributions.
-       - The function ensures at least 2D input for single-trial contributions.
-       - The final 4th dimension is ordered as ``[trial_1, trial_2, ..., mean]``.
-       - The affine and header are copied from the ROI reference image.
-       - Designed for visualizing spatial contribution patterns in fMRI decoding.
+    See Also
+    --------
+    numpy.ravel, numpy.reshape
+    nibabel.Nifti1Image
     """
 
-
-    # --- load reference image ---
+    # load reference image ---
     if isinstance(roi, str):
         img = nib.load(roi)
     elif isinstance(roi, nib.Nifti1Image):
@@ -123,7 +127,7 @@ def recon_contribution(roi, lin_roi, contrib_path, output_file=None):
     affine = img.affine
     roi_shape = img.shape[:3]
 
-    # --- load data ---
+    # load data ---
     roi_linidx = np.load(lin_roi)
     contrib = np.load(contrib_path)  # (n_trials, n_voxels_in_roi)
 
@@ -134,14 +138,14 @@ def recon_contribution(roi, lin_roi, contrib_path, output_file=None):
     assert len(roi_linidx) == n_vox, \
         f"ROI voxels ({len(roi_linidx)}) != contribution size ({n_vox})"
 
-    # --- reconstruct each 3D volume ---
+    # reconstruct each 3D volume ---
     vols = []
     for i in range(n_trials):
         vol = np.zeros(np.prod(roi_shape), dtype=np.float32)
         vol[roi_linidx] = contrib[i]
         vols.append(vol.reshape(roi_shape))
 
-    # --- append the mean volume ---
+    # append the mean volume ---
     mean_vol = np.zeros(np.prod(roi_shape), dtype=np.float32)
     mean_vol[roi_linidx] = contrib.mean(axis=0)
     vols.append(mean_vol.reshape(roi_shape))
@@ -149,7 +153,7 @@ def recon_contribution(roi, lin_roi, contrib_path, output_file=None):
     img4d = np.stack(vols, axis=-1)
     w_img = nib.Nifti1Image(img4d, affine)
 
-    # --- save or return ---
+    # save or return ---
     if output_file is not None:
         nib.save(w_img, output_file)
         print(f"[INFO] Saved contribution map: {output_file}")
@@ -179,7 +183,7 @@ def recon_weights(roi, lin_roi, weights_path, output_file=None):
         The 3D reconstructed weight map.
     """
 
-    # --- Load reference image ---
+    # Load reference image
     if isinstance(roi, str):
         img = nib.load(roi)
     elif isinstance(roi, nib.Nifti1Image):
@@ -190,7 +194,7 @@ def recon_weights(roi, lin_roi, weights_path, output_file=None):
     affine = img.affine
     roi_shape = img.shape[:3]
 
-    # --- Load data ---
+    # Load data
     roi_linidx = np.load(lin_roi)
     weights = np.load(weights_path)
 
@@ -200,12 +204,12 @@ def recon_weights(roi, lin_roi, weights_path, output_file=None):
     assert len(roi_linidx) == weights.shape[0], \
         f"ROI voxels ({len(roi_linidx)}) != weights size ({weights.shape[0]})"
 
-    # --- Fill into 3D volume ---
+    # Fill into 3D volume
     full_map = np.zeros(np.prod(roi_shape), dtype=np.float32)
     full_map[roi_linidx] = weights
     w_img = nib.Nifti1Image(full_map.reshape(roi_shape), affine)
 
-    # --- Save or return ---
+    # Save or return
     if output_file is not None:
         nib.save(w_img, output_file)
         print(f"[INFO] Saved weight map: {output_file}")
@@ -213,93 +217,143 @@ def recon_weights(roi, lin_roi, weights_path, output_file=None):
     else:
         return w_img
 
-def _pipeline(cfg, *, standardize=False, searchlight=False, locked_params=None, **kwargs):
+def pipeline_from_config(
+    cfg,
+    *,
+    searchlight: bool = False,
+    standardize: bool = False,
+    random_state=None,
+    labels=None,
+    scoring=None,
+    locked=None,
+):
     """
-    Build and configure a machine learning pipeline (optionally with grid search)
-    for decoding or classification tasks, based on a configuration dictionary.
+    Construct a decoding pipeline from configuration.
 
-    This function constructs a scikit-learn :class:`~sklearn.pipeline.Pipeline`
-    using preprocessing, feature selection, and classification steps defined
-    in ``cfg``. It supports both ROI-based decoding (with hyperparameter
-    optimization) and searchlight analyses (where parameters are fixed).
+    This function builds a full scikit-learn :class:`~sklearn.pipeline.Pipeline`
+    according to the specification in ``cfg``. The standard structure is:
 
-    :param dict cfg:
-        Configuration dictionary specifying components of the pipeline.
+        ``VarianceThreshold`` → (optional) ``Scaler`` → (optional) ``Feature Selector`` → ``Estimator``
 
-        Expected keys include:
+    Optionally, the resulting pipeline can be wrapped in a model selection object
+    (e.g., :class:`~sklearn.model_selection.GridSearchCV` or
+    :class:`~sklearn.model_selection.RandomizedSearchCV`) for ROI-level optimization,
+    or configured in a “locked” mode for searchlight decoding, where grid search is skipped
+    and previously tuned parameters are applied directly.
 
-        * ``"scaler"`` – configuration for the feature scaler (optional)
-        * ``"cv"`` – configuration for the inner cross-validation splitter
-        * ``"estimator"`` – configuration for the final classifier
-        * ``"feature_selection"`` – configuration for feature selection (optional)
-        * ``"variance_threshold"`` – float; minimum variance to retain a feature
-        * ``"gridsearch"`` – configuration for hyperparameter search
-          (only used if not in searchlight mode and no ``locked_params`` are given)
-    :param bool standardize:
-        Whether to include feature standardization in the pipeline.
-        Defaults to ``False``.
-    :param bool searchlight:
-        If ``True``, disables feature selection and hyperparameter search,
-        returning a fixed estimator pipeline. Defaults to ``False``.
-    :param dict locked_params:
-        Dictionary of fixed estimator parameters to set directly on the pipeline.
-        When provided, the hyperparameter grid is skipped.
-        This is typically used for searchlight analyses to ensure consistent
-        parameters across voxels.
-    :param kwargs:
-        Additional keyword arguments for compatibility or future extensions.
-        Currently unused.
+    Parameters
+    ----------
+    cfg : dict
+        Configuration dictionary defining all pipeline components. Supported keys include:
+        ``"variance_threshold"``, ``"scaler"``, ``"feature_selection"``,
+        ``"estimator"``, ``"cv"``, and optionally ``"gridsearch"``.
+    searchlight : bool, default=False
+        If True, disables grid/random search and applies ``locked`` parameters directly.
+        Used for voxelwise searchlight decoding where hyperparameter optimization is impractical.
+    standardize : bool, default=False
+        Whether to include a scaling step defined by ``cfg["scaler"]``.
+        If False, the scaler stage is replaced by ``"passthrough"``.
+    random_state : int or None, optional
+        Seed controlling stochastic elements in estimators, cross-validation splits,
+        or randomized searches. Typically derived from a higher-level RNG in
+        permutation testing.
+    labels : array-like of shape (n_samples,), optional
+        Target labels used for label-aware estimator initialization or scoring behavior.
+        When provided, they can inform:
+        - The choice of appropriate scoring function (binary vs. multiclass).
+        - Whether to enable probabilistic outputs (e.g., ``SVC(probability=True)``)
+          when using AUC- or log-loss-based metrics.
+        - Automatic adaptation of class balancing or weighting schemes
+          (e.g., ``class_weight='balanced'``).
+        Passing labels is recommended when the estimator or metric depends on
+        the number of unique classes.
+    scoring : str or callable, optional
+        Metric used for model evaluation and hyperparameter tuning.
+        If not provided, falls back to ``cfg["scoring"]`` or ``"balanced_accuracy"``.
+        The same scoring function is propagated consistently across observed and
+        permutation-based evaluations.
+    locked : dict or None, optional
+        Parameter dictionary applied directly via ``Pipeline.set_params``.
+        Used in searchlight mode to reuse tuned hyperparameters from ROI-level analyses.
 
-    :returns:
-        Either a configured pipeline or a grid search object depending on the mode.
+    Returns
+    -------
+    pipe : sklearn.pipeline.Pipeline or sklearn.model_selection.BaseSearchCV
+        - **ROI mode** → A grid or randomized search object wrapping the pipeline.
+        - **Searchlight mode** → A bare pipeline with fixed parameters (no search).
 
-        * :class:`~sklearn.pipeline.Pipeline` – if ``locked_params`` is provided
-          or ``searchlight=True``
-        * :class:`~sklearn.model_selection.GridSearchCV` – otherwise
-    :rtype:
-        :class:`~sklearn.pipeline.Pipeline` or :class:`~sklearn.model_selection.GridSearchCV`
+    Notes
+    -----
+    - The base pipeline always includes a
+      :class:`~sklearn.feature_selection.VarianceThreshold` filter controlled by
+      ``cfg["variance_threshold"]`` (default: 1e-12) to remove constant features.
+    - If ``cfg["gridsearch"]`` is present and ``searchlight=False``, the pipeline
+      is wrapped using :func:`factory.search_from_config`. The scoring metric is
+      inherited from ``cfg["scoring"]`` unless explicitly overridden in the
+      grid search arguments.
+    - When ``searchlight=True`` or ``locked`` is provided, no hyperparameter search
+      is performed and the locked parameters are applied directly.
+    - A deterministic ``random_state`` ensures reproducibility across permutations
+      and folds when passed down from higher-level RNGs.
 
-    .. note::
-       - The pipeline always begins with a :class:`~sklearn.feature_selection.VarianceThreshold`
-         step to remove near-constant features.
-       - Feature selection is automatically disabled in searchlight mode.
-       - When grid search is enabled, ``cfg["gridsearch"]`` must define
-         parameter grids and search settings.
+    Examples
+    --------
+    ROI decoding with grid search:
 
-    **Example:**
+    >>> pipe = pipeline_from_config(cfg, standardize=True, random_state=42)
+    >>> pipe
+    GridSearchCV(
+        estimator=Pipeline(steps=[
+            ('var', VarianceThreshold(threshold=1e-12)),
+            ('scaler', StandardScaler()),
+            ('select', SelectPercentile(percentile=10)),
+            ('clf', SVC(class_weight='balanced', kernel='linear'))
+        ]),
+        param_grid={'select__percentile': [10, 20, 40, 100],
+                    'clf__C': [0.01, 0.1, 1, 10]},
+        scoring='balanced_accuracy'
+    )
 
-    .. code-block:: python
+    Searchlight decoding with locked parameters:
 
-        cfg = {
-            "scaler": {"type": "StandardScaler"},
-            "cv": {"type": "KFold", "n_splits": 5},
-            "estimator": {"type": "SVC"},
-            "gridsearch": {"param_grid": {"clf__C": [0.1, 1, 10]}},
-        }
+    >>> locked = {'clf__C': 1.0, 'select__percentile': 20}
+    >>> pipe = pipeline_from_config(cfg, searchlight=True, locked=locked)
+    >>> type(pipe)
+    <class 'sklearn.pipeline.Pipeline'>
 
-        # ROI-based decoding (uses grid search)
-        pipe = _pipeline(cfg, standardize=True)
-        print(pipe)
-        # GridSearchCV(...)
+    Binary AUC decoding example (label-aware scoring):
 
-        # Searchlight decoding (fixed parameters)
-        sl_pipe = _pipeline(cfg, searchlight=True, locked_params={"clf__C": 1.0})
-        print(sl_pipe)
-        # Pipeline(...)
+    >>> cfg['scoring'] = 'roc_auc_ovr'
+    >>> pipe = pipeline_from_config(cfg, labels=y, random_state=42)
+    >>> # Under the hood, SVC(probability=True) is enabled automatically.
+
+    See Also
+    --------
+    factory.scaler_from_config : Construct scaling components (e.g., StandardScaler, MinMaxScaler).
+    factory.selector_from_config : Build feature selection objects.
+    factory.estimator_from_config : Create estimator objects (SVC, LDA, LogisticRegression, etc.).
+    factory.search_from_config : Wrap pipelines in GridSearchCV or RandomizedSearchCV.
     """
 
-    scaler   = factory.scaler_from_config(cfg.get("scaler"))
-    inner_cv = factory.cv_from_config(cfg["cv"])
-    est      = factory.estimator_from_config(cfg["estimator"])
+    # 1) Scaler (always define it)
+    scaler = factory.scaler_from_config(cfg.get("scaler")) if standardize else "passthrough"
 
-    # Turn off feature selection for searchlight
+    # 2) Feature selector
     selector = factory.selector_from_config(
         cfg.get("feature_selection") if not searchlight else None,
         estimator_factory=factory.estimator_from_config,
-        task="classification",
-        random_state=0,
+        random_state=random_state,
     )
 
+    # 3) Estimator (labels/scoring-aware if you added those conveniences)
+    est = factory.estimator_from_config(
+        cfg.get("estimator"),
+        random_state=random_state,
+        labels=labels,
+        scoring=scoring if scoring is not None else cfg.get("scoring", "balanced_accuracy"),
+    )
+
+    # 4) Assemble base pipeline
     thr = float(cfg.get("variance_threshold", 1e-12))
     pipe = Pipeline([
         ("var", VarianceThreshold(threshold=thr)),
@@ -308,71 +362,103 @@ def _pipeline(cfg, *, standardize=False, searchlight=False, locked_params=None, 
         ("clf", est),
     ])
 
-    # If we have locked params OR we're in searchlight, skip the grid entirely.
-    # (You can still keep grid for ROI decoding.)
-    if locked_params is not None or searchlight:
-        if locked_params:
-            pipe.set_params(**locked_params)
+
+    # 5) Apply locked params / searchlight early-exit
+    if searchlight or locked:
+        if locked:
+            pipe.set_params(**locked)
         return pipe
 
-    # Otherwise (ROI path), use your regular inner grid search
-    grid = factory.search_from_config(pipe, inner_cv, cfg["gridsearch"])
-    return grid
+    # 6) Optional grid/random search (ROI path only)
+    gs_cfg = cfg.get("gridsearch")
+    if gs_cfg:
+        # Inner CV from cfg
+        inner_cv = factory.cv_from_config(cfg.get("cv"))
+
+        # If grid args don't specify scoring but top-level does, propagate it
+        if "args" in gs_cfg and "scoring" not in gs_cfg["args"] and "scoring" in cfg:
+            gs_cfg = {**gs_cfg, "args": {**gs_cfg["args"], "scoring": cfg["scoring"]}}
+
+        pipe = factory.search_from_config(
+            estimator=pipe,
+            cv=inner_cv,
+            cfg=gs_cfg,
+        )
+    
+    return pipe
 
 
 def _permute_within_groups(y, g, rng):
     """
-    Permute labels independently within each group.
+    Permute labels independently within groups.
 
-    This function shuffles the elements of ``y`` **within** each unique group in ``g``.
-    It is commonly used in permutation testing or cross-validation contexts where
-    label shuffling must respect grouping constraints (e.g., runs, sessions, or subjects).
+    This utility function shuffles the labels in ``y`` **within each unique group**
+    defined by the corresponding entries in ``g``. It is typically used in
+    permutation testing or cross-validation contexts where label shuffling must
+    preserve the dependency structure among samples (e.g., within runs, sessions,
+    or subjects).
 
-    If ``g`` is ``None``, a global permutation of ``y`` is performed instead.
+    If ``g`` is ``None``, a global permutation of ``y`` is performed instead,
+    equivalent to ``rng.permutation(y)``.
 
-    :param array_like y:
-        Array of labels or target values to be permuted.
-    :param array_like g:
-        Array of group identifiers of the same length as ``y``.
-        Each unique value in ``g`` defines an independent group within which
-        permutation occurs. If ``None``, all samples are treated as belonging
-        to one global group.
-    :param numpy.random.Generator rng:
-        Random number generator instance used to perform the permutations.
-        Should be a :class:`numpy.random.Generator` object for reproducibility.
+    Parameters
+    ----------
+    y : array-like of shape (n_samples,)
+        Target labels or values to permute.
+    g : array-like of shape (n_samples,), optional
+        Group identifiers that define independent shuffling blocks. All samples
+        sharing the same group label are permuted among themselves but never
+        mixed with samples from other groups. If ``None``, all samples are
+        treated as belonging to a single group.
+    rng : numpy.random.Generator
+        Random number generator instance used for permutation. Should be a
+        :class:`numpy.random.Generator` created via :func:`numpy.random.default_rng`
+        for reproducible permutations.
 
-    :returns:
+    Returns
+    -------
+    y_perm : numpy.ndarray of shape (n_samples,)
         A permuted copy of ``y`` where labels have been shuffled within each group.
-    :rtype:
-        numpy.ndarray
 
-    **Example:**
+    Notes
+    -----
+    - The group structure is strictly preserved: no label exchanges occur between
+      different groups.
+    - The output array is a **copy** of ``y``; the input is not modified in place.
+    - Each call produces a different permutation unless the RNG is seeded with
+      a fixed value.
+    - The function is agnostic to label type; any 1D array-like input
+      (integers, strings, floats) is supported.
 
-    .. code-block:: python
+    Examples
+    --------
+    >>> import numpy as np
+    >>> y = np.array([0, 1, 0, 1, 0, 1])
+    >>> g = np.array([1, 1, 2, 2, 3, 3])
+    >>> rng = np.random.default_rng(42)
+    >>> _permute_within_groups(y, g, rng)
+    array([1, 0, 1, 0, 0, 1])
 
-        import numpy as np
+    When ``g`` is None, labels are permuted globally:
 
-        y = np.array([0, 1, 0, 1, 0, 1])
-        g = np.array([1, 1, 2, 2, 3, 3])
-        rng = np.random.default_rng(42)
+    >>> rng = np.random.default_rng(123)
+    >>> _permute_within_groups(y, None, rng)
+    array([0, 0, 1, 1, 0, 1])
 
-        y_perm = _permute_within_groups(y, g, rng)
-        print(y_perm)
-        # Output might look like: [1 0 1 0 0 1]
-
-    .. note::
-       - The function preserves the group structure: elements belonging to different
-         groups are never mixed.
-       - Each call produces a different permutation unless the RNG seed is fixed.
+    See Also
+    --------
+    _cv_mean_score : Uses this function to perform within-group permutations
+        during cross-validation-based decoding.
+    numpy.random.default_rng : Recommended constructor for modern RNGs.
     """
-
     if g is None:
         return rng.permutation(y)
-    y_perm = y.copy()
+    y_perm = np.copy(y)
     for grp in np.unique(g):
         idx = np.where(g == grp)[0]
         y_perm[idx] = rng.permutation(y_perm[idx])
     return y_perm
+
 
 def _cv_mean_score(
     X_path,
@@ -391,109 +477,110 @@ def _cv_mean_score(
     **kwargs
 ):
     """
-    Compute the mean cross-validated score across provided outer folds using the
-    same pipeline definition as :func:`_pipeline`. Supports both observed scoring
-    and permutation-based null estimation.
+    Compute the mean cross-validated decoding score across user-specified folds.
 
-    The function loads a memory-mapped feature matrix from ``X_path`` (via
-    :func:`joblib.load` with ``mmap_mode="r"``), iterates over outer folds, fits
-    the configured model, and scores on held-out data. When ``permute=True``,
-    labels are permuted either globally or within groups (runs/sessions) to form
-    a null distribution sample.
+    This function performs outer-loop evaluation for ROI-based or searchlight decoding.
+    For each fold, it builds a full decoding pipeline using
+    :func:`pipeline_from_config`, fits on the training data, and scores on the
+    test data. When ``permute=True``, it performs label permutations to estimate
+    a null-distribution sample under the hypothesis of no label–feature
+    relationship.
 
-    :param str X_path:
-        Path to a ``joblib`` dump of a memory-mapped feature matrix with shape
+    The same scoring metric (configured via ``cfg['scoring']`` or
+    :func:`factory.scorer_from_config`) is used for both observed and permuted
+    evaluations, ensuring consistency between model optimization (e.g., during
+    grid search) and final scoring.
+
+    Parameters
+    ----------
+    X_path : str or Path
+        Path to a ``joblib`` dump of a memory-mapped feature matrix
         ``(n_samples, n_features)``.
-    :param array_like labels:
-        Integer (or categorical) labels of shape ``(n_samples,)``.
-    :param list folds:
-        List of 2-tuples ``(train_idx, test_idx)`` providing outer splits (e.g.,
-        LOGO). Each index array selects rows of ``X`` and ``labels``.
-    :param dict cfg:
-        Decoding configuration passed to :func:`_pipeline`.
-    :param array_like groups:
-        Optional group identifiers of shape ``(n_samples,)``. If provided, they
-        can be used to pass ``groups`` to estimators that support it, and to
-        constrain permutations when ``permute_within_groups=True``.
-    :param bool standardize:
-        If ``True``, enables the scaler step in :func:`_pipeline`. Default: ``True``.
-    :param bool permute:
-        If ``True``, perform label permutations to estimate a null score. Default: ``False``.
-    :param bool permute_both_sets:
-        If ``True``, permute both training and test labels within each fold (current behavior).
-        If ``False``, permute **only** training labels and score against true test labels.
-        Default: ``True``.
-    :param bool permute_within_groups:
-        If ``True`` and ``groups`` is provided, permute labels independently
-        **within** each group using :func:`_permute_within_groups`. Otherwise,
-        perform a global permutation. Default: ``True``.
-    :param numpy.random.Generator rng:
-        RNG used for permutations. If ``None`` and ``permute=True``, a default
-        generator is created via ``np.random.default_rng()``.
-    :param str | pathlib.Path | None save_dir:
-        Optional directory in which to store per-fold artifacts for the observed
-        (non-permutation) run. When set, a subdirectory per fold is created with
-        the pattern ``fold-XX``; the trained pipeline and relevant metadata are
-        saved via :func:`_save_pipeline`.
-    :param numpy.ndarray roi_linidx:
-        Optional array of voxel linear indices (1D→3D mapping within an ROI mask)
-        passed through to :func:`_save_pipeline`.
-    :param kwargs:
-        Additional keyword arguments forwarded to :func:`_pipeline` (e.g., estimator-specific
-        options). These do not override the behavior controlled by the named parameters above.
+    labels : array-like of shape (n_samples,)
+        Integer or categorical labels aligned with rows in ``X``.
+    folds : list of tuple(ndarray, ndarray)
+        List of (train_idx, test_idx) splits defining the outer cross-validation
+        scheme (e.g., leave-one-run-out, leave-one-subject-out).
+    cfg : dict
+        Configuration dictionary controlling decoding parameters and pipeline
+        construction. Passed to :func:`pipeline_from_config`.
+    groups : array-like of shape (n_samples,), optional
+        Optional grouping labels (e.g., run or subject IDs). Used both for
+        stratified or grouped CV and for within-group label permutations.
+    standardize : bool, default=True
+        If True, enables the scaling step in the pipeline. When False, scaling
+        is skipped (equivalent to a "passthrough" scaler).
+    permute : bool, default=False
+        If True, permutes labels in each fold to compute a null score.
+    permute_both_sets : bool, default=True
+        If True, permutes both training and test labels within each fold.
+        If False, permutes only training labels (recommended for
+        most decoding-based null distributions).
+    permute_within_groups : bool, default=True
+        If True and ``groups`` are provided, permutations are restricted
+        to within-group shuffles via :func:`_permute_within_groups`.
+        If False, labels are permuted globally using ``rng.permutation``.
+    rng : numpy.random.Generator, optional
+        Random number generator controlling label shuffling and per-model
+        random_state seeds. If None and ``permute=True``, a default generator
+        is created via :func:`numpy.random.default_rng()`.
+    save_dir : str or Path, optional
+        If provided and ``permute=False``, per-fold artifacts (fitted pipeline,
+        metadata) are stored under ``save_dir/fold-XX`` using :func:`_save_pipeline`.
+    roi_linidx : numpy.ndarray, optional
+        Linear voxel indices corresponding to the ROI mask for saving fold outputs.
+    **kwargs
+        Additional keyword arguments forwarded to :func:`pipeline_from_config`
+        (e.g., estimator- or searchlight-specific parameters). ``locked_params``
+        may be used to disable grid search in searchlight mode.
 
-    :returns:
-        Mean of the per-fold scores (float).
-    :rtype:
-        float
+    Returns
+    -------
+    float
+        Mean cross-validation score across folds.
 
-    **Details**
-        - The model is created via :func:`_pipeline(cfg, **kwargs)`.
-        - If the resulting object is a :class:`~sklearn.model_selection.BaseSearchCV`
-          instance **or** its estimator supports a ``groups`` parameter (detected via
-          :func:`sklearn.utils.validation.has_fit_parameter`), groups are passed to
-          ``fit`` when available.
-        - For permutations:
-          * If ``permute_within_groups`` and ``groups`` are set, labels are shuffled
-            **within** each group in both train and test sets if ``permute_both_sets=True``;
-            otherwise only the training labels are permuted.
-          * If no groups are provided or ``permute_within_groups=False``, labels are
-            permuted globally using ``rng.permutation``.
-        - When ``permute=False`` and ``save_dir`` is provided, per-fold artifacts are
-          saved after scoring.
+    Notes
+    -----
+    - A new pipeline is instantiated for each fold. If ``permute=True``, the
+      same RNG is used to derive an integer ``random_state`` for that instance,
+      ensuring reproducible results across permutations.
+    - If the pipeline (or inner estimator) supports a ``groups`` argument
+      (checked via :func:`sklearn.utils.validation.has_fit_parameter` or
+      subclassing :class:`sklearn.model_selection.BaseSearchCV`), ``groups`` are
+      passed to ``fit`` automatically.
+    - Scoring consistency:
+        * The same scorer is used for both observed and permuted evaluations.
+        * Grid search (if configured) inherits the same scoring metric unless
+          explicitly overridden in ``cfg['gridsearch']['args']``.
 
-    **Example**
-        .. code-block:: python
+    Example
+    -------
+    .. code-block:: python
 
-            folds = [(tr, te) for tr, te in logo.split(X_idx, y, groups)]
-            mean_acc = _cv_mean_score(
-                X_path="/path/to/X.dump",
-                labels=y,
-                folds=folds,
-                cfg=cfg,
-                groups=groups,
-                standardize=True,
-                permute=False,
-                save_dir="results/run-01",
-                roi_linidx=roi_idx,
-            )
-            print(f"Mean CV score: {mean_acc:.3f}")
+        folds = [(tr, te) for tr, te in logo.split(X_idx, y, groups)]
+        mean_score = _cv_mean_score(
+            X_path="/path/to/X.dump",
+            labels=y,
+            folds=folds,
+            cfg=cfg,
+            groups=groups,
+            permute=False,
+            save_dir="results/run-01",
+            roi_linidx=roi_idx,
+        )
+        print(f"Mean CV {cfg['scoring']}: {mean_score:.3f}")
 
-    .. seealso::
-       :func:`_pipeline`, :func:`_permute_within_groups`, :func:`_save_pipeline`
-
-    .. note::
-       - ``X_path`` must reference a ``joblib``-dumped, memory-mappable array.
-       - Set a fixed seed on ``rng`` (or create one with a fixed seed) for
-         reproducible permutations.
-       - The function returns only the **mean** score; if you need per-fold
-         scores or fitted estimators for analysis, consider extending the
-         saving logic or returning additional outputs.
+    See Also
+    --------
+    pipeline_from_config : Build scaler → selector → estimator pipeline.
+    _permute_within_groups : Shuffle labels within group boundaries.
+    _save_pipeline : Persist fitted models and metadata.
     """
 
     X_mm = load(X_path, mmap_mode="r")
     y = np.asarray(labels)
     g_full = None if groups is None else np.asarray(groups)
+    
     if rng is None and permute:
         rng = np.random.default_rng()
 
@@ -521,30 +608,32 @@ def _cv_mean_score(
             y_tr_perm = y_tr
             y_te_perm = y_te
 
-        # define the pipeline
-        update_dict = {
-            "groups": groups,
-            "standardize": standardize
-        }
+        # make scoring object
+        scorer = factory.scorer_from_config(cfg.get("scoring", "balanced_accuracy"))
         
-        model = _pipeline(
+        # define the pipeline
+        random_state = int(rng.integers(2**31 - 1)) if rng is not None else None
+        clf = pipeline_from_config(
             cfg,
+            random_state=random_state,
+            labels=labels,
+            scoring=scorer,
             **kwargs
         )
 
-        supports_groups = isinstance(model, BaseSearchCV) or has_fit_parameter(model, "groups")
+        supports_groups = isinstance(clf, BaseSearchCV) or has_fit_parameter(clf, "groups")
         if g_tr is not None and supports_groups:
-            model.fit(X_mm[train_idx], y_tr_perm, groups=g_tr)
+            clf.fit(X_mm[train_idx], y_tr_perm, groups=g_tr)
         else:
-            model.fit(X_mm[train_idx], y_tr_perm)
+            clf.fit(X_mm[train_idx], y_tr_perm)
 
-        score = model.score(X_mm[test_idx], y_te_perm)
+        score = clf.score(X_mm[test_idx], y_te_perm)
         fold_scores.append(float(score))
 
         if not permute:
             if isinstance(fold_dir, str):
                 _save_pipeline(
-                    model,
+                    clf,
                     X_mm,
                     test_idx,
                     train_idx,
@@ -559,193 +648,283 @@ def tqdm_disabled():
 
 def extract_from_pipeline(model, X, test_idx):
     """
-    Extract key elements (weights, predictions, and contributions) from a fitted
-    decoding pipeline for a given test fold.
+    Extract per-fold weights, decisions, predictions, and per-sample contributions
+    from a fitted decoding pipeline, supporting both binary and multiclass classifiers.
 
-    This function reconstructs feature-space indices, classifier weights, and
-    decision values from a trained scikit-learn pipeline. It supports both
-    plain pipelines and those wrapped inside a :class:`~sklearn.model_selection.GridSearchCV`
-    (by automatically selecting ``best_estimator_``). The function also computes
-    per-sample feature contributions in the original ROI feature space.
+    This function introspects a trained scikit-learn pipeline (optionally wrapped in
+    a search object such as :class:`~sklearn.model_selection.GridSearchCV`) to recover:
 
-    :param model:
-        Trained model, typically an instance of :class:`~sklearn.pipeline.Pipeline`
-        or :class:`~sklearn.model_selection.GridSearchCV` that wraps one.
-    :param numpy.ndarray X:
-        Feature matrix of shape ``(n_samples, n_features)`` used to fit the model.
-        Should correspond to the same ROI feature space used during training.
-    :param array_like test_idx:
-        Indices of the test samples (from the outer CV split) for which to extract
-        predictions and contributions.
+      - the mapping of features retained after preprocessing back to the original ROI
+        feature space,
+      - the classifier’s linear weight vectors (expanded to full ROI length),
+      - per-sample feature contributions,
+      - decision values or probabilities, and
+      - predicted labels for a specified test split.
 
-    :returns:
-        A dictionary containing extracted information from the trained model:
+    It supports both **binary** and **multiclass** linear estimators that expose
+    ``coef_`` and either ``decision_function`` or ``predict_proba``.
 
-        * ``"test_idx"`` – indices of the test samples (echo of ``test_idx``)
-        * ``"orig_idx"`` – feature indices retained after variance thresholding
-          and feature selection, mapping back to the ROI feature space
-        * ``"weights"`` – classifier weights expanded to full feature space
-          (``numpy.ndarray`` of shape ``(n_features,)``)
-        * ``"contribution"`` – per-sample feature contributions in ROI space
-          (``numpy.ndarray`` of shape ``(n_test, n_features)``)
-        * ``"decision"`` – raw decision values for the test samples
-          (output of ``decision_function``)
-        * ``"y_pred"`` – predicted labels for the test samples
+    Parameters
+    ----------
+    model : sklearn.pipeline.Pipeline or sklearn.model_selection.BaseSearchCV
+        Trained pipeline or search object. If wrapped in a cross-validation
+        search (e.g., ``GridSearchCV``), the best estimator is extracted
+        automatically via ``model.best_estimator_``.
+        Expected step names:
+        ``"var"`` (variance filter), ``"scaler"``, ``"select"`` (feature selector),
+        and ``"clf"`` (classifier). Any of these may be set to ``'passthrough'``.
+    X : numpy.ndarray of shape (n_samples, n_features)
+        Feature matrix in the original ROI feature space used for model training.
+    test_idx : array-like of int
+        Indices of the test samples (outer cross-validation split) for which
+        to compute predictions and feature contributions.
 
-    :rtype:
-        dict
+    Returns
+    -------
+    ddict : dict
+        Dictionary containing extracted decoding information. Keys and shapes:
 
-    **Computation Details**
-        - If the model was trained using :class:`~sklearn.feature_selection.VarianceThreshold`
-          or another selector, the function reconstructs the chain of indices mapping
-          selected features back to their original ROI coordinates.
-        - The full-weight vector is reconstructed by inserting zeros for any features
-          that were filtered out during preprocessing.
-        - Per-sample contributions are computed as the elementwise product between the
-          transformed test data (up to, but excluding, the classifier step)
-          and the classifier’s linear weights.
+        - ``"test_idx"`` : numpy.ndarray
+            Echo of the provided ``test_idx``.
+        - ``"orig_idx"`` : numpy.ndarray of shape (n_selected_features,)
+            Indices of features retained after variance thresholding and
+            feature selection, mapped back to columns of the original ROI feature matrix.
+        - ``"weights"`` :
+            - **Binary:** numpy.ndarray of shape ``(n_features,)``
+            - **Multiclass:** numpy.ndarray of shape ``(n_classes, n_features)``
+            Full-length classifier weights expanded to the original ROI space
+            (zeros for filtered-out features).
+        - ``"contribution"`` :
+            - **Binary:** numpy.ndarray of shape ``(n_test, n_features)``
+            - **Multiclass:** numpy.ndarray of shape ``(n_test, n_features, n_classes)``
+            Per-sample voxelwise contributions in ROI space, computed as the
+            elementwise product between preprocessed feature activations
+            (up to, but excluding, the classifier) and the corresponding
+            class-specific weight vector.
+        - ``"decision"`` : numpy.ndarray or None
+            Output of the model’s ``decision_function`` or, if unavailable,
+            ``predict_proba``. Shape depends on classifier type:
+            - Binary: ``(n_test,)``
+            - Multiclass: ``(n_test, n_classes)``.
+        - ``"y_pred"`` : numpy.ndarray of shape (n_test,)
+            Predicted labels for the test samples.
 
-    **Example**
-        .. code-block:: python
+    Notes
+    -----
+    - The function assumes a **linear** model exposing ``coef_`` and a compatible
+      decision interface. For nonlinear kernels (e.g., RBF SVM), the reported
+      feature contributions are **not interpretable**.
+    - When the classifier is multiclass (``coef_.shape == (n_classes, n_selected)``),
+      weights and contributions are computed and returned per class.
+    - Any preprocessing step absent from the pipeline (e.g., selector omitted)
+      must appear as a named step with ``'passthrough'`` to ensure proper index mapping.
+    - Feature indices are reconstructed by chaining the supports of
+      ``VarianceThreshold`` and any selector step back to the original
+      ROI feature ordering.
+    - If neither ``decision_function`` nor ``predict_proba`` is implemented
+      by the classifier, ``"decision"`` will be set to ``None``.
 
-            ddict = extract_from_pipeline(trained_model, X, test_idx)
+    Examples
+    --------
+    Binary decoding example:
+    >>> ddict = extract_from_pipeline(trained_model, X, test_idx)
+    >>> ddict["weights"].shape
+    (X.shape[1],)
+    >>> ddict["contribution"].shape
+    (len(test_idx), X.shape[1])
 
-            print(ddict["weights"].shape)
-            # (n_features,)
+    Multiclass decoding example:
+    >>> ddict = extract_from_pipeline(trained_model, X, test_idx)
+    >>> ddict["weights"].shape
+    (n_classes, X.shape[1])
+    >>> ddict["contribution"].shape
+    (len(test_idx), X.shape[1], n_classes)
 
-            print(ddict["decision"][:5])
-            # [ 1.23, -0.85, 0.54, ...]
-
-    .. note::
-       - The classifier must expose a ``coef_`` attribute (e.g., linear models such as
-         SVMs or logistic regression).
-       - The function assumes the pipeline steps are named
-         ``"var"``, ``"scaler"``, ``"select"``, and ``"clf"``.
-       - If a step was set to ``'passthrough'``, its indices are handled transparently.
-       - For non-linear classifiers (e.g., RBF SVM), the computed feature
-         contributions are **not** meaningful.
+    See Also
+    --------
+    sklearn.pipeline.Pipeline
+    sklearn.feature_selection.VarianceThreshold
+    sklearn.linear_model.LogisticRegression
+    sklearn.svm.LinearSVC
     """
-
+    # unwrap search objects
     pipe = model.best_estimator_ if hasattr(model, "best_estimator_") else model
 
-    var = pipe.named_steps.get("var")             # VarianceThreshold or 'passthrough'
-    sel = pipe.named_steps.get("select")          # selector
+    # fetch steps (allow 'passthrough')
+    var = pipe.named_steps.get("var", None)         # VarianceThreshold or 'passthrough' or None
+    sel = pipe.named_steps.get("select", None)      # selector or 'passthrough' or None
     clf = pipe.named_steps["clf"]
 
+    # --- safe index helpers ---------------------------------------------------
+    def _safe_get_support(step, n_feats):
+        if step is None or step == "passthrough":
+            return np.arange(n_feats)
+        if hasattr(step, "get_support"):
+            return step.get_support(indices=True)
+        if hasattr(step, "support_"):
+            sup = np.asarray(step.support_, dtype=bool)
+            return np.flatnonzero(sup)
+        # fallback: identity
+        return np.arange(n_feats)
+
     # indices mapping back to ROI feature space
-    var_idx = np.arange(X.shape[1]) if var == "passthrough" else var.get_support(indices=True)
-    sel_idx = np.arange(len(var_idx)) if sel == "passthrough" else sel.get_support(indices=True)
-    orig_idx = var_idx[sel_idx]                   # indices in ROI feature space (columns of X)
+    n_features = X.shape[1]
+    var_idx = _safe_get_support(var, n_features)
+    sel_idx = _safe_get_support(sel, len(var_idx))
+    orig_idx = var_idx[sel_idx]  # indices in original ROI feature space
 
-    # weights in full ROI feature space
-    w_sel = clf.coef_.ravel()
-    w_full = np.zeros(X.shape[1], dtype=float); w_full[orig_idx] = w_sel
+    # --- weights (support multiclass) ----------------------------------------
+    if not hasattr(clf, "coef_"):
+        raise ValueError("Classifier does not expose `coef_`; cannot compute linear weights.")
+    coef = clf.coef_
+    # binary → (n_selected,), multiclass → (n_classes, n_selected)
+    if coef.ndim == 1:
+        coef = coef[np.newaxis, :]  # (1, n_selected)
 
-    # out-of-fold predictions
-    dec = pipe.decision_function(X[test_idx])
-    y_pred = pipe.predict(X[test_idx])
+    n_classes, n_selected = coef.shape
+    if n_selected != len(orig_idx):
+        # Some estimators store coef in a different transformed space; guard.
+        raise ValueError(
+            f"Classifier coef_ width ({n_selected}) != selected features ({len(orig_idx)})."
+        )
 
-    # (optional) per-sample contributions
-    Xt_test = pipe[:-1].transform(X[test_idx])    # var -> scaler -> select
-    contrib_full = np.zeros((Xt_test.shape[0], X.shape[1]), dtype=float)
-    contrib_full[:, orig_idx] = Xt_test * w_sel
+    # expand weights back to full ROI space
+    w_full = np.zeros((n_classes, n_features), dtype=float)
+    w_full[:, orig_idx] = coef
+
+    # decisions / predictions
+    Xt = X[test_idx]
+    # decision_function preferred; else probabilities; else None
+    if hasattr(pipe, "decision_function"):
+        dec = pipe.decision_function(Xt)
+    elif hasattr(pipe, "predict_proba"):
+        dec = pipe.predict_proba(Xt)
+    else:
+        dec = None
+    y_pred = pipe.predict(Xt)
+
+    # per-sample contributions
+    # Transform test features up to, but excluding, the classifier
+    Xt_test = pipe[:-1].transform(Xt)  # shape: (n_test, n_selected)
+
+    # contributions in selected feature space:
+    # (n_test, n_classes, n_selected) = (n_test, 1, n_selected) for binary
+    contrib_sel = Xt_test[:, None, :] * coef[None, :, :]  # broadcast
+
+    # expand back to ROI space per class
+    n_test = Xt_test.shape[0]
+    if n_classes == 1:
+        # maintain backward-compatible shapes
+        contrib_full = np.zeros((n_test, n_features), dtype=float)
+        contrib_full[:, orig_idx] = contrib_sel[:, 0, :]
+        weights_out = w_full[0]  # (n_features,)
+    else:
+        # (n_test, n_features, n_classes)
+        contrib_full = np.zeros((n_test, n_features, n_classes), dtype=float)
+        for c in range(n_classes):
+            contrib_full[:, orig_idx, c] = contrib_sel[:, c, :]
+        weights_out = w_full  # (n_classes, n_features)
 
     ddict = {
-        "test_idx": test_idx,
+        "test_idx": np.asarray(test_idx),
         "orig_idx": orig_idx,
-        "weights": w_full,
+        "weights": weights_out,
         "contribution": contrib_full,
         "decision": dec,
-        "y_pred": y_pred
+        "y_pred": y_pred,
     }
 
     return ddict
 
 def _save_pipeline(model, X, test_idx, train_idx, output_dir, roi_linidx=None):
     """
-    Save the fitted model, its parameters, and fold-specific outputs to disk
-    in a consistent format for both ROI and searchlight decoding paths.
+    Save a fitted decoding model and fold-specific outputs to disk (ROI & searchlight).
 
-    This utility function serializes everything needed to reproduce or
-    inspect a given cross-validation fold. It works seamlessly whether the
-    model is a tuned :class:`~sklearn.model_selection.GridSearchCV` instance
-    or a plain :class:`~sklearn.pipeline.Pipeline` (e.g., from searchlight
-    decoding with fixed hyperparameters).
+    This utility serializes everything needed to inspect or reproduce a single
+    outer-CV fold. It works whether `model` is a tuned
+    :class:`~sklearn.model_selection.GridSearchCV` (ROI path) or a plain
+    :class:`~sklearn.pipeline.Pipeline` (searchlight path with fixed hyperparameters).
 
     The function:
-        1. Extracts key outputs using :func:`extract_from_pipeline`
-        2. Saves them as ``.npy`` arrays
-        3. Dumps the fitted estimator using :func:`joblib.dump`
-        4. Writes model parameters to a JSON file
-        5. Optionally stores ROI voxel mapping if provided
+      1) extracts fold outputs via :func:`extract_from_pipeline` (now multiclass-aware),
+      2) saves them as `.npy` arrays,
+      3) dumps the fitted estimator with :func:`joblib.dump`,
+      4) writes a JSON of the chosen parameters,
+      5) optionally stores the ROI voxel mapping, and
+      6) for classification, stores the classifier’s ``classes_`` ordering.
 
-    :param model:
-        Fitted model to be saved. Can be either a
-        :class:`~sklearn.model_selection.GridSearchCV` (ROI path)
-        or a :class:`~sklearn.pipeline.Pipeline` (searchlight path).
-    :param numpy.ndarray X:
-        Full feature matrix of shape ``(n_samples, n_features)`` used in training.
-        Needed for extracting model weights and predictions.
-    :param array_like test_idx:
-        Indices of the test samples used in this fold.
-    :param array_like train_idx:
-        Indices of the training samples used in this fold.
-        (Not directly used in saving, but retained for completeness and possible
-        downstream extensions.)
-    :param str | pathlib.Path output_dir:
-        Path to the output directory where all artifacts will be saved.
-        The directory is created if it does not already exist.
-    :param numpy.ndarray roi_linidx:
-        Optional 1D array mapping ROI feature indices to 3D voxel coordinates.
-        Saved as ``roi_linidx.npy`` if provided.
+    Parameters
+    ----------
+    model : sklearn.model_selection.BaseSearchCV or sklearn.pipeline.Pipeline
+        Fitted model to be saved. If it has ``best_estimator_``, that estimator
+        is used for extraction and serialization.
+    X : numpy.ndarray of shape (n_samples, n_features)
+        Full feature matrix used during fitting (ROI feature space).
+    test_idx : array-like of int
+        Indices of the test samples for this outer fold.
+    train_idx : array-like of int
+        Indices of the training samples for this outer fold (not saved by default,
+        but accepted for completeness and potential extensions).
+    output_dir : str or pathlib.Path
+        Directory to write all artifacts. Created if it does not exist.
+    roi_linidx : numpy.ndarray, optional
+        1D array mapping ROI feature columns back to voxel linear indices; saved
+        as ``roi_linidx.npy`` when provided.
 
-    :returns:
-        None. Artifacts are written to disk at ``output_dir``.
+    Returns
+    -------
+    None
+        Artifacts are written to ``output_dir``.
 
-    **Saved Files**
-        - ``fold_k_test_idx.npy`` – test sample indices
-        - ``fold_k_orig_idx.npy`` – indices of retained ROI features
-        - ``fold_k_weights.npy`` – classifier weights (in full feature space)
-        - ``fold_k_contribution.npy`` – per-sample feature contributions
-        - ``fold_k_decision.npy`` – decision function values
-        - ``fold_k_y_pred.npy`` – predicted labels
-        - ``fold_k_best_estimator.joblib`` – serialized fitted pipeline or estimator
-        - ``fold_k_best_params.json`` – parameter dictionary, with an extra key
-          ``"_searchlight_mode"`` indicating whether the model came from
-          searchlight or ROI decoding
-        - ``roi_linidx.npy`` – optional voxel index mapping (if provided)
+    Saved Files
+    -----------
+    - ``fold_k_test_idx.npy`` : test sample indices (echo of `test_idx`).
+    - ``fold_k_orig_idx.npy`` : indices of retained ROI features after var/selector.
+    - ``fold_k_weights.npy`` :
+        * **Binary:** shape ``(n_features,)``
+        * **Multiclass:** shape ``(n_classes, n_features)``
+    - ``fold_k_contribution.npy`` :
+        * **Binary:** shape ``(n_test, n_features)``
+        * **Multiclass:** shape ``(n_test, n_features, n_classes)``
+    - ``fold_k_decision.npy`` *(optional)* :
+        Decision values if available:
+        * **Binary:** shape ``(n_test,)``
+        * **Multiclass:** shape ``(n_test, n_classes)``
+        Omitted if the estimator exposes neither ``decision_function`` nor
+        ``predict_proba``.
+    - ``fold_k_y_pred.npy`` : predicted labels (shape ``(n_test,)``).
+    - ``fold_k_classes.npy`` *(optional)* :
+        Class label order used by the classifier (``clf.classes_``), saved when present.
+        Important for interpreting columns of multiclass outputs.
+    - ``fold_k_best_estimator.joblib`` : serialized fitted pipeline/estimator.
+    - ``fold_k_best_params.json`` : chosen parameter dictionary with an extra
+      flag ``"_searchlight_mode"`` indicating whether the model came from
+      searchlight (True) or ROI (False).
+    - ``roi_linidx.npy`` *(optional)* : voxel index mapping (if provided).
 
-    **Behavior**
-        - If ``model`` has a ``best_estimator_`` attribute, it is treated as a
-          :class:`~sklearn.model_selection.GridSearchCV` and the tuned estimator
-          is extracted via ``model.best_estimator_``.
-        - Otherwise, the function assumes a simple pipeline (searchlight path)
-          and saves it directly.
-        - Parameters are taken from ``model.best_params_`` if available; otherwise,
-          from ``fitted.named_steps["clf"].get_params()`` or fallback to
-          ``fitted.get_params(deep=False)``.
-        - The parameter JSON is augmented with the flag ``"_searchlight_mode"``.
+    Behavior & Notes
+    ----------------
+    - If ``model`` has ``best_estimator_``, it is treated as a search object and
+      the tuned estimator is used. Otherwise, the pipeline is used directly.
+    - Parameters are taken from ``model.best_params_`` when available; otherwise
+      from ``fitted.named_steps["clf"].get_params()`` (fallback to
+      ``fitted.get_params(deep=False)``).
+    - Multiclass compatibility:
+        * Weights and contributions are saved in per-class form when applicable.
+        * The classifier’s ``classes_`` (if present) is saved to disambiguate class order.
+    - Existing files with the same names are overwritten.
 
-    **Example**
-        .. code-block:: python
-
-            _save_pipeline(
-                model=trained_model,
-                X=X_mm,
-                test_idx=test_idx,
-                train_idx=train_idx,
-                output_dir="results/roi_01/fold-00",
-                roi_linidx=roi_idx
-            )
-
-    .. note::
-       - Each call overwrites existing files with the same names in ``output_dir``.
-       - The saved parameter JSON is human-readable and suitable for tracking
-         model provenance.
-       - The directory structure should be managed by the caller (e.g., one folder
-         per outer CV fold).
+    Examples
+    --------
+    >>> _save_pipeline(
+    ...     model=trained_model,
+    ...     X=X_mm,
+    ...     test_idx=test_idx,
+    ...     train_idx=train_idx,
+    ...     output_dir="results/roi_01/fold-00",
+    ...     roi_linidx=roi_idx,
+    ... )
     """
-
     # Ensure directory exists
     os.makedirs(output_dir, exist_ok=True)
 
@@ -753,15 +932,29 @@ def _save_pipeline(model, X, test_idx, train_idx, output_dir, roi_linidx=None):
     is_grid = hasattr(model, "best_estimator_")
     fitted = model.best_estimator_ if is_grid else model
 
-    # ---- 1) Save fold outputs (whatever your extractor returns)
+    # 1) Extract fold outputs (binary & multiclass supported)
     ddict = extract_from_pipeline(fitted, X, test_idx)
+
+    # Save everything extractable, but skip keys with None values (e.g., decision=None)
     for key, val in ddict.items():
+        if val is None:
+            # skip saving absent artifacts (e.g., no decision_function/proba)
+            continue
         np.save(opj(output_dir, f"fold_k_{key}.npy"), val)
 
-    # ---- 2) Save the fitted estimator
+    # 1a) Save classifier classes_ ordering if available (helps interpret multiclass)
+    try:
+        clf = fitted.named_steps["clf"]
+        if hasattr(clf, "classes_"):
+            np.save(opj(output_dir, "fold_k_classes.npy"), clf.classes_)
+    except Exception:
+        # pipeline might not have a "clf" step (unlikely here); ignore silently
+        pass
+
+    # 2) Save the fitted estimator
     dump(fitted, opj(output_dir, "fold_k_best_estimator.joblib"))
 
-    # ---- 3) Save params JSON (robust to both cases)
+    # 3) Save params JSON (robust to both cases)
     if is_grid:
         best_params = model.best_params_
     else:
@@ -771,103 +964,142 @@ def _save_pipeline(model, X, test_idx, train_idx, output_dir, roi_linidx=None):
         except Exception:
             best_params = fitted.get_params(deep=False)
 
-    # Optional: tag so you can tell which path produced this
     out_params = {"_searchlight_mode": (not is_grid), **best_params}
-
     with open(opj(output_dir, "fold_k_best_params.json"), "w") as f:
         json.dump(out_params, f, indent=2)
 
-    # ---- 4) Save ROI mapping if provided
+    # 4) Save ROI mapping if provided
     if isinstance(roi_linidx, np.ndarray):
         np.save(opj(output_dir, "roi_linidx.npy"), roi_linidx)
 
 
 def _folds_for_labels(cfg, labels, groups=None):
     """
-    Generate outer cross-validation folds for decoding, mirroring the ROI path
-    behavior while supporting both group-based and legacy split schemes.
+    Generate outer cross-validation folds for decoding, supporting both
+    group-based and legacy within-class split schemes.
 
-    Depending on the decoding configuration, this function either:
-    
-    - Uses a configured cross-validation splitter (e.g., StratifiedKFold, LeaveOneGroupOut)
-      if ``permute_within_groups=True`` in ``cfg``; or
-    - Falls back to a legacy deterministic scheme that selects every *k*-th
-      trial within each class as the test set.
+    This helper determines how outer folds are constructed for decoding analyses,
+    depending on the configuration flags in ``cfg``. It mirrors the ROI decoding
+    pipeline logic while maintaining backward compatibility with legacy
+    “every-kth” splitting for simpler setups.
 
-    :param dict cfg:
-        Decoding settings dictionary. Expected keys include:
-        
-        * ``"permute_within_groups"`` – bool indicating whether to use group-aware CV.
-        * ``"outer_cv"`` – configuration passed to :func:`factory.cv_from_config`
-          (only used when ``permute_within_groups=True``).
-        * ``"fold_interval"`` – integer specifying the interval for legacy
-          “every-third” folding (used when ``permute_within_groups=False``).
-    :param array_like labels:
-        Label vector of shape ``(n_samples,)`` containing class assignments.
-        Must contain binary or categorical values.
-    :param array_like groups:
-        Optional group labels of shape ``(n_samples,)`` used when
-        group-aware cross-validation is enabled (e.g., runs or subjects).
+    Specifically:
+      - When ``permute_within_groups=True``, group-aware CV is performed using
+        a splitter constructed via :func:`factory.cv_from_config`.
+      - When ``permute_within_groups=False``, a deterministic “every-kth”
+        split scheme is used, in which samples are divided within each class.
 
-    :returns:
-        A list of tuples ``(train_idx, test_idx)``, where each element contains
-        the integer indices for the training and test sets of one outer fold.
-    :rtype:
-        list[tuple[numpy.ndarray, numpy.ndarray]]
+    Parameters
+    ----------
+    cfg : dict
+        Decoding configuration dictionary. Expected keys include:
 
-    **Behavior**
-        - If ``permute_within_groups=True``:
-          - Uses :func:`factory.cv_from_config(cfg["outer_cv"])`
-            to instantiate a cross-validation splitter.
-          - Generates folds by calling ``split(dummy_X, labels, groups)`` where
-            ``dummy_X`` is a placeholder array (since most splitters ignore features).
-        - If ``permute_within_groups=False``:
-          - Implements the legacy “every *k*-th within-class” strategy:
-            samples in each class are partitioned such that every *k*-th
-            sample (as determined by ``fold_interval``) is assigned to the
-            test set in one fold.
-          - Training indices are the complement of test indices.
+        - ``"permute_within_groups"`` : bool
+            Whether to perform group-aware outer CV (e.g., leave-one-run-out).
+        - ``"outer_cv"`` : dict
+            Cross-validation configuration passed to
+            :func:`factory.cv_from_config` when group-based splitting is used.
+        - ``"fold_interval"`` : int
+            Interval controlling the legacy “every-kth” folding strategy,
+            used when ``permute_within_groups=False``.
+    labels : array-like of shape (n_samples,)
+        Class labels for decoding (binary or multiclass). Must be aligned
+        with the feature matrix used elsewhere in decoding.
+    groups : array-like of shape (n_samples,), optional
+        Group identifiers used for cross-validation when
+        ``permute_within_groups=True``. Typically corresponds to runs,
+        sessions, or subjects.
 
-    **Example**
-        .. code-block:: python
+    Returns
+    -------
+    folds : list of tuple(ndarray, ndarray)
+        List of (train_idx, test_idx) pairs defining each outer fold.
+        Each index array contains integer sample indices for the corresponding split.
 
-            cfg = {
-                "permute_within_groups": True,
-                "outer_cv": {"type": "LeaveOneGroupOut"}
-            }
-            folds = _folds_for_labels(cfg, labels, groups=runs)
-            print(f"{len(folds)} outer folds generated")
+    Notes
+    -----
+    **Group-aware mode (``permute_within_groups=True``)**
+        - Uses :func:`factory.cv_from_config(cfg["outer_cv"])` to instantiate
+          a cross-validation splitter (e.g., StratifiedKFold, LeaveOneGroupOut,
+          StratifiedGroupKFold).
+        - Generates folds by calling ``split(dummy_X, labels, groups)``, where
+          ``dummy_X`` is a placeholder array of zeros with length equal to ``labels``.
+        - Ensures group-respecting splits compatible with permutation-based
+          decoding when labels are shuffled within groups.
 
-        .. code-block:: python
+    **Legacy “every-kth” mode (``permute_within_groups=False``)**
+        - Implements a deterministic split that partitions samples within
+          each class label such that every *k*-th sample (as specified by
+          ``fold_interval``) is used for testing in a distinct fold.
+        - Training indices are all remaining samples not in the current test set.
+        - The number of folds equals the value of ``fold_interval``.
 
-            # Legacy "every third" fallback
-            cfg = {"permute_within_groups": False, "fold_interval": 3}
-            folds = _folds_for_labels(cfg, labels)
-            print(len(folds))  # → 3
+    **Multiclass Behavior**
+        - For multiclass data, the legacy path applies the same “every-kth”
+          logic independently to each class label, ensuring each class
+          contributes approximately equal samples per fold.
+        - When ``permute_within_groups=True``, any valid scikit-learn CV
+          splitter compatible with multiclass labels can be used.
 
-    .. note::
-       - When using the legacy folding mode, the labels are assumed to be
-         binary and balanced across classes.
-       - The group-aware path provides compatibility with the ROI decoding
-         configuration logic (via :func:`factory.cv_from_config`).
-       - The “every-third” approach ensures that each sample appears once
-         in the test set across all folds, similar to manual k-fold CV.
+    Examples
+    --------
+    Group-aware outer CV (recommended for ROI decoding):
+
+    >>> cfg = {
+    ...     "permute_within_groups": True,
+    ...     "outer_cv": {"type": "LeaveOneGroupOut"}
+    ... }
+    >>> folds = _folds_for_labels(cfg, labels, groups=runs)
+    >>> print(f"{len(folds)} outer folds generated")
+
+    Legacy “every third” fallback (simple binary or multiclass):
+
+    >>> cfg = {"permute_within_groups": False, "fold_interval": 3}
+    >>> folds = _folds_for_labels(cfg, labels)
+    >>> len(folds)
+    3
+
+    See Also
+    --------
+    factory.cv_from_config : Builds scikit-learn CV splitters from configuration.
+    sklearn.model_selection.StratifiedKFold
+    sklearn.model_selection.LeaveOneGroupOut
+    sklearn.model_selection.StratifiedGroupKFold
+
+    Notes
+    -----
+    - The legacy mode assumes roughly balanced class distributions.
+      It is deterministic and ensures that each sample appears once
+      in the test set across all folds.
+    - The group-aware path is recommended for reproducibility and
+      consistency with ROI-based decoding pipelines.
+    - When labels are permuted within groups during permutation testing,
+      group-aware CV ensures that group boundaries are respected.
     """
 
+    labs = np.asarray(labels)
+    n = len(labs)
+    
     if cfg.get("permute_within_groups"):
-        outer = factory.cv_from_config(cfg["outer_cv"])
-        dummy_X = np.zeros_like(labels)  # not used by splitter
-        folds = [(tr, te) for tr, te in outer.split(dummy_X, labels, groups)]
-    else:
-        # legacy “every third within class” (your define_folds)
-        labs = np.asarray(labels)
-        n_trials = len(labs)
-        z_idx = np.where(labs == 0)[0]
-        o_idx = np.where(labs == 1)[0]
-        folds = []
-        k = int(cfg["fold_interval"])
-        for off in range(k):
-            te = np.concatenate([z_idx[off::k], o_idx[off::k]])
-            tr = np.setdiff1d(np.arange(n_trials), te)
-            folds.append((tr, te))
+        cv = factory.cv_from_config(cfg["outer_cv"])
+        dummy_X = np.zeros((n, 1), dtype=int)
+        folds = [(tr, te) for tr, te in (
+            cv.split(dummy_X, labs, groups) if groups is not None else cv.split(dummy_X, labs)
+        )]
+        return folds
+
+    # legacy “every third within class” (your define_folds)
+    k = int(cfg.get("fold_interval", 3))
+    classes = np.unique(labs)
+    folds = []
+    all_idx = np.arange(n)
+
+    # Build test sets by taking every k-th index *within each class*, then union across classes
+    per_class_indices = {c: np.where(labs == c)[0] for c in classes}
+    for off in range(k):
+        te_slices = [idxs[off::k] for idxs in per_class_indices.values()]
+        te = np.concatenate(te_slices, dtype=int) if te_slices else np.empty(0, int)
+        tr = np.setdiff1d(all_idx, te, assume_unique=False)
+        folds.append((tr, te))
+
     return folds
