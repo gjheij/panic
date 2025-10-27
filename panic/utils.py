@@ -40,183 +40,6 @@ def dump_yaml(data: Dict[str, Any], path: Path) -> None:
         yaml.safe_dump(data, f, sort_keys=False)
 
 
-def recon_contribution(roi, lin_roi, contrib_path, output_file=None):
-    """
-    Reconstruct per-trial and mean contribution maps into a 4D NIfTI image.
-
-    This function takes a matrix of per-trial voxel contributions (e.g., model
-    weights × activations) defined over an ROI and projects them back into the
-    3D image space of a reference NIfTI. It returns (or saves) a 4D image with
-    one volume per trial plus a final volume that is the voxelwise mean across
-    trials.
-
-    Parameters
-    ----------
-    roi : str or nibabel.Nifti1Image
-        Reference image (or path to it) that supplies the target spatial shape
-        and affine. Typically an ROI mask or a reference beta/mean image.
-        Only ``img.shape[:3]`` and ``img.affine`` are used.
-    lin_roi : str
-        Path to a ``.npy`` file containing the **linear voxel indices** (1D) of
-        the ROI in the reference image. These indices must match the column
-        order of ``contrib`` and assume **NumPy C-order raveling**
-        (i.e., consistent with ``np.ravel`` / ``reshape(..., order='C')``).
-    contrib_path : str
-        Path to a ``.npy`` file with shape ``(n_trials, n_voxels_in_roi)`` containing
-        per-trial contribution values. A 1D array of shape ``(n_voxels_in_roi,)`` is
-        also accepted and will be treated as a single trial.
-    output_file : str or None, optional
-        If provided, the reconstructed 4D NIfTI is written to this path and the
-        function returns ``None``. If ``None`` (default), a
-        :class:`nibabel.Nifti1Image` is returned instead.
-
-    Returns
-    -------
-    img4d : nibabel.Nifti1Image or None
-        If ``output_file`` is ``None``, returns a NIfTI image with shape
-        ``(X, Y, Z, n_trials + 1)`` where the last volume is the mean across
-        trials. If ``output_file`` is set, returns ``None`` after saving.
-
-    Notes
-    -----
-    - Linear indices in ``lin_roi`` must reference the flattened reference grid
-      in **C-order** (as produced by ``np.ravel``). If your indices were created
-      with Fortran-order or a different flattening convention, the reconstruction
-      will be spatially misaligned.
-    - The output affine is copied from the reference image. The reference header
-      is not propagated; modify as needed before saving if header fields matter.
-    - Inputs are loaded via :func:`numpy.load` and must be saved as ``.npy``.
-    - A copy-safe path is used: the function allocates a zero-filled 1D buffer
-      per volume, assigns ROI values by index, then reshapes to 3D.
-
-    Examples
-    --------
-    Return an in-memory 4D image:
-
-    >>> img = recon_contribution(
-    ...     roi="roi_mask.nii.gz",
-    ...     lin_roi="roi_linidx.npy",
-    ...     contrib_path="sub-01_contrib.npy"
-    ... )
-    >>> import nibabel as nib
-    >>> nib.save(img, "sub-01_contrib_4d.nii.gz")
-
-    Save directly to disk:
-
-    >>> recon_contribution(
-    ...     roi="roi_mask.nii.gz",
-    ...     lin_roi="roi_linidx.npy",
-    ...     contrib_path="sub-01_contrib.npy",
-    ...     output_file="sub-01_contrib_4d.nii.gz"
-    ... )
-
-    See Also
-    --------
-    numpy.ravel, numpy.reshape
-    nibabel.Nifti1Image
-    """
-
-    # load reference image ---
-    if isinstance(roi, str):
-        img = nib.load(roi)
-    elif isinstance(roi, nib.Nifti1Image):
-        img = roi
-    else:
-        raise TypeError("`roi` must be a file path or Nifti1Image object.")
-
-    affine = img.affine
-    roi_shape = img.shape[:3]
-
-    # load data ---
-    roi_linidx = np.load(lin_roi)
-    contrib = np.load(contrib_path)  # (n_trials, n_voxels_in_roi)
-
-    if contrib.ndim == 1:
-        contrib = contrib[None, :]  # ensure 2D
-
-    n_trials, n_vox = contrib.shape
-    assert len(roi_linidx) == n_vox, \
-        f"ROI voxels ({len(roi_linidx)}) != contribution size ({n_vox})"
-
-    # reconstruct each 3D volume ---
-    vols = []
-    for i in range(n_trials):
-        vol = np.zeros(np.prod(roi_shape), dtype=np.float32)
-        vol[roi_linidx] = contrib[i]
-        vols.append(vol.reshape(roi_shape))
-
-    # append the mean volume ---
-    mean_vol = np.zeros(np.prod(roi_shape), dtype=np.float32)
-    mean_vol[roi_linidx] = contrib.mean(axis=0)
-    vols.append(mean_vol.reshape(roi_shape))
-
-    img4d = np.stack(vols, axis=-1)
-    w_img = nib.Nifti1Image(img4d, affine)
-
-    # save or return ---
-    if output_file is not None:
-        nib.save(w_img, output_file)
-        print(f"[INFO] Saved contribution map: {output_file}")
-        return None
-    else:
-        return w_img
-
-def recon_weights(roi, lin_roi, weights_path, output_file=None):
-    """
-    Reconstruct a voxelwise weight map (e.g., SVM coefficients) into a 3D NIfTI.
-
-    Parameters
-    ----------
-    roi : str or nib.Nifti1Image
-        Reference NIfTI (ROI or beta image) defining spatial dimensions and affine.
-    lin_roi : str
-        Path to .npy file with linear voxel indices of the ROI (as used during decoding).
-    weights_path : str
-        Path to .npy file with model weights, shape = (n_voxels_in_roi,).
-    output_file : str, optional
-        Path to save the reconstructed NIfTI file.
-        If None, returns the nibabel Nifti1Image object.
-
-    Returns
-    -------
-    nib.Nifti1Image or None
-        The 3D reconstructed weight map.
-    """
-
-    # Load reference image
-    if isinstance(roi, str):
-        img = nib.load(roi)
-    elif isinstance(roi, nib.Nifti1Image):
-        img = roi
-    else:
-        raise TypeError("`roi` must be a file path or Nifti1Image object.")
-
-    affine = img.affine
-    roi_shape = img.shape[:3]
-
-    # Load data
-    roi_linidx = np.load(lin_roi)
-    weights = np.load(weights_path)
-
-    if weights.ndim != 1:
-        raise ValueError(f"Expected 1D weight vector, got shape {weights.shape}")
-
-    assert len(roi_linidx) == weights.shape[0], \
-        f"ROI voxels ({len(roi_linidx)}) != weights size ({weights.shape[0]})"
-
-    # Fill into 3D volume
-    full_map = np.zeros(np.prod(roi_shape), dtype=np.float32)
-    full_map[roi_linidx] = weights
-    w_img = nib.Nifti1Image(full_map.reshape(roi_shape), affine)
-
-    # Save or return
-    if output_file is not None:
-        nib.save(w_img, output_file)
-        print(f"[INFO] Saved weight map: {output_file}")
-        return None
-    else:
-        return w_img
-
 def pipeline_from_config(
     cfg,
     *,
@@ -747,15 +570,13 @@ def extract_from_pipeline(model, X, test_idx):
     sklearn.linear_model.LogisticRegression
     sklearn.svm.LinearSVC
     """
-    # unwrap search objects
+
     pipe = model.best_estimator_ if hasattr(model, "best_estimator_") else model
 
-    # fetch steps (allow 'passthrough')
-    var = pipe.named_steps.get("var", None)         # VarianceThreshold or 'passthrough' or None
-    sel = pipe.named_steps.get("select", None)      # selector or 'passthrough' or None
+    var = pipe.named_steps.get("var", None)
+    sel = pipe.named_steps.get("select", None)
     clf = pipe.named_steps["clf"]
 
-    # --- safe index helpers ---------------------------------------------------
     def _safe_get_support(step, n_feats):
         if step is None or step == "passthrough":
             return np.arange(n_feats)
@@ -764,37 +585,103 @@ def extract_from_pipeline(model, X, test_idx):
         if hasattr(step, "support_"):
             sup = np.asarray(step.support_, dtype=bool)
             return np.flatnonzero(sup)
-        # fallback: identity
+        # transformers like PCA have no support mask → identity here;
+        # mapping to ROI is handled separately below for PCA.
         return np.arange(n_feats)
 
-    # indices mapping back to ROI feature space
     n_features = X.shape[1]
     var_idx = _safe_get_support(var, n_features)
-    sel_idx = _safe_get_support(sel, len(var_idx))
-    orig_idx = var_idx[sel_idx]  # indices in original ROI feature space
 
-    # --- weights (support multiclass) ----------------------------------------
+    # --- detect PCA in 'select' step
+    is_pca = (sel is not None and sel != "passthrough" and hasattr(sel, "components_"))
+
     if not hasattr(clf, "coef_"):
         raise ValueError("Classifier does not expose `coef_`; cannot compute linear weights.")
     coef = clf.coef_
-    # binary → (n_selected,), multiclass → (n_classes, n_selected)
     if coef.ndim == 1:
-        coef = coef[np.newaxis, :]  # (1, n_selected)
+        coef = coef[np.newaxis, :]  # (1, n_selected_or_pc)
 
-    n_classes, n_selected = coef.shape
-    if n_selected != len(orig_idx):
-        # Some estimators store coef in a different transformed space; guard.
+    Xt = X[test_idx]  # original ROI space
+
+    if is_pca:
+        # 1) pre-PCA features (after var + scaler, before PCA)
+        #    Build a small pipeline: var -> scaler (skip 'select' since it is PCA)
+        #    We can apply steps one by one for clarity.
+        Z = Xt
+        if var is not None and var != "passthrough":
+            # keep only var_idx features
+            Z = Z[:, var_idx]
+        scaler = pipe.named_steps.get("scaler", None)
+        if scaler is not None and scaler != "passthrough":
+            Z = scaler.transform(Z)  # (n_test, n_pre)
+
+        # 2) map weights from PC space back to pre-PCA feature space
+        #    sel.components_: (n_components, n_pre)
+        comps = sel.components_  # rows are PCs
+        # coef: (n_classes, n_components)
+        # weights in pre-PCA feature space:
+        w_pre = coef @ comps  # (n_classes, n_pre)
+
+        # 3) expand to full ROI by placing pre-PCA weights at var_idx
+        n_classes = w_pre.shape[0]
+        w_full = np.zeros((n_classes, n_features), dtype=float)
+        w_full[:, var_idx] = w_pre
+
+        # 4) contributions in ROI space (per class)
+        #    Z is (n_test, n_pre); contributions per feature = Z * w_pre (broadcast)
+        contrib_pre = Z[:, None, :] * w_pre[None, :, :]  # (n_test, n_classes, n_pre)
+        # expand to ROI space
+        n_test = Z.shape[0]
+        contrib_full = np.zeros((n_test, n_features, n_classes), dtype=float)
+        for c in range(n_classes):
+            contrib_full[:, var_idx, c] = contrib_pre[:, c, :]
+
+        # 5) decisions / predictions from pipeline (already includes PCA step)
+        if hasattr(pipe, "decision_function"):
+            dec = pipe.decision_function(Xt)
+        elif hasattr(pipe, "predict_proba"):
+            dec = pipe.predict_proba(Xt)
+        else:
+            dec = None
+        y_pred = pipe.predict(Xt)
+
+        # 6) orig_idx for bookkeeping: with PCA we didn’t select a subset after var
+        #    (all var_idx are used, just linearly remixed), so:
+        orig_idx = var_idx
+
+        # shapes as in the multiclass doc:
+        if n_classes == 1:
+            weights_out = w_full[0]
+            contrib_out = contrib_full[:, :, 0]
+        else:
+            weights_out = w_full
+            contrib_out = contrib_full
+
+        return {
+            "test_idx": np.asarray(test_idx),
+            "orig_idx": orig_idx,
+            "weights": weights_out,
+            "contribution": contrib_out,
+            "decision": dec,
+            "y_pred": y_pred,
+        }
+
+    # --- non-PCA path (selectors with get_support or passthrough) -------------
+    sel_idx = _safe_get_support(sel, len(var_idx))
+    orig_idx = var_idx[sel_idx]
+
+    n_selected = len(orig_idx)
+    if coef.shape[1] != n_selected:
         raise ValueError(
-            f"Classifier coef_ width ({n_selected}) != selected features ({len(orig_idx)})."
+            f"Classifier coef_ width ({coef.shape[1]}) != selected features ({n_selected})."
         )
 
-    # expand weights back to full ROI space
+    # expand weights back to ROI space
+    n_classes = coef.shape[0]
     w_full = np.zeros((n_classes, n_features), dtype=float)
     w_full[:, orig_idx] = coef
 
     # decisions / predictions
-    Xt = X[test_idx]
-    # decision_function preferred; else probabilities; else None
     if hasattr(pipe, "decision_function"):
         dec = pipe.decision_function(Xt)
     elif hasattr(pipe, "predict_proba"):
@@ -803,38 +690,31 @@ def extract_from_pipeline(model, X, test_idx):
         dec = None
     y_pred = pipe.predict(Xt)
 
-    # per-sample contributions
-    # Transform test features up to, but excluding, the classifier
-    Xt_test = pipe[:-1].transform(Xt)  # shape: (n_test, n_selected)
+    # contributions in selected space
+    Xt_test = pipe[:-1].transform(Xt)  # includes 'select' since it's not PCA
+    contrib_sel = Xt_test[:, None, :] * coef[None, :, :]  # (n_test, n_classes, n_selected)
 
-    # contributions in selected feature space:
-    # (n_test, n_classes, n_selected) = (n_test, 1, n_selected) for binary
-    contrib_sel = Xt_test[:, None, :] * coef[None, :, :]  # broadcast
-
-    # expand back to ROI space per class
+    # expand to ROI
     n_test = Xt_test.shape[0]
-    if n_classes == 1:
-        # maintain backward-compatible shapes
-        contrib_full = np.zeros((n_test, n_features), dtype=float)
-        contrib_full[:, orig_idx] = contrib_sel[:, 0, :]
-        weights_out = w_full[0]  # (n_features,)
-    else:
-        # (n_test, n_features, n_classes)
-        contrib_full = np.zeros((n_test, n_features, n_classes), dtype=float)
-        for c in range(n_classes):
-            contrib_full[:, orig_idx, c] = contrib_sel[:, c, :]
-        weights_out = w_full  # (n_classes, n_features)
+    contrib_full = np.zeros((n_test, n_features, n_classes), dtype=float)
+    for c in range(n_classes):
+        contrib_full[:, orig_idx, c] = contrib_sel[:, c, :]
 
-    ddict = {
+    if n_classes == 1:
+        weights_out = w_full[0]
+        contrib_out = contrib_full[:, :, 0]
+    else:
+        weights_out = w_full
+        contrib_out = contrib_full
+
+    return {
         "test_idx": np.asarray(test_idx),
         "orig_idx": orig_idx,
         "weights": weights_out,
-        "contribution": contrib_full,
+        "contribution": contrib_out,
         "decision": dec,
         "y_pred": y_pred,
     }
-
-    return ddict
 
 def _save_pipeline(model, X, test_idx, train_idx, output_dir, roi_linidx=None):
     """
@@ -1103,3 +983,180 @@ def _folds_for_labels(cfg, labels, groups=None):
         folds.append((tr, te))
 
     return folds
+
+def recon_contribution(roi, lin_roi, contrib_path, output_file=None):
+    """
+    Reconstruct per-trial and mean contribution maps into a 4D NIfTI image.
+
+    This function takes a matrix of per-trial voxel contributions (e.g., model
+    weights × activations) defined over an ROI and projects them back into the
+    3D image space of a reference NIfTI. It returns (or saves) a 4D image with
+    one volume per trial plus a final volume that is the voxelwise mean across
+    trials.
+
+    Parameters
+    ----------
+    roi : str or nibabel.Nifti1Image
+        Reference image (or path to it) that supplies the target spatial shape
+        and affine. Typically an ROI mask or a reference beta/mean image.
+        Only ``img.shape[:3]`` and ``img.affine`` are used.
+    lin_roi : str
+        Path to a ``.npy`` file containing the **linear voxel indices** (1D) of
+        the ROI in the reference image. These indices must match the column
+        order of ``contrib`` and assume **NumPy C-order raveling**
+        (i.e., consistent with ``np.ravel`` / ``reshape(..., order='C')``).
+    contrib_path : str
+        Path to a ``.npy`` file with shape ``(n_trials, n_voxels_in_roi)`` containing
+        per-trial contribution values. A 1D array of shape ``(n_voxels_in_roi,)`` is
+        also accepted and will be treated as a single trial.
+    output_file : str or None, optional
+        If provided, the reconstructed 4D NIfTI is written to this path and the
+        function returns ``None``. If ``None`` (default), a
+        :class:`nibabel.Nifti1Image` is returned instead.
+
+    Returns
+    -------
+    img4d : nibabel.Nifti1Image or None
+        If ``output_file`` is ``None``, returns a NIfTI image with shape
+        ``(X, Y, Z, n_trials + 1)`` where the last volume is the mean across
+        trials. If ``output_file`` is set, returns ``None`` after saving.
+
+    Notes
+    -----
+    - Linear indices in ``lin_roi`` must reference the flattened reference grid
+      in **C-order** (as produced by ``np.ravel``). If your indices were created
+      with Fortran-order or a different flattening convention, the reconstruction
+      will be spatially misaligned.
+    - The output affine is copied from the reference image. The reference header
+      is not propagated; modify as needed before saving if header fields matter.
+    - Inputs are loaded via :func:`numpy.load` and must be saved as ``.npy``.
+    - A copy-safe path is used: the function allocates a zero-filled 1D buffer
+      per volume, assigns ROI values by index, then reshapes to 3D.
+
+    Examples
+    --------
+    Return an in-memory 4D image:
+
+    >>> img = recon_contribution(
+    ...     roi="roi_mask.nii.gz",
+    ...     lin_roi="roi_linidx.npy",
+    ...     contrib_path="sub-01_contrib.npy"
+    ... )
+    >>> import nibabel as nib
+    >>> nib.save(img, "sub-01_contrib_4d.nii.gz")
+
+    Save directly to disk:
+
+    >>> recon_contribution(
+    ...     roi="roi_mask.nii.gz",
+    ...     lin_roi="roi_linidx.npy",
+    ...     contrib_path="sub-01_contrib.npy",
+    ...     output_file="sub-01_contrib_4d.nii.gz"
+    ... )
+
+    See Also
+    --------
+    numpy.ravel, numpy.reshape
+    nibabel.Nifti1Image
+    """
+
+    # load reference image ---
+    if isinstance(roi, str):
+        img = nib.load(roi)
+    elif isinstance(roi, nib.Nifti1Image):
+        img = roi
+    else:
+        raise TypeError("`roi` must be a file path or Nifti1Image object.")
+
+    affine = img.affine
+    roi_shape = img.shape[:3]
+
+    # load data ---
+    roi_linidx = np.load(lin_roi)
+    contrib = np.load(contrib_path)  # (n_trials, n_voxels_in_roi)
+
+    if contrib.ndim == 1:
+        contrib = contrib[None, :]  # ensure 2D
+
+    n_trials, n_vox = contrib.shape
+    assert len(roi_linidx) == n_vox, \
+        f"ROI voxels ({len(roi_linidx)}) != contribution size ({n_vox})"
+
+    # reconstruct each 3D volume ---
+    vols = []
+    for i in range(n_trials):
+        vol = np.zeros(np.prod(roi_shape), dtype=np.float32)
+        vol[roi_linidx] = contrib[i]
+        vols.append(vol.reshape(roi_shape))
+
+    # append the mean volume ---
+    mean_vol = np.zeros(np.prod(roi_shape), dtype=np.float32)
+    mean_vol[roi_linidx] = contrib.mean(axis=0)
+    vols.append(mean_vol.reshape(roi_shape))
+
+    img4d = np.stack(vols, axis=-1)
+    w_img = nib.Nifti1Image(img4d, affine)
+
+    # save or return ---
+    if output_file is not None:
+        nib.save(w_img, output_file)
+        print(f"[INFO] Saved contribution map: {output_file}")
+        return None
+    else:
+        return w_img
+
+def recon_weights(roi, lin_roi, weights_path, output_file=None):
+    """
+    Reconstruct a voxelwise weight map (e.g., SVM coefficients) into a 3D NIfTI.
+
+    Parameters
+    ----------
+    roi : str or nib.Nifti1Image
+        Reference NIfTI (ROI or beta image) defining spatial dimensions and affine.
+    lin_roi : str
+        Path to .npy file with linear voxel indices of the ROI (as used during decoding).
+    weights_path : str
+        Path to .npy file with model weights, shape = (n_voxels_in_roi,).
+    output_file : str, optional
+        Path to save the reconstructed NIfTI file.
+        If None, returns the nibabel Nifti1Image object.
+
+    Returns
+    -------
+    nib.Nifti1Image or None
+        The 3D reconstructed weight map.
+    """
+
+    # Load reference image
+    if isinstance(roi, str):
+        img = nib.load(roi)
+    elif isinstance(roi, nib.Nifti1Image):
+        img = roi
+    else:
+        raise TypeError("`roi` must be a file path or Nifti1Image object.")
+
+    affine = img.affine
+    roi_shape = img.shape[:3]
+
+    # Load data
+    roi_linidx = np.load(lin_roi)
+    weights = np.load(weights_path)
+
+    if weights.ndim != 1:
+        raise ValueError(f"Expected 1D weight vector, got shape {weights.shape}")
+
+    assert len(roi_linidx) == weights.shape[0], \
+        f"ROI voxels ({len(roi_linidx)}) != weights size ({weights.shape[0]})"
+
+    # Fill into 3D volume
+    full_map = np.zeros(np.prod(roi_shape), dtype=np.float32)
+    full_map[roi_linidx] = weights
+    w_img = nib.Nifti1Image(full_map.reshape(roi_shape), affine)
+
+    # Save or return
+    if output_file is not None:
+        nib.save(w_img, output_file)
+        print(f"[INFO] Saved weight map: {output_file}")
+        return None
+    else:
+        return w_img    

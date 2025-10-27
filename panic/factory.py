@@ -1,6 +1,7 @@
 # cv_factory.py
 import numpy as np
 
+from sklearn.decomposition import PCA
 from sklearn.model_selection import (
     StratifiedKFold, RepeatedStratifiedKFold, StratifiedShuffleSplit,
     GroupKFold, StratifiedGroupKFold, LeaveOneGroupOut, LeavePGroupsOut,
@@ -134,6 +135,7 @@ _FS_REGISTRY = {
     "RFE": RFE,
     "RFECV": RFECV,
     "VarianceThreshold": VarianceThreshold,
+    "PCA": PCA,
     "passthrough": "passthrough",
     "none": "passthrough",
 }
