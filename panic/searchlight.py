@@ -168,45 +168,41 @@ def _voxel_radius_in_voxels(mask_img, radius_mm):
     It assumes approximately isotropic voxel dimensions and falls back to
     reasonable defaults if voxel size metadata is unavailable.
 
-    :param nibabel.Nifti1Image mask_img:
+    Parameters
+    ----------
+    mask_img : nibabel.Nifti1Image
         A 3D NIfTI image (or compatible object) whose header contains voxel
         dimension information in ``pixdim`` or via ``header.get_zooms()``.
-    :param float radius_mm:
+    radius_mm : float
         Searchlight radius expressed in millimeters.
 
-    :returns:
+    Returns
+    -------
+    int
         The radius converted to voxel units, rounded to the nearest integer.
         A minimum of 1 voxel is enforced.
-    :rtype:
-        int
 
-    **Computation Details**
-        - Attempts to extract voxel dimensions using
-          ``mask_img.header.get_zooms()[:3]``.
-        - If unavailable or malformed, falls back to using the array shape
-          of the image data (via ``image.get_data(mask_img).shape[:3]``).
-        - Uses only the first element of the voxel size (x-axis spacing)
-          to compute an approximately isotropic voxel radius:
-          ``radius_vox = round(radius_mm / voxel_size_x)``.
-        - Returns at least 1 to avoid a zero-radius searchlight.
+    Notes
+    -----
+    - Attempts to extract voxel dimensions using
+      ``mask_img.header.get_zooms()[:3]``.
+    - If unavailable or malformed, falls back to using the array shape
+      of the image data (via ``image.get_data(mask_img).shape[:3]``).
+    - Uses only the first element of the voxel size (x-axis spacing)
+      to compute an approximately isotropic voxel radius:
+      ``radius_vox = round(radius_mm / voxel_size_x)``.
+    - Returns at least 1 to avoid a zero-radius searchlight.
+    - Assumes roughly isotropic voxel dimensions; if voxel sizes differ
+      substantially across axes, the result is only an approximation.
+    - Designed for compatibility with fMRI searchlight decoding pipelines.
 
-    **Example**
-        .. code-block:: python
-
-            import nibabel as nib
-
-            mask_img = nib.load("roi_mask.nii.gz")
-            r_vox = _voxel_radius_in_voxels(mask_img, radius_mm=6.0)
-            print(f"Searchlight radius ≈ {r_vox} voxels")
-
-    .. note::
-       - This conversion assumes roughly isotropic voxel dimensions; if
-         voxel sizes differ substantially across axes, the result is only
-         an approximation.
-       - Ensures a minimum radius of 1 voxel to maintain a valid neighborhood.
-       - Designed for compatibility with fMRI searchlight decoding pipelines.
+    Examples
+    --------
+    >>> import nibabel as nib
+    >>> mask_img = nib.load("roi_mask.nii.gz")
+    >>> r_vox = _voxel_radius_in_voxels(mask_img, radius_mm=6.0)
+    >>> print(f"Searchlight radius ≈ {r_vox} voxels")
     """
-
     hdr = mask_img.header
     zooms = np.array(image.get_data(mask_img).shape[:3], dtype=float)  # fallback if header missing pixdim
     try:
@@ -215,6 +211,7 @@ def _voxel_radius_in_voxels(mask_img, radius_mm):
         pass
     vx = float(zooms[0])
     return max(1, int(round(radius_mm / vx)))
+
 
 def _neighbors_ball_mm(zooms, r_mm):
     """
@@ -226,56 +223,55 @@ def _neighbors_ball_mm(zooms, r_mm):
     dimensions. It returns an array of integer voxel offsets suitable for
     constructing searchlight neighborhoods in fMRI decoding analyses.
 
-    :param sequence zooms:
+    Parameters
+    ----------
+    zooms : sequence of float
         Sequence of voxel dimensions (in mm) along the x, y, and z axes,
         typically obtained from a NIfTI image header via
         ``mask_img.header.get_zooms()[:3]``.
         Example: ``(3.5, 3.75, 5.0)``.
-    :param float r_mm:
+    r_mm : float
         Searchlight radius in millimeters.
 
-    :returns:
+    Returns
+    -------
+    numpy.ndarray
         Array of integer voxel offsets ``(dx, dy, dz)`` such that the
         Euclidean distance (in mm) from the origin does not exceed ``r_mm``.
         Shape is ``(n_neighbors, 3)``.
-    :rtype:
-        numpy.ndarray
 
-    **Computation Details**
-        - The voxel-space bounding box is determined by dividing the
-          millimeter radius by voxel sizes along each axis:
-          ``rx = int(r_mm // vx)``, etc.
-        - All integer offset combinations within ``[-rx, rx] × [-ry, ry] × [-rz, rz]``
-          are tested for inclusion using the distance criterion:
-          ``(dx*vx)**2 + (dy*vy)**2 + (dz*vz)**2 <= r_mm**2``.
-        - Returns offsets as a NumPy integer array.
+    Notes
+    -----
+    - The voxel-space bounding box is determined by dividing the
+      millimeter radius by voxel sizes along each axis:
+      ``rx = int(r_mm // vx)``, etc.
+    - All integer offset combinations within
+      ``[-rx, rx] × [-ry, ry] × [-rz, rz]`` are tested for inclusion using
+      the distance criterion:
+      ``(dx*vx)**2 + (dy*vy)**2 + (dz*vz)**2 <= r_mm**2``.
+    - Returns offsets as a NumPy integer array.
+    - The output represents **relative** voxel coordinates; to obtain
+      absolute indices in an image, add these offsets to a voxel’s (i, j, k)
+      coordinates.
+    - Accounts for anisotropic voxel dimensions by scaling distances
+      according to physical spacing.
+    - Designed for use in searchlight mapping and neighborhood-based analyses.
 
-    **Example**
-        .. code-block:: python
-
-            zooms = (3.5, 3.75, 5.0)
-            r_mm = 6.0
-            offsets = _neighbors_ball_mm(zooms, r_mm)
-            print(f"{len(offsets)} neighbors within {r_mm} mm radius")
-
-    .. note::
-       - The output represents **relative** voxel coordinates; to obtain
-         absolute indices in an image, add these offsets to a voxel’s (i, j, k)
-         coordinates.
-       - Accounts for anisotropic voxel dimensions by scaling distances
-         according to physical spacing.
-       - Designed for use in searchlight mapping and neighborhood-based
-         analyses.
+    Examples
+    --------
+    >>> zooms = (3.5, 3.75, 5.0)
+    >>> r_mm = 6.0
+    >>> offsets = _neighbors_ball_mm(zooms, r_mm)
+    >>> print(f"{len(offsets)} neighbors within {r_mm} mm radius")
     """
-
     vx, vy, vz = map(float, zooms[:3])     # e.g. (3.5, 3.75, 5.0)
     rx, ry, rz = int(r_mm // vx), int(r_mm // vy), int(r_mm // vz)
     offs = []
     r2 = r_mm * r_mm
-    for dx in range(-rx, rx+1):
-        for dy in range(-ry, ry+1):
-            for dz in range(-rz, rz+1):
-                if (dx*vx)**2 + (dy*vy)**2 + (dz*vz)**2 <= r2:
+    for dx in range(-rx, rx + 1):
+        for dy in range(-ry, ry + 1):
+            for dz in range(-rz, rz + 1):
+                if (dx * vx) ** 2 + (dy * vy) ** 2 + (dz * vz) ** 2 <= r2:
                     offs.append((dx, dy, dz))
     return np.asarray(offs, dtype=int)
 
@@ -300,102 +296,106 @@ def _one_center(
     searchlight center voxel.
 
     This function performs decoding at one spatial location by extracting
-    the neighborhood of voxels (as defined by ``offsets``), running cross-validated
-    decoding on that subset of features, and computing both the observed and
-    null (permutation) performance estimates.
+    the neighborhood of voxels (as defined by ``offsets``), running
+    cross-validated decoding on that subset of features, and computing both
+    the observed and null (permutation) performance estimates. It returns
+    a compact tuple summarizing key results for the given center voxel,
+    suitable for aggregation across the searchlight volume.
 
-    It returns a compact tuple summarizing all key results for the given
-    center voxel, suitable for aggregation across the searchlight volume.
-
-    :param tuple[int, int, int] center_ijk:
+    Parameters
+    ----------
+    center_ijk : tuple of int
         Integer voxel coordinates ``(i, j, k)`` of the current searchlight center.
-    :param numpy.ndarray offsets:
+    offsets : numpy.ndarray
         Array of voxel offset coordinates ``(dx, dy, dz)`` defining the
         spherical neighborhood (e.g., output of :func:`_neighbors_ball_mm`).
-    :param numpy.ndarray col_index_vol:
+    col_index_vol : numpy.ndarray
         3D integer array mapping voxel coordinates to feature indices within
         the ROI feature space. Entries < 0 indicate non-ROI voxels.
-    :param tuple[int, int, int] vol_shape:
+    vol_shape : tuple of int
         Shape of the full 3D brain volume (e.g., from the mask image).
-    :param numpy.ndarray roi_linidx:
+    roi_linidx : numpy.ndarray
         Linear indices of voxels included in the ROI feature space.
         Used for mapping between image and feature coordinates.
-    :param str X_mm_path:
+    X_mm_path : str
         Path to a ``joblib`` dump containing the full memory-mapped feature
         matrix of shape ``(n_samples, n_features_all_roi)``.
-    :param array_like labels:
+    labels : array_like
         Array of target labels for decoding, shape ``(n_samples,)``.
-    :param list folds:
+    folds : list of tuple
         List of outer cross-validation splits as tuples ``(train_idx, test_idx)``.
-    :param dict cfg:
+    cfg : dict
         Configuration dictionary for decoding, passed to :func:`_cv_mean_score`.
-    :param array_like groups:
-        Optional group labels of shape ``(n_samples,)`` for group-aware CV or
-        within-group permutations.
-    :param int n_perms:
+    groups : array_like
+        Optional group labels of shape ``(n_samples,)`` for group-aware CV
+        or within-group permutations.
+    n_perms : int
         Number of label permutations to run for estimating the null distribution.
-    :param int seed:
-        Random seed controlling the reproducibility of permutation sampling.
-    :param kwargs:
+    seed : int
+        Random seed controlling reproducibility of permutation sampling.
+    **kwargs : dict, optional
         Additional keyword arguments forwarded to :func:`_cv_mean_score`.
 
-    :returns:
-        A 6-element tuple containing:
+    Returns
+    -------
+    tuple
+        A 9-element tuple containing:
+        
+        1. ``center_ijk`` : tuple of int  
+           Voxel coordinates.
+        2. ``obs`` : float  
+           Observed mean cross-validated score.
+        3. ``null_mean`` : float  
+           Mean score under permutation null.
+        4. ``delta`` : float  
+           Difference between observed and null mean.
+        5. ``p`` : float  
+           Empirical p-value computed as
+           ``(sum(perm >= obs) + 1) / (len(perm) + 1)``.
+        6. ``n_feat`` : int  
+           Number of voxels included in the neighborhood.
+        7. ``n_run`` : int  
+           Number of permutation runs actually executed (may stop early).
+        8. ``stopped`` : int  
+           Flag indicating if early stopping occurred (0 or 1).
+        9. ``stop_code`` : int  
+           Encoded reason for stopping (0: none, 1: cannot be significant, 2: already significant).
 
-        1. ``center_ijk`` – voxel coordinates (tuple)
-        2. ``obs`` – observed mean cross-validated score (float)
-        3. ``null_mean`` – mean score under permutation null (float)
-        4. ``delta`` – difference between observed and null mean (float)
-        5. ``p`` – empirical p-value computed as
-           ``(sum(perm >= obs) + 1) / (len(perm) + 1)``
-        6. ``n_feat`` – number of voxels included in the neighborhood (int)
+    Notes
+    -----
+    - Identifies valid voxel neighbors within the searchlight radius
+      using ``offsets`` and ``col_index_vol``.
+    - Skips computation if fewer than 2 valid features are available.
+    - Extracts the relevant feature subset from the memmapped matrix
+      and saves a lightweight temporary file for fast I/O.
+    - Computes the observed decoding score via :func:`utils._cv_mean_score`.
+    - Performs ``n_perms`` permutation runs with an independent RNG initialized from ``seed``.
+    - Aggregates permutation scores and computes ``null_mean``, ``delta``,
+      and empirical ``p``.
+    - The empirical p-value is bias-corrected using a +1 numerator and denominator adjustment.
+    - Uses :func:`numpy.random.default_rng` for reproducible random sampling.
+    - Designed for internal use within parallelized searchlight loops.
 
-    :rtype:
-        tuple[tuple[int, int, int], float, float, float, float, int]
-
-    **Computation Steps**
-        1. Identify valid voxel neighbors within the searchlight radius
-           using ``offsets`` and ``col_index_vol``.
-        2. Skip computation if fewer than 2 valid features are available.
-        3. Extract the relevant feature subset from the memmapped matrix
-           and save a lightweight temporary file for fast I/O.
-        4. Compute the observed decoding score via :func:`utils._cv_mean_score`.
-        5. Perform ``n_perms`` permutation runs, each using an independent RNG
-           initialized from ``seed``.
-        6. Aggregate permutation scores and compute ``null_mean``, ``delta``,
-           and empirical ``p``.
-
-    **Example**
-        .. code-block:: python
-
-            center = (32, 40, 20)
-            offsets = _neighbors_ball_mm((3.5, 3.5, 3.5), 6.0)
-            result = _one_center(
-                center_ijk=center,
-                offsets=offsets,
-                col_index_vol=col_index_vol,
-                vol_shape=(64, 64, 36),
-                roi_linidx=roi_idx,
-                X_mm_path="/tmp/X_roi.joblib",
-                labels=y,
-                folds=folds,
-                cfg=cfg,
-                groups=runs,
-                n_perms=100,
-                seed=1234
-            )
-            print(result)
-            # ((32, 40, 20), 0.71, 0.50, 0.21, 0.01, 87)
-
-    .. note::
-        - For efficiency, the function dumps a small temporary
-            ``joblib`` file containing only the subset of features in
-            the current searchlight neighborhood.
-        - A minimum of 2 valid voxels is required to compute decoding.
-        - The empirical p-value is bias-corrected using a +1 numerator and
-            denominator adjustment.
-        - Uses :func:`numpy.random.default_rng` for reproducible random sampling.
-        - Designed for internal use within parallelized searchlight loops.
+    Examples
+    --------
+    >>> center = (32, 40, 20)
+    >>> offsets = _neighbors_ball_mm((3.5, 3.5, 3.5), 6.0)
+    >>> result = _one_center(
+    ...     center_ijk=center,
+    ...     offsets=offsets,
+    ...     col_index_vol=col_index_vol,
+    ...     vol_shape=(64, 64, 36),
+    ...     roi_linidx=roi_idx,
+    ...     X_mm_path="/tmp/X_roi.joblib",
+    ...     labels=y,
+    ...     folds=folds,
+    ...     cfg=cfg,
+    ...     groups=runs,
+    ...     n_perms=100,
+    ...     seed=1234
+    ... )
+    >>> print(result)
+    ((32, 40, 20), 0.71, 0.50, 0.21, 0.01, 87, 100, 0, 0)
     """
 
     X_mm = load(X_mm_path, mmap_mode="r")  # shape [n_samples, n_features_all_roi]
@@ -470,19 +470,6 @@ def _one_center(
             
     return (cx, cy, cz), float(obs), float(null_mean), float(delta), float(p), int(len(cols)), n_run, int(stopped), int(stop_code)
 
-def permutation_searchlight(
-    betas_img,            # 4D betas (nifti)
-    mask_img,             # binary ROI/brain mask (nifti)
-    trial_list,           # list[str] or array[str] per volume in betas
-    label_mapper,         # dict like {'CS-':0,'CS+':1}
-    cfg,
-    *,
-    groups=None,          # run indices per trial (optional)
-    seed=0,
-    tmpdir="~/.joblib_cache",
-    output_file=None,
-    **kwargs
-):
     """
     Run a permutation-based searchlight decoding analysis and write result maps.
 
@@ -492,56 +479,61 @@ def permutation_searchlight(
     empirical p-value, and number of features used. Work can be parallelized
     across centers.
 
-    :param nibabel.Nifti1Image betas_img:
+    Parameters
+    ----------
+    betas_img : nibabel.Nifti1Image
         4D beta image with shape ``(X, Y, Z, n_samples)``.
-    :param nibabel.Nifti1Image mask_img:
-        Binary ROI (or brain) mask aligned to ``betas_img`` space (or resampled to it).
-    :param sequence trial_list:
-        Trial descriptors aligned with the 4th dimension of ``betas_img``; used
-        by :class:`data.MaskAndFilterBetas` to select and order samples.
-    :param dict label_mapper:
-        Mapping from trial labels (strings) to integer class labels, e.g.
-        ``{'CS-': 0, 'CS+': 1}``.
-    :param dict cfg:
-        Decoding settings dictionary. Expected keys (under ``"searchlight"``) include:
-        ``"radius_mm"`` (float, default 6), ``"n_permutations"`` (int, default 100),
-        ``"n_jobs"`` (int, default 1), and ``"locked"`` (dict of fixed estimator params).
-        Top-level keys reused from ROI path include
-        ``"outer_cv"``, ``"permute_within_groups"``, ``"estimator"``,
-        ``"feature_selection"``, and ``"variance_threshold"``.
-    :param array_like groups:
+    mask_img : nibabel.Nifti1Image
+        Binary ROI (or brain) mask aligned to ``betas_img`` space
+        (or resampled to it).
+    trial_list : sequence of str
+        Trial descriptors aligned with the 4th dimension of ``betas_img``.
+        Used by :class:`data.MaskAndFilterBetas` to select and order samples.
+    label_mapper : dict
+        Mapping from trial labels (strings) to integer class labels,
+        e.g. ``{'CS-': 0, 'CS+': 1}``.
+    cfg : dict
+        Decoding settings dictionary. Expected keys (under ``"searchlight"``)
+        include:
+        - ``radius_mm`` (float, default=6)
+        - ``n_permutations`` (int, default=100)
+        - ``n_jobs`` (int, default=1)
+        - ``locked`` (dict of fixed estimator parameters)
+
+        Top-level keys reused from the ROI path include:
+        - ``outer_cv``
+        - ``permute_within_groups``
+        - ``estimator``
+        - ``feature_selection``
+        - ``variance_threshold``.
+    groups : array_like, optional
         Optional group vector (e.g., run indices) of shape ``(n_samples,)``.
         Enables group-aware folds and within-group permutations.
-    :param int seed:
+    seed : int, default=0
         Global seed for center-wise RNG seeding.
-    :param int n_perms:
-        Number of label permutations to compute for the null distribution.
-        Default is 250. Set with general_settings.n_permutations in config file.     
-    :param str tmpdir:
-        Directory for temporary memmaps and intermediate artifacts
-        (defaults to ``~/.joblib_cache``).
-    :param str | None output_file:
+    tmpdir : str, default="~/.joblib_cache"
+        Directory for temporary memmaps and intermediate artifacts.
+    output_file : str or None, optional
         Optional path forwarded to :class:`data.MaskAndFilterBetas` for writing
         intermediate outputs.
-    :param int n_jobs:
-        Controls the level of parallellization over centers. Default is 1.
-        Should be set in the config file under ``"general_settings.n_jobs"``.
-    :param kwargs:
+    **kwargs : dict, optional
         Additional keyword arguments forwarded to the per-center runner
         :func:`_one_center` and ultimately :func:`utils._cv_mean_score`
         (e.g., estimator-specific options).
 
-    :returns:
+    Returns
+    -------
+    dict of str to str
         Dictionary mapping map names to output file paths:
 
-        * ``"observed"`` – NIfTI of observed cross-validated scores
-        * ``"null_mean"`` – NIfTI of permutation null mean scores
-        * ``"delta"`` – NIfTI of observed − null mean
-        * ``"pvalue"`` – NIfTI of empirical p-values
-        * ``"nfeatures"`` – NIfTI of neighborhood sizes per center
-    :rtype:
-        dict[str, str]
+        - ``"observed"`` : NIfTI of observed cross-validated scores.
+        - ``"null_mean"`` : NIfTI of permutation null mean scores.
+        - ``"delta"`` : NIfTI of observed − null mean.
+        - ``"pvalue"`` : NIfTI of empirical p-values.
+        - ``"nfeatures"`` : NIfTI of neighborhood sizes per center.
 
+    Notes
+    -----
     **Workflow**
         1. Build features and labels within ``ROI ∩ valid`` using
            :class:`data.MaskAndFilterBetas`.
@@ -555,8 +547,9 @@ def permutation_searchlight(
         7. Save a JSON sidecar with key metadata (radius, permutations, CV, etc.).
 
     **Parallelization**
-        - Controlled by ``cfg["parallel"]["n_jobs"]``; when ``> 1``,
-          centers are processed with ``joblib.Parallel`` using the ``loky`` backend.
+        - Controlled by ``cfg["parallel"]["n_jobs"]``.
+        - When ``> 1``, centers are processed with ``joblib.Parallel`` using the
+          ``loky`` backend.
         - Center seeds are drawn from a global RNG initialized by ``seed``.
 
     **Output Files**
@@ -565,30 +558,34 @@ def permutation_searchlight(
         - ``searchlight_delta.nii.gz``
         - ``searchlight_pvalue.nii.gz``
         - ``searchlight_nfeatures.nii.gz``
-        - ``searchlight_desc-metadata.json`` (radius, permutations, CV config, etc.)
+        - ``searchlight_desc-metadata.json`` (contains radius, permutations, CV config, etc.)
 
-    **Example**
-        .. code-block:: python
+    Examples
+    --------
+    >>> out = permutation_searchlight(
+    ...     betas_img=betas,
+    ...     mask_img=mask,
+    ...     trial_list=trials,
+    ...     label_mapper={'CS-': 0, 'CS+': 1},
+    ...     cfg=cfg['decoding_settings'],
+    ...     groups=runs,
+    ...     seed=123,
+    ...     tmpdir="/tmp/sl-cache",
+    ...     save_dir="results/sub-01"
+    ... )
+    >>> print(out["delta"])  # path to delta map
 
-            out = permutation_searchlight(
-                betas_img=betas,
-                mask_img=mask,
-                trial_list=trials,
-                label_mapper={'CS-': 0, 'CS+': 1},
-                cfg=cfg['decoding_settings'],
-                groups=runs,
-                seed=123,
-                tmpdir="/tmp/sl-cache",
-                save_dir="results/sub-01"
-            )
-            print(out["delta"])  # path to delta map
+    See Also
+    --------
+    _one_center : Computes observed and permutation-based decoding accuracy for a single voxel.
+    _neighbors_ball_mm : Computes voxel offsets defining a spherical neighborhood.
+    utils._cv_mean_score : Runs cross-validated decoding for a given feature matrix.
 
-    .. note::
-       - The maps are written on the same grid/affine as the mask resampled to betas.
-       - Neighborhoods respect anisotropic voxel sizes via :func:`_neighbors_ball_mm`.
-       - Empirical p-values use the standard ``(+1)/(+1)`` bias correction.
-       - The function expects linear (coef_)-based classifiers for interpretability,
-         but will still compute scores with non-linear models.
+    References
+    ----------
+    - Kriegeskorte, N., Goebel, R., & Bandettini, P. (2006).
+      Information-based functional brain mapping.
+      *Proceedings of the National Academy of Sciences*, 103(10), 3863–3868.
     """
 
     if groups is not None:

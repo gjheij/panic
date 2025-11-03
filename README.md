@@ -243,7 +243,10 @@ Below, I highlight several classifiers that are supported by `panic`:
 > It basically rests on sklearn's I/O consistency.
 > Please open an issue in case you encounter problems.
 
-## Linear classifiers
+
+
+## Classifiers
+### Linear classifiers
 
 | Classifier                           | [factory](panic/factory.py) name              | Best for                                | Notes / Typical config                                                          |
 | ------------------------------------ | ------------------------------ | --------------------------------------- | ------------------------------------------------------------------------------- |
@@ -253,7 +256,7 @@ Below, I highlight several classifiers that are supported by `panic`:
 | **[SGDClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDClassifier.html)**                    | `"SGDClassifier"`              | Large datasets or regularization sweeps | Supports `loss='hinge'`, `'log_loss'`, `'modified_huber'`                       |
 | **[LinearSVC](https://scikit-learn.org/stable/modules/generated/sklearn.svm.LinearSVC.html)**                        | `"LinearSVC"`                  | Common in searchlight decoding          | Often used with `C=1`, `dual=False` if n_samples > n_features                   |
 
-## Kernel & non-linear classifiers
+### Kernel & non-linear classifiers
 
 | Classifier                               | [factory](panic/factory.py) name             | Best for                      | Notes / Typical config                                               |
 | ---------------------------------------- | ----------------------------- | ----------------------------- | -------------------------------------------------------------------- |
@@ -263,7 +266,7 @@ Below, I highlight several classifiers that are supported by `panic`:
 | **[GradientBoostingClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.GradientBoostingClassifier.html) / XGBoost** | (you can add)                 | Nonlinear decoding            | Better performance on structured ROI data; slower for searchlight    |
 | **[KNeighborsClassifier](https://scikit-learn.org/stable/modules/generated/sklearn.neighbors.KNeighborsClassifier.html)**                 | `"KNeighborsClassifier"`      | Small, low-dimensional ROIs   | Parameter-free, but not great for high-dim voxel patterns            |
 
-## Sparse / feature-selection–oriented
+### Sparse / feature-selection–oriented
 
 | Classifier                                           | Module   | Benefit                    | Notes                                                         |
 | ---------------------------------------------------- | -------- | -------------------------- | ------------------------------------------------------------- |
@@ -293,3 +296,48 @@ _ALIASES = {
     "GPC": "GaussianProcessClassifier",
 }
 ```
+
+## Feature selection
+
+| Selector                                                                                                                    | [factory](panic/factory.py) name | Best for                                 | Notes / Typical config                                                                                                         |
+| --------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| **[SelectKBest](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.SelectKBest.html)**             | `"SelectKBest"`                  | Simple top-k univariate filtering        | Use `score_func=f_classif` (default in examples) or `mutual_info_classif`; set `k` (e.g., 500–5000) via gridsearch.            |
+| **[SelectPercentile](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.SelectPercentile.html)**   | `"SelectPercentile"`             | Fast filtering scalable to whole-brain   | Specify `percentile` (e.g., 5–40%); pair with linear SVM/LR; easy to sweep in `gridsearch.param_grid`.                         |
+| **[SelectFromModel](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.SelectFromModel.html)**     | `"SelectFromModel"`              | Model-based sparsity/weights             | Wrap a linear model with `penalty='l1'` (e.g., `LogisticRegression(saga)`) or `LinearSVC`; tune `threshold` or `max_features`. |
+| **[RFE](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.RFE.html)**                             | `"RFE"`                          | Small/medium ROIs where ranking matters  | Recursive elimination with a base estimator (e.g., `LinearSVC`); set `n_features_to_select` and `step` (e.g., 0.1).            |
+| **[RFECV](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.RFECV.html)**                         | `"RFECV"`                        | Automatic RFE with CV-based model sizing | Chooses feature count via inner CV; set `cv` and `scoring`; can be slow—prefer for ROI, not searchlight.                       |
+| **[VarianceThreshold](https://scikit-learn.org/stable/modules/generated/sklearn/feature_selection.html#variancethreshold)** | `"VarianceThreshold"`            | Quick sanity filter to drop flat voxels  | Use tiny `threshold` (e.g., `1e-12`) to remove constant/near-constant time series; helpful before PCA/SVM.                     |
+| **[PCA](https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.PCA.html)**                                 | `"PCA"`                          | Dimensionality reduction, denoising      | Unsupervised; set `n_components` (e.g., 50–200) or variance ratio; **fit inside CV** to avoid leakage.                         |
+| **Pass-through**                                                                                                            | `"passthrough"` / `"none"`       | Baseline / ablation                      | No feature selection; useful when comparing pipelines or relying on model regularization alone.                                |
+
+## Score functions
+
+| Score function                                                                                                                        | [factory](panic/factory.py) name | Best for                              | Notes / Typical config                                                                                                      |
+| ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| **[f_classif](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.f_classif.html)**                           | `"f_classif"`                    | Standard univariate classification    | One-way ANOVA F-test between labels; default for `SelectKBest`/`SelectPercentile`; works well for fMRI decoding.            |
+| **[f_regression](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.f_regression.html)**                     | `"f_regression"`                 | Continuous target variables           | Performs linear regression F-test; useful for decoding continuous values (e.g., ratings, parametric modulators).            |
+| **[chi2](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.chi2.html)**                                     | `"chi2"`                         | Sparse or non-negative features       | Tests dependence via chi-squared; requires non-negative input (e.g., counts, activation ≥0); scale or shift data if needed. |
+| **[mutual_info_classif](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.mutual_info_classif.html)**       | `"mutual_info_classif"`          | Nonlinear feature–label relationships | Estimates mutual information; robust to monotonic nonlinearities; slower but more flexible than `f_classif`.                |
+| **[mutual_info_regression](https://scikit-learn.org/stable/modules/generated/sklearn.feature_selection.mutual_info_regression.html)** | `"mutual_info_regression"`       | Nonlinear continuous decoding         | Captures nonlinear associations between features and targets; use for regression designs or parametric learning.            |
+
+## Grid search and hyperparameter optimization
+
+| Search method                                                                                                                     | [factory](panic/factory.py) name | Best for                              | Notes / Typical config                                                                                               |
+| --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| **[GridSearchCV](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.GridSearchCV.html)**                   | `"GridSearchCV"`                 | Exhaustive, small parameter spaces    | Tests all combinations in `param_grid`; reliable but slow for large grids; keep `n_jobs=1` inside nested CV.         |
+| **[RandomizedSearchCV](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.RandomizedSearchCV.html)**       | `"RandomizedSearchCV"`           | Larger or continuous parameter spaces | Samples a fixed number of random hyperparameter sets (`n_iter`); faster approximate alternative to full grid search. |
+| **[HalvingGridSearchCV](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.HalvingGridSearchCV.html)**     | `"HalvingGridSearchCV"`          | Adaptive grid search with pruning     | Successively reduces candidate set based on early performance; efficient for mid-sized grids and large datasets.     |
+| **[HalvingRandomSearchCV](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.HalvingRandomSearchCV.html)** | `"HalvingRandomSearchCV"`        | Fast coarse-to-fine exploration       | Combines random sampling with successive halving; good trade-off between speed and coverage for exploratory runs.    |
+
+## Cross-validation strategies
+| Splitter                                                                                                                              | [factory](panic/factory.py) name | Best for                                       | Notes / Typical config                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| **[StratifiedKFold](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.StratifiedKFold.html)**                 | `"StratifiedKFold"`              | Balanced binary/multiclass decoding            | Preserves class ratios across folds; typical for within-subject CV; set `n_splits=3–10`, `shuffle=True` if desired. |
+| **[RepeatedStratifiedKFold](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.RepeatedStratifiedKFold.html)** | `"RepeatedStratifiedKFold"`      | More stable CV estimates                       | Repeats StratifiedKFold multiple times with different splits; use for small samples or noisy data.                  |
+| **[StratifiedShuffleSplit](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.StratifiedShuffleSplit.html)**   | `"StratifiedShuffleSplit"`       | Flexible train/test ratios                     | Random stratified resampling; set `test_size` (e.g., 0.2); useful for fast bootstrapping-type validation.           |
+| **[GroupKFold](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.GroupKFold.html)**                           | `"GroupKFold"`                   | Grouped data (e.g., multiple runs per subject) | Ensures that all samples from the same group (e.g., run/block) stay in the same fold.                               |
+| **[StratifiedGroupKFold](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.StratifiedGroupKFold.html)**       | `"StratifiedGroupKFold"`         | Stratified + grouped decoding                  | Maintains class balance while grouping (ideal for fMRI with per-run grouping); recommended default for PANIC.       |
+| **[LeaveOneGroupOut](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.LeaveOneGroupOut.html)**               | `"LeaveOneGroupOut"`             | Leave-one-run-out / leave-one-session-out      | Each group (e.g., run) serves once as test set; prevents run-wise leakage; standard for cross-run decoding.         |
+| **[LeavePGroupsOut](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.LeavePGroupsOut.html)**                 | `"LeavePGroupsOut"`              | Multi-run holdout                              | Similar to LeaveOneGroupOut but can leave out multiple groups per fold (set `p` accordingly).                       |
+| **[TimeSeriesSplit](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html)**                 | `"TimeSeriesSplit"`              | Sequential / trial-order–dependent decoding    | Maintains temporal order; use for learning-curve or habituation analyses.                                           |
+| **[PredefinedSplit](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.PredefinedSplit.html)**                 | `"PredefinedSplit"`              | Custom or nested CV setups                     | Allows manual assignment of fold indices; useful when outer folds are fixed or defined per subject/run.             |
