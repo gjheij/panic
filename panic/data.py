@@ -838,7 +838,9 @@ class PrepareBetas:
             ``[-clip, clip]``. If ``None``, clipping is disabled. Default is ``1e6``.
         :param str | None standardize:
             If set to ``"zscore"``, performs voxelwise z-score normalization across the
-            last dimension (e.g., time or trial). Other values disable standardization.
+            last dimension (e.g., time or trial). If set to ``"range"``, it does not
+            divide by standard deviation, but by its range. Other values disable
+            standardization.
         :param kwargs:
             Additional keyword arguments (currently unused; reserved for extension).
 
@@ -856,9 +858,9 @@ class PrepareBetas:
             1. Load the input image using :func:`nilearn.image.load_img`.
             2. Replace NaN/±∞ values with ``fill`` via :func:`numpy.nan_to_num`.
             3. Optionally clip voxel intensities to the range ``[-clip, clip]``.
-            4. If ``standardize='zscore'``:
+            4. If ``standardize='zscore'`` or ``standardize='range'``:
             - Compute voxelwise mean and standard deviation across the last axis.
-            - Apply z-score normalization ``(x - μ) / σ``.
+            - Apply normalization ``(x - μ) / σ`` or ``(x - μ) / (max - min)``.
             - Replace any residual NaN/Inf with zeros.
             - Disable further standardization in the decoding pipeline.
             5. Return a new NIfTI image via :func:`nilearn.image.new_img_like`.
@@ -893,16 +895,40 @@ class PrepareBetas:
             data = np.clip(data, -clip, clip)
 
         do_standardization = True
-        if standardize == "zscore":
-            logger.info("Z-scoring betas before decoding; removing 'StandardScalar' from pipeline")
-
-            mu = data.mean(axis=-1, keepdims=True)
-            sigma = data.std(axis=-1, ddof=1, keepdims=True)
-            zdata = (data - mu) / np.where(sigma == 0, 1, sigma)
-
-            data = np.nan_to_num(zdata, copy=False)
+        if standardize in ["zscore", "range"]:
             do_standardization = False
-            
+        
+            if standardize == "zscore":
+                logger.info("Z-scoring betas before decoding; removing 'StandardScalar' from pipeline")
+
+                mu = data.mean(axis=-1, keepdims=True)
+                sigma = data.std(axis=-1, ddof=1, keepdims=True)
+                zdata = (data - mu) / np.where(sigma == 0, 1, sigma)
+                data = np.nan_to_num(zdata, copy=False)
+
+            elif standardize == "range":
+                logger.info("Normalizing betas by range before decoding; removing 'StandardScalar' from pipeline")
+
+                # mean across trials (axis = -1 because PANIC stores betas as [voxels × trials])
+                mu = data.mean(axis=-1, keepdims=True)
+
+                # compute range across trials
+                data_min = data.min(axis=-1, keepdims=True)
+                data_max = data.max(axis=-1, keepdims=True)
+                denom = data_max - data_min
+
+                # avoid divide-by-zero (flat voxels)
+                denom = np.where(denom == 0, 1, denom)
+
+                # mean-center + divide by range
+                rdata = (data - mu) / denom
+
+                # replace NaN / Inf just like z-score code does
+                data = np.nan_to_num(rdata, copy=False)
+
+            else:
+                logger.error(f"'standardize' must be on of 'range' or 'zscore', not '{standardize}'")
+
         return image.new_img_like(img, data, copy_header=True), do_standardization
     
     @classmethod
