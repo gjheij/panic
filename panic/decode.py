@@ -3,7 +3,6 @@
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 
 import os
-import json
 import shutil
 import numpy as np
 import pandas as pd
@@ -13,25 +12,26 @@ import tempfile, uuid
 from tqdm import tqdm
 from joblib import Parallel, delayed, dump, load
 
-from panic import data, utils, factory
+from panic import data, utils
 from panic.logger import get_logger, tqdm_joblib
 from lazyfmri.utils import FindFiles, update_kwargs
 from panic.searchlight import permutation_searchlight
+from panic.errors import EmptyMaskError, NoTrialsFoundError, NoFeaturesSelectedError
 
-logger = get_logger(__name__, level=logging.INFO, use_tqdm=True)
+logger = logging.getLogger(__name__)
 opj = os.path.join
 
 
 def run_decoding_with_permutation(
-    X,
-    labels,
-    folds,
-    cfg,
-    seed=0,
-    tmpdir="~/.joblib_cache",
-    groups=None,
-    **kwargs
-):
+        X,
+        labels,
+        folds,
+        cfg,
+        seed=0,
+        tmpdir="~/.joblib_cache",
+        groups=None,
+        **kwargs
+    ):
     """
     Run decoding with permutation testing on ROI-level data, with optional *fail-fast* early stopping.
 
@@ -184,6 +184,14 @@ def run_decoding_with_permutation(
     X_mm = load(X_path, mmap_mode="r")
     logger.info(f"X={X_mm.shape} (n_samples, n_features)")
 
+    # config takes precedence over the presence of groups
+    if not cfg.get("permute_within_groups", False):
+        if groups is not None:
+            logger.info("Groups (or runs) were detected, but permute_within_groups=False, so ignoring groups..")
+
+        groups = None
+    
+    # log them
     if groups is not None:
         logger.info(f"Groups = {groups}")
 
@@ -194,12 +202,16 @@ def run_decoding_with_permutation(
     if "save_dir" in kwargs:
         logger.info(f"Storing fold information in {kwargs['save_dir']}")
 
-    observed_acc = utils._cv_mean_score(
-        X_path, labels, folds, cfg,
-        groups=groups,
-        permute=False,
-        **kwargs
-    )
+    try:
+        observed_acc = utils._cv_mean_score(
+            X_path, labels, folds, cfg,
+            groups=groups,
+            permute=False,
+            **kwargs
+        )
+    except NoFeaturesSelectedError as e:
+        logger.warning(f"Observed CV failed (no features): {e}. Skipping ROI.")
+        return None
 
     logger.info("Observed accuracy after %d folds: %.4f", len(folds), observed_acc)
 
@@ -224,7 +236,6 @@ def run_decoding_with_permutation(
     early_stop_batch = cfg.get("early_stop_batch", 32)
     logger.info("Starting permutation testing: n_perms=%d, n_jobs=%d", n_perms, n_jobs)
     if early_stop_alpha is None:
-
 
         if n_jobs == 1:
             permuted_acc = [
@@ -435,6 +446,7 @@ class ClassifySubject(data.PrepareBetas):
         # append subject to save_dir
         self.gen_settings = self.cfg["general_settings"]
         self.dec_settings = self.cfg["decoding_settings"]
+        self.roi_settings = self.cfg["roi_settings"]
 
         # turn off feature selection within searchlight
         self.dec_settings_no_feature_selection = {**self.dec_settings, "feature_selection": None}
@@ -444,6 +456,7 @@ class ClassifySubject(data.PrepareBetas):
     
         logger.info(f"Decoding configuration:")
         logger.info(self.dec_settings)
+
 
     def _fit(self, **kwargs):
         """
@@ -593,6 +606,7 @@ class ClassifySubject(data.PrepareBetas):
 
         data.PrepareBetas.__init__(self, **kwargs)
 
+
     def decode_single_mask(
         self,
         betas,
@@ -698,13 +712,17 @@ class ClassifySubject(data.PrepareBetas):
         # standard ROI analysis
         if not self.searchlight:
 
-            extract = self.extract_betas_from_rois(
-                betas,
-                mask,
-                trial_list=trial_list,
-                label_mapper=label_mapper,
-                output_file=output_file
-            )
+            try:
+                extract = self.extract_betas_from_rois(
+                    betas,
+                    mask,
+                    trial_list=trial_list,
+                    label_mapper=label_mapper,
+                    output_file=output_file
+                )
+            except (EmptyMaskError, NoFeaturesSelectedError, ValueError) as e:
+                logger.warning(f"Skipping ROI: {e}")
+                return None
 
             # outer folds
             folds = utils._folds_for_labels(self.dec_settings, extract.labels, groups)
@@ -722,8 +740,14 @@ class ClassifySubject(data.PrepareBetas):
                     roi_linidx=extract.roi_linidx,
                     **kwargs
                 )
-            except Exception as e:
-                raise RuntimeError(f"Decoding failed with message: {e}")
+            except (NoFeaturesSelectedError, ValueError) as e:
+                # expected-ish failures for tiny ROIs / strict selection / degenerate folds
+                logger.warning(f"Skipping ROI: {e}")
+                return None
+            except Exception:
+                # unexpected failure: log full traceback but still skip mask
+                logger.exception("Decoding failed unexpectedly; skipping ROI")
+                return None
         else:
             # Searchlight (same same, but different)
             try:
@@ -731,62 +755,86 @@ class ClassifySubject(data.PrepareBetas):
                     betas,
                     mask,
                     trial_list,
-                    label_mapper,
+                    label_mapper, 
                     self.dec_settings_no_feature_selection,
                     groups=groups,
                     **kwargs
                 )
-            except Exception as e:
-                raise RuntimeError(f"Searchlight failed with message: {e}")
+            except (NoFeaturesSelectedError, ValueError) as e:
+                # expected-ish failures for tiny ROIs / strict selection / degenerate folds
+                logger.warning(f"Skipping ROI: {e}")
+                return None
+            except Exception:
+                logger.exception("Searchlight failed unexpectedly; skipping mask")
+                return None            
 
         return ddict
     
     def define_mask_inputs(self):
 
         # roi_dict options:
-        #   1. dict -> FreeSurfer labels
-        #   2. directory -> *.nii.gz files
+        #   1. directory -> *.nii.gz files
+        #   2. dict -> FreeSurfer labels
         #   3. file -> assume mask
 
-        if isinstance(self.cfg["roi_dict"], dict):
-            run_dict = self.cfg["roi_dict"]
-        elif isinstance(self.cfg["roi_dict"], str):
-            if os.path.isdir(self.cfg["roi_dict"]):
+        is_labels = False
+        roi_dict = self.cfg["roi_dict"]
+        if isinstance(roi_dict, str):
+            assert os.path.exists(roi_dict), FileNotFoundError(f"Input ROI-directory '{roi_dict}' does not exist")
+            if os.path.isdir(roi_dict):
+                extension = self.cfg["roi_settings"].get("extension", ".nii.gz")
                 mask_files = FindFiles(
-                    self.cfg["roi_dict"],
-                    extension="nii.gz"
+                    roi_dict,
+                    extension=extension
                 ).files
 
                 if isinstance(mask_files, str):
                     mask_files = [mask_files]
 
                 if not isinstance(mask_files, list):
-                    raise TypeError(f"We should have a list by now..")
-                
+                    raise TypeError(f"We should have a list by now, not {type(mask_files)}..")
+                else:
+                    if len(mask_files)<1:
+                        raise ValueError(f"ROI-list from '{roi_dict}' with extension '{extension}' is empty..")
+                    
                 run_dict = {}
                 n_digits = len(str(len(mask_files)))
                 for ix, m in enumerate(mask_files):
                     lbl = f"mask_{str(ix+1).zfill(n_digits)}"
                     run_dict[lbl] = m
+
+            elif isinstance(roi_dict, dict):
+                run_dict = roi_dict
+                is_labels = True                    
             else:
                 run_dict = {
                     "mask_1": self.cfg["roi_dict"]
                 }
         
-        return run_dict
+        assert len(run_dict)>0, ValueError(f"No ROIs were detected using: '{roi_dict}'")
+        return run_dict, is_labels
 
-    def decode_masks(self, hemi_key="hemi", **kwargs):
+
+    def decode_masks(
+            self,
+            hemi_key="hemi",
+            **kwargs
+        ):
         
         out_files = {}
         results = []
         null = []
 
-        roi_dict = self.define_mask_inputs()
+        roi_dict, is_labels = self.define_mask_inputs()
         for r_key, r_val in roi_dict.items():
             logger.info(f"Processing '{r_key}' (labels|file={r_val})")
 
             # prepare ROIs for beta-series extraction
-            _, roi_masks = self.prepare_rois(r_val)
+            roi_name = None
+            if is_labels:
+                roi_name = r_key
+
+            _, roi_masks = self.prepare_rois(r_val, roi_name=roi_name)
 
             # extract betas
             for h_key, h_val in roi_masks.items():
@@ -822,6 +870,10 @@ class ClassifySubject(data.PrepareBetas):
                     **kwargs
                 )
 
+                # exit if mask is empty
+                if ddict is None:
+                    continue
+
                 # Store
                 if not self.searchlight:
                     results_dict = {
@@ -856,7 +908,7 @@ class ClassifySubject(data.PrepareBetas):
                     )
                 else:
                     out_files[h_val[0]] = ddict
-
+        
         if not self.searchlight:
             # write null-distributions
             null_df = pd.DataFrame(null)
@@ -917,14 +969,16 @@ class ClassifySubject(data.PrepareBetas):
             **kwargs
         )
 
-    def prepare_rois(self, roi_labels, **kwargs):
-        
+    def prepare_rois(self, roi_labels, roi_name=None):
+
+        # prepare ROIs
         obj = data.PrepareROIs(
-                subject=self.subject,
-                roi_labels=roi_labels,
-                project_dir=self.gen_settings["project_dir"],
-                **kwargs
-            )
+            subject=self.subject,
+            roi_labels=roi_labels,
+            roi_name=roi_name,
+            project_dir=self.gen_settings["project_dir"],
+            **self.roi_settings
+        )
 
         # now a dict: {'left': Nift1Image, 'right': Nift1Image}
         roi_masks = obj.return_masks()
