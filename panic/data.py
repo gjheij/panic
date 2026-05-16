@@ -13,11 +13,13 @@ from nilearn import (
 import nibabel as nib
 from lazyfmri import utils
 from panic.logger import get_logger
+from panic.errors import EmptyMaskError
 
 opj = os.path.join
 
 logger = get_logger(__name__)
-                    
+
+
 class PrepareROIs:
     """
     Discover, load, and sanitize ROI masks for a subject from directories,
@@ -27,7 +29,7 @@ class PrepareROIs:
     and then loads ROI masks depending on the type of ``roi_labels``:
 
     - **list[int]** → extract those integer labels from a FreeSurfer ``.mgz/.mgh``
-      file matching ``roi_name`` using :meth:`_from_labels`
+      file matching ``roi_src`` using :meth:`_from_labels`
       (internally calls :meth:`select_labels_from_mgh`).
     - **str (directory path)** → bulk-load all ``.nii.gz`` masks in the folder
       via :meth:`_from_directory`.
@@ -44,7 +46,7 @@ class PrepareROIs:
         Custom directory where ROI/mask files live. If provided, used as-is.
         Otherwise, the directory is constructed as
         ``<project_dir>/derivatives/<src>/<subject>/<roi_base>``.
-    :param str roi_name:
+    :param str roi_src:
         Filename substring to select the source labeled volume (e.g., ``"aseg.mgz"`` or
         a custom FreeSurfer label file) when ``roi_labels`` is a **list**.
         Default: ``"hippoAmygLabels.mgz"``.
@@ -79,7 +81,7 @@ class PrepareROIs:
                 project_dir="/proj",
                 roi_base="masks",
                 src="freesurfer",
-                roi_name="aseg.mgz",
+                roi_src="aseg.mgz",
                 roi_labels=[17, 53]  # hippocampus L/R
             )
             roi_dict = rois.return_masks()
@@ -108,7 +110,8 @@ class PrepareROIs:
         subject=None,
         project_dir="/mnt/d/fMRI/HRA",
         roi_dir=None,
-        roi_name="hippoAmygLabels.mgz",
+        roi_src="hippoAmygLabels.mgz",
+        roi_name=None,
         roi_labels=None,
         roi_base="hippo-amygdala",
         src="freesurfer",
@@ -120,12 +123,15 @@ class PrepareROIs:
         self.roi_dir = roi_dir
         self.roi_base = roi_base
         self.roi_name = roi_name
+        self.roi_src = roi_src
         self.roi_labels = roi_labels
         self.src = src
         self.extension = extension
         
         # derive mask dir from components or straight directory
         self.mask_dir = self.derive_mask_dir()
+
+        assert os.path.exists(self.mask_dir), FileNotFoundError(f"Mask directory '{self.mask_dir}' does not exist")
 
         # load masks
         if isinstance(self.roi_labels, list):
@@ -137,6 +143,7 @@ class PrepareROIs:
                 self.roi_masks = self._from_file(self.roi_labels)
         else:
             raise TypeError(f"roi_labels must be a list of FreeSurfer-compatible labels, a directory with *.nii.gz files, or an actual .nii.gz file, not '{self.roi_labels}'")
+
 
     def derive_mask_dir(self):
         """
@@ -200,8 +207,10 @@ class PrepareROIs:
         else:
             return self.roi_dir
 
+
     def return_masks(self):
         return self.roi_masks
+
 
     def _from_directory(self, directory, fill=0.0, out_dtype=np.uint8):
         """
@@ -290,8 +299,10 @@ class PrepareROIs:
 
         return ddict
 
+
     def _from_atlas(self, img, fill=0.0):
         raise NotImplementedError(f"To-be-implemented: extract from actual atlas file; for now, use the label options")
+
 
     def _from_file(self, i, fill=0.0, out_dtype=np.uint8):
         """
@@ -361,6 +372,7 @@ class PrepareROIs:
             lbl: [roi_name, out_img]
         }
         
+
     def _from_labels(self, mask_dir):
         """
         Load and extract ROI masks from labeled volumetric files (e.g., FreeSurfer .mgz).
@@ -377,7 +389,7 @@ class PrepareROIs:
         :returns:
             Dictionary mapping label identifiers to a list containing:
             
-            * ``roi_name`` – the human-readable ROI name
+            * ``roi_src`` – the human-readable ROI name
             * ``nibabel.Nifti1Image`` – binary ROI mask image in NIfTI format
         :rtype:
             dict[str, list[Union[str, nibabel.Nifti1Image]]]
@@ -386,7 +398,7 @@ class PrepareROIs:
             1. Search ``mask_dir`` for all files matching ``self.extension`` using
             :func:`utils.FindFiles`.
             2. Filter results to include only files containing the target substring
-            ``self.roi_name`` via :func:`utils.get_file_from_substring`.
+            ``self.roi_src`` via :func:`utils.get_file_from_substring`.
             3. For each matching file:
             - Log the filename and index.
             - Call :func:`self.select_labels_from_mgh` to extract the specified
@@ -416,7 +428,7 @@ class PrepareROIs:
         - The extracted ROIs are converted to binary NIfTI masks for use in
             downstream decoding or visualization pipelines.
         - Requires that ``self.roi_labels`` (list of integers) and
-            ``self.roi_name`` are defined in the calling object.
+            ``self.roi_src`` are defined in the calling object.
         - Depends on:
             * :func:`utils.FindFiles` – to locate files
             * :func:`utils.get_file_from_substring` – to filter by substring
@@ -426,7 +438,7 @@ class PrepareROIs:
         
         logger.info(f"Loading masks from '{mask_dir}'")
         masks = utils.get_file_from_substring(
-            self.roi_name,
+            self.roi_src,
             utils.FindFiles(
                 mask_dir,
                 extension=self.extension,
@@ -436,24 +448,22 @@ class PrepareROIs:
         if not isinstance(masks, list):
             masks = [masks]
 
+        return_masks = {}
         for ix, m in enumerate(masks):
             logger.info(f" #{ix+1}: {m}")
-
-        return_masks = {}
-        for i in masks:
-
             # Create a binary mask from labeled mgz
             tmp_mask = self.select_labels_from_mgh(
-                input_file=i,
+                input_file=m,
                 labels=self.roi_labels,
                 mode="nifti",
                 binary=True,
             )
 
-            lbl, roi_n = self._fetch_key(i, roi_name=self.roi_name)
+            lbl, roi_n = self._fetch_key(m, roi_name=self.roi_name)
             return_masks[lbl] = [roi_n, tmp_mask]
 
         return return_masks
+
 
     @classmethod
     def _fetch_key(self, i, roi_name=None):
@@ -539,6 +549,7 @@ class PrepareROIs:
 
         return lbl, roi_name
 
+
     @classmethod
     def _sanitize(self, img, fill=0.0):
         """
@@ -606,6 +617,7 @@ class PrepareROIs:
             )
 
         return data
+
 
     @classmethod
     def select_labels_from_mgh(
@@ -712,6 +724,7 @@ class PrepareROIs:
 
         return out_img
     
+
 class PrepareBetas:
     """
     Prepare trialwise beta images for decoding analyses.
@@ -799,7 +812,7 @@ class PrepareBetas:
         beta_file: str=None,
         trial_list: list=None,
         **kwargs
-        ):
+    ):
 
         if isinstance(beta_file, str):
             logger.info(f"Beta-file: '{beta_file}'")
@@ -818,7 +831,15 @@ class PrepareBetas:
         return self.trial_list
 
     @classmethod
-    def sanitize_img(self, img, fill=0.0, clip=1e6, standardize=None, **kwargs):
+    def sanitize_img(
+        self,
+        img,
+        fill=0.0,
+        clip=1e6,
+        standardize=None,
+        **kwargs
+    ):
+        
         """
         Sanitize an image by replacing invalid values, optionally clipping outliers,
         and performing z-score standardization.
@@ -931,6 +952,7 @@ class PrepareBetas:
 
         return image.new_img_like(img, data, copy_header=True), do_standardization
     
+
     @classmethod
     def load_and_merge_betas(
         self,
@@ -1033,7 +1055,10 @@ class PrepareBetas:
         #--------------------------------------------------------------------------------
         # stglm | halfpipe | glmsingle
         src = os.path.basename(beta_dir)
-        logger.info(f"Loading betas from: '{opj(beta_dir, subject)}'")
+        subject_betas = opj(beta_dir, subject)
+
+        assert os.path.exists(subject_betas), FileNotFoundError(f"Input beta directory '{subject_betas}' does not exist")
+        logger.info(f"Loading betas from: '{subject_betas}'")
 
         #--------------------------------------------------------------------------------
         # define GLMsingle mapper
@@ -1044,20 +1069,22 @@ class PrepareBetas:
 
         #--------------------------------------------------------------------------------
         # stglm | glmsingle need to be concatenated; HALFpipe comes concatenated
-        search = f"desc-{model}"
-
         if src == "glmsingle":
             search = f"model-{model_mapper[model]}_beta-"
         elif src == "bach":
             search = "beta_"
         elif src == "halfpipe":
             search = [f"feature-{model}_condition-", "effect_statmap.nii.gz"]
+        else:
+            search = f"desc-{model}"
 
         m_files = utils.FindFiles(
-            opj(beta_dir, subject),
+            subject_betas,
             extension=".nii.gz",
             filters=search
         ).files
+
+        assert len(m_files)>0, ValueError(f"No *.nii.gz files in '{subject_betas}'")
 
         #--------------------------------------------------------------------------------
         # D. Bach's beta values
@@ -1067,13 +1094,13 @@ class PrepareBetas:
         
         #--------------------------------------------------------------------------------
         # HALFpipe outputs condition-wise single-trial files > match with "label_dict" in config.yml
+        niimgs = []
+        trials = []
+        groups = []
         if src == "halfpipe":
-            niimgs = []
-            trials = []
-            groups = []
 
             if not isinstance(label_mapper, dict):
-                logger.error(f"When HALFpipe is used, 'label_mapper' must be a dictionary with keys representing the stimuli to include, not '{label_mapper}'")
+                raise TypeError(f"When HALFpipe is used, 'label_mapper' must be a dictionary with keys representing the stimuli to include, not '{label_mapper}'")
 
             # select ev-specific files
             include_events = list(label_mapper.keys())
@@ -1083,7 +1110,7 @@ class PrepareBetas:
                     incl_files = [incl_files]
 
                 if not isinstance(incl_files, list):
-                    logger.error(f"We should have a list of beta-values by now, not {incl_files}")
+                    raise TypeError(f"We should have a list of beta-values by now, not {incl_files}")
 
                 # fetch nr of volumes and fill in with label_mapper
                 logger.info(f"Found {len(incl_files)} files for '{i}' [model = {model}]")
@@ -1107,12 +1134,11 @@ class PrepareBetas:
 
         else:
             logger.info(f"Found {len(m_files)} files for {model}-model")
-            niimgs = []
             for f in m_files:
                 img = nib.load(f)
                 header = img.header
                 n_vols = header.get("dim")[4]
-                trials.extend([i] * n_vols)
+                # trials.extend([i] * n_vols)
                 niimgs.append(img)
 
                 # stGLM can be run-wise
@@ -1139,7 +1165,7 @@ class PrepareBetas:
         # HALFpipe trials are read above
         if src in ["glmsingle", "bach"]:
             txt_files = utils.FindFiles(
-                opj(beta_dir, subject),
+                subject_betas,
                 extension=".txt"
             ).files
 
@@ -1152,7 +1178,7 @@ class PrepareBetas:
         else:
 
             json_files = utils.FindFiles(
-                opj(beta_dir, subject),
+                subject_betas,
                 extension=".json"
             ).files
 
@@ -1180,7 +1206,7 @@ class PrepareBetas:
         # save merged?
         if save_imgs:
             if output_dir is None:
-                output_dir = opj(beta_dir, subject)
+                output_dir = subject_betas
 
             fname = opj(
                 output_dir,
@@ -1344,7 +1370,7 @@ class MaskAndFilterBetas:
 
         for i, t in enumerate(self.trial_list):
             for key, val in self.label_mapper.items():
-                if t == key:
+                if key in t:
                     filtered_trials.append(key)
                     labels.append(val)
                     trial_indices.append(i)
@@ -1356,13 +1382,23 @@ class MaskAndFilterBetas:
             f"{k}: {(labels == v).sum()}"
             for k, v in self.label_mapper.items()
         ]
-
+        
+        # make sure n_trials>0
+        if n_trials == 0:
+            msg = (
+                "Number of trials equals 0. "
+                "Please check trial names to make sure filtering is correct. "
+                f"Label counts: {', '.join(parts)}"
+            )
+            logger.error(msg)
+            raise ValueError(msg)
+        
         logger.info(f"Total included trials: {n_trials} ({', '.join(parts)})")
 
         # Filter beta images and corresponding trial names
         X_filtered = self.betas_in_mask[trial_indices]
         filtered_trial_list = [self.trial_list[i] for i in trial_indices]
-
+    
         logger.info(f"Filtered beta images: {X_filtered.shape[0]}")
         return X_filtered, filtered_trial_list, labels
 
@@ -1496,6 +1532,9 @@ class MaskAndFilterBetas:
         vox_after = int(roi_in_fov.get_fdata().sum())
         logger.info(f"{vox_after}/{vox_before} voxels inside beta FOV")
 
+        if vox_after == 0:
+            raise EmptyMaskError(f"Invalid mask after filtering: voxel count in mask = {vox_after}")
+            
         roi_mask_data = roi_in_fov.get_fdata() > 0.5
         roi_linidx = np.flatnonzero(roi_mask_data.ravel())
 
