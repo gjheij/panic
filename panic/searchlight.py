@@ -1,21 +1,20 @@
-# searchlight.py
 # -*- coding: utf-8 -*-
-import logging
+# emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: nil -*-
+# vi: set ft=python sts=4 ts=4 sw=4 et:
+
 import numpy as np
-import nibabel as nib
 from tqdm import tqdm
 from nilearn import image
-import os, math, json, tempfile, uuid
+import os, json, tempfile, uuid
 from joblib import Parallel, delayed, dump, load
 from panic.logger import get_logger, tqdm_joblib
 from panic import (
     data,
-    factory,
     utils,
 )
 from statsmodels.stats.multitest import fdrcorrection
 
-logger = get_logger(__name__, level=logging.INFO, use_tqdm=True)
+logger = get_logger(__name__)
 opj = os.path.join
 
 
@@ -445,7 +444,7 @@ def _one_center(
     seeds = center_rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
     def _score_once(rng):
-        # delegate to utils._cv_mean_score exactly as before
+        # delegate to utils._cv_mean_score
         return utils._cv_mean_score(
             tmp_path, labels, folds, cfg,
             rng=rng,
@@ -470,6 +469,21 @@ def _one_center(
             
     return (cx, cy, cz), float(obs), float(null_mean), float(delta), float(p), int(len(cols)), n_run, int(stopped), int(stop_code)
 
+
+def permutation_searchlight(
+    betas_img,            # 4D betas (nifti)
+    mask_img,             # binary ROI/brain mask (nifti)
+    trial_list,           # list[str] or array[str] per volume in betas
+    label_mapper,         # dict like {'CS-':0,'CS+':1}
+    cfg,
+    *,
+    groups=None,          # run indices per trial (optional)
+    seed=0,
+    tmpdir="~/.joblib_cache",
+    output_file=None,
+    **kwargs
+):
+    
     """
     Run a permutation-based searchlight decoding analysis and write result maps.
 
@@ -587,6 +601,13 @@ def _one_center(
       Information-based functional brain mapping.
       *Proceedings of the National Academy of Sciences*, 103(10), 3863–3868.
     """
+
+    # config takes precedence over the presence of groups
+    if not cfg.get("permute_within_groups", False):
+        if groups is not None:
+            logger.info("Groups (or runs) were detected, but permute_within_groups=False, so ignoring groups..")
+
+        groups = None
 
     if groups is not None:
         logger.info(f"Groups = {groups}")
@@ -929,7 +950,8 @@ def save_searchlight_maps(
             mask_img,
             ref_img,
             interpolation="nearest",
-            force_resample=True
+            force_resample=True,
+            copy_header=True
         ).get_fdata() > 0.5
     else:
         m = np.isfinite(pvalue_map)
