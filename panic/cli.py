@@ -19,6 +19,7 @@ import argparse
 import os
 import re
 import sys
+import logging
 import tempfile
 from copy import deepcopy
 from pathlib import Path
@@ -32,12 +33,12 @@ from panic.utils import (
     load_yaml,
     dump_yaml
 )
-from panic.logger import get_logger
+from panic.logger import init_logging
 from panic.decode import ClassifySubject
 
-logger = get_logger(__name__)
+opj = os.path.join
 
-# ---------- YAML helpers ----------
+# YAML helpers
 def parse_value(raw: str) -> Any:
     """Parse a string like '1e-3', 'true', '[1,2]', '"str with spaces"' into Python types."""
     try:
@@ -104,7 +105,10 @@ def set_by_path(obj: Any, path: str, value: Any) -> None:
                 cur = cur[name]
 
 
-def apply_assignments(cfg: Dict[str, Any], assignments: Iterable[str]) -> Tuple[Dict[str, Any], List[str]]:
+def apply_assignments(
+        cfg: Dict[str, Any],
+        assignments: Iterable[str]
+    ) -> Tuple[Dict[str, Any], List[str]]:
     """
     Apply key=value strings to cfg. Returns (updated_cfg, list_of_changes_as_strings).
     """
@@ -121,13 +125,12 @@ def apply_assignments(cfg: Dict[str, Any], assignments: Iterable[str]) -> Tuple[
     return cfg, changes
 
 
-# ---------- CLI actions ----------
-
+# CLI actions
 def action_show(args):
     cfg_path = Path(args.config or get_config_path())
     data = load_yaml(cfg_path)
     yaml_str = yaml.safe_dump(data, sort_keys=False)
-    logger.info(f"# Config: {cfg_path}\n{yaml_str}")
+    print(f"# Config: {cfg_path}\n{yaml_str}")
 
 
 def action_config(args):
@@ -135,13 +138,13 @@ def action_config(args):
     data = load_yaml(cfg_path)
     updated, changes = apply_assignments(data, args.set or [])
     if not args.save:
-        logger.info("No --save given; preview of changes only:\n" + "\n".join(f"  - {c}" for c in changes))
+        print("No --save given; preview of changes only:\n" + "\n".join(f"  - {c}" for c in changes))
         return
     # backup
     backup = cfg_path.with_suffix(cfg_path.suffix + ".bak")
     backup.write_text(cfg_path.read_text(encoding="utf-8"), encoding="utf-8")
     dump_yaml(updated, cfg_path)
-    logger.info(f"Saved {len(changes)} change(s) to {cfg_path} (backup at {backup.name}).")
+    print(f"Saved {len(changes)} change(s) to {cfg_path} (backup at {backup.name}).")
 
 
 def _write_temp_config(base_cfg: Dict[str, Any]) -> Path:
@@ -156,6 +159,12 @@ def action_run(args):
     cfg_path = Path(args.config or get_config_path())
     base_cfg = load_yaml(cfg_path)
 
+    # Run PANIC
+    subjects = args.subject or []
+    if not subjects:
+        print("Please provide at least one --subject")
+        sys.exit(2)
+
     # Apply overrides (if any)
     cfg_for_run = base_cfg
     changes = []
@@ -166,22 +175,30 @@ def action_run(args):
     if args.set:
         # ephemeral temp config
         cfg_to_use = _write_temp_config(cfg_for_run)
-        logger.info(f"Using temporary config with overrides at: {cfg_to_use}")
+        print(f"Using temporary config with overrides at: {cfg_to_use}")
     else:
         cfg_to_use = cfg_path
 
     if changes:
-        logger.info("Applied overrides:")
+        print("Applied overrides:")
         for c in changes:
-            logger.info(f" {c}")
-
-    # Run PANIC
-    subjects = args.subject or []
-    if not subjects:
-        logger.critical("Please provide at least one --subject", file=sys.stderr)
-        sys.exit(2)
+            print(f" {c}")
 
     for subj in subjects:
+
+        save_dir = opj(base_cfg["save_dir"], subj)
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # make directory
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # define log file | will be overwritten
+        log_file = os.path.join(save_dir, "log.log")
+
+        log_level = logging.DEBUG if args.debug else logging.INFO
+        init_logging(level=log_level, logfile=log_file)
+
         decoder = ClassifySubject(
             subj,
             str(cfg_to_use),
@@ -192,13 +209,25 @@ def action_run(args):
         decoder._fit()
 
 
-# ---------- Argparse ----------
-
+# Argparse
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="panic",
         description="Run PANIC decoding and update YAML settings from the command line.",
     )
+
+    p.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Enable verbose debug-level logging.\n\n"
+            "When set, the logger runs at ``logging.DEBUG`` instead of "
+            "``logging.INFO``. This produces substantially more detailed diagnostic "
+            "output, which is useful for troubleshooting file discovery, conversion "
+            "steps, metadata handling, and worker behavior."
+        ),
+    )
+
     p.add_argument(
         "-c", "--config",
         help="Path to the YAML config. Defaults to panic.utils.get_config_path().",
