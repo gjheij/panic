@@ -1,6 +1,6 @@
 import numpy as np
 
-# --- helpers ---------------------------------------------------------------
+# helpers
 
 def _gaussian_smooth3d(vol, sigma_vox):
     """Lightweight spatial smoothing; uses SciPy if available, else no-op."""
@@ -62,7 +62,7 @@ def _trial_windows(T, centers, half_width=4):
     w = np.clip(1 - ((tt - cc) / float(half_width))**2, 0, 1)  # parabolic
     return w
 
-# --- main factory ----------------------------------------------------------
+# main factory
 
 def make_harder_noise(
     shape,
@@ -99,7 +99,7 @@ def make_harder_noise(
     X, Y, Z = shape
     shape4 = shape + (T,)
 
-    # --- per-voxel target SD tied to the signal's variability (like your code)
+    # per-voxel target SD tied to the signal's variability (like your code)
     # we'll compute sig_sd externally from your 'signal'
     # placeholder: function expects you to pass 'sig_sd' later or compute here
     def _compute_sigma_vol(signal):
@@ -107,7 +107,7 @@ def make_harder_noise(
         sigma_vol = base_sd + k_snr * sig_sd
         return np.asarray(sigma_vol)
 
-    # --- 1) AR(1) colored baseline noise (voxelwise rho)
+    # 1) AR(1) colored baseline noise (voxelwise rho)
     rho = np.clip(rng.normal(ar1_mean, ar1_sd, size=shape), 0.0, 0.98)
     eps = rng.standard_normal(shape4)
     ar1 = np.zeros_like(eps)
@@ -115,14 +115,14 @@ def make_harder_noise(
     for t in range(1, T):
         ar1[..., t] = rho * ar1[..., t-1] + eps[..., t]
 
-    # --- 2) Spatially correlated field
+    # 2) Spatially correlated field
     spatial = np.empty_like(ar1)
     for t in range(T):
         spatial[..., t] = _gaussian_smooth3d(rng.standard_normal(shape), spatial_sigma)
     # Mix with white to control effective strength
     spatial = spatial_weight * spatial + (1 - spatial_weight) * rng.standard_normal(shape4)
 
-    # --- 3) Global signal: low-freq drift + band-limited 'physio'
+    # 3) Global signal: low-freq drift + band-limited 'physio'
     drift_tc  = _band_limited_tc(T, rng, low=0.0,   high=0.02) * drift_strength
     physio_tc = _band_limited_tc(T, rng, low=0.03,  high=0.15) * physio_strength
     g = (drift_tc + physio_tc)  # shape (T,)
@@ -132,7 +132,7 @@ def make_harder_noise(
     gw = gw / (gw.std(ddof=1) + 1e-8) * global_strength
     global_component = gw[..., None] * g[None, None, None, :]
 
-    # --- 4) Heteroscedasticity over time (piecewise constant SD multipliers)
+    # 4) Heteroscedasticity over time (piecewise constant SD multipliers)
     chunks = max(1, int(hetero_chunks))
     edges = np.linspace(0, T, chunks + 1, dtype=int)
     multipliers = np.ones(T, float)
@@ -140,7 +140,7 @@ def make_harder_noise(
         m = np.exp(rng.normal(0, hetero_logsd))  # lognormal > 0
         multipliers[edges[i]:edges[i+1]] = m
 
-    # --- 5) Sparse motion-like spikes (timepoint-specific)
+    # 5) Sparse motion-like spikes (timepoint-specific)
     spikes = np.zeros(T, float)
     spike_times = np.where(rng.random(T) < spike_prob)[0]
     if spike_times.size:
@@ -154,7 +154,7 @@ def make_harder_noise(
     else:
         spike_component = 0.0
 
-    # --- 6) Trial-timed nuisance to specifically hurt decoding
+    # 6) Trial-timed nuisance to specifically hurt decoding
     # Detect 14 trial centers from the total convolved design
     total_conv = np.asarray(conv_face) + np.asarray(conv_house)  # (T,)
     centers = _find_trial_centers(total_conv, n_trials=14, min_separation=3)
@@ -175,7 +175,7 @@ def make_harder_noise(
     trial_tc /= (np.std(trial_tc) + 1e-8)
     trial_component = trial_jitter_strength * contrast_map[..., None] * trial_tc[None, None, None, :]
 
-    # --- combine components (pre-scaling)
+    # combine components (pre-scaling)
     noise_raw = (
         ar1 +
         spatial +
