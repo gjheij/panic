@@ -13,11 +13,15 @@ from typing import Any, Dict
 from joblib import dump, load
 from importlib.resources import files, as_file
 from sklearn.utils.validation import has_fit_parameter
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection._search import BaseSearchCV
 
 import panic
 from panic.logger import get_logger
-from panic import factory
+from panic import (
+    factory,
+    errors
+)
 
 from sklearn.feature_selection import (
     VarianceThreshold
@@ -40,16 +44,27 @@ def dump_yaml(data: Dict[str, Any], path: Path) -> None:
         yaml.safe_dump(data, f, sort_keys=False)
 
 
+class FailIfNoFeatures(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        if X.shape[1] == 0:
+            raise errors.NoFeaturesSelectedError("No features left after preprocessing.")
+        return self
+    def transform(self, X):
+        if X.shape[1] == 0:
+            raise errors.NoFeaturesSelectedError("No features left after preprocessing.")
+        return X
+    
+
 def pipeline_from_config(
-    cfg,
-    *,
-    searchlight: bool = False,
-    standardize: bool = False,
-    random_state=None,
-    labels=None,
-    scoring=None,
-    locked=None,
-):
+        cfg,
+        *,
+        searchlight: bool = False,
+        standardize: bool = False,
+        random_state=None,
+        labels=None,
+        scoring=None,
+        locked=None,
+    ):
     """
     Construct a decoding pipeline from configuration.
 
@@ -182,6 +197,7 @@ def pipeline_from_config(
         ("var", VarianceThreshold(threshold=thr)),
         ("scaler", scaler if standardize else "passthrough"),
         ("select", selector if selector is not None else "passthrough"),
+        ("check", FailIfNoFeatures()),
         ("clf", est),
     ])
 
@@ -202,6 +218,12 @@ def pipeline_from_config(
         if "args" in gs_cfg and "scoring" not in gs_cfg["args"] and "scoring" in cfg:
             gs_cfg = {**gs_cfg, "args": {**gs_cfg["args"], "scoring": cfg["scoring"]}}
 
+        # raise error if NaN
+        gs_args = dict(gs_cfg.get("args", {}))
+        gs_args.setdefault("error_score", "raise")
+        gs_cfg = {**gs_cfg, "args": gs_args}
+        
+        # generate GridsearchCV
         pipe = factory.search_from_config(
             estimator=pipe,
             cv=inner_cv,
@@ -284,21 +306,21 @@ def _permute_within_groups(y, g, rng):
 
 
 def _cv_mean_score(
-    X_path,
-    labels,
-    folds,
-    cfg,
-    *,
-    groups=None,
-    standardize=True,
-    permute=False,
-    permute_both_sets=True,
-    permute_within_groups=True,
-    rng=None,
-    save_dir=None,
-    roi_linidx=None,
-    **kwargs
-):
+        X_path,
+        labels,
+        folds,
+        cfg,
+        *,
+        groups=None,
+        standardize=True,
+        permute=False,
+        permute_both_sets=True,
+        permute_within_groups=True,
+        rng=None,
+        save_dir=None,
+        roi_linidx=None,
+        **kwargs
+    ):
     """
     Compute the mean cross-validated decoding score across user-specified folds.
 
@@ -443,14 +465,19 @@ def _cv_mean_score(
             scoring=scorer,
             **kwargs
         )
+        
+        try:
+            supports_groups = isinstance(clf, BaseSearchCV) or has_fit_parameter(clf, "groups")
+            if g_tr is not None and supports_groups:
+                clf.fit(X_mm[train_idx], y_tr_perm, groups=g_tr)
+            else:
+                clf.fit(X_mm[train_idx], y_tr_perm)
 
-        supports_groups = isinstance(clf, BaseSearchCV) or has_fit_parameter(clf, "groups")
-        if g_tr is not None and supports_groups:
-            clf.fit(X_mm[train_idx], y_tr_perm, groups=g_tr)
-        else:
-            clf.fit(X_mm[train_idx], y_tr_perm)
+            score = clf.score(X_mm[test_idx], y_te_perm)
+        except errors.NoFeaturesSelectedError as e:
+            logger.warning(f"Fold {f_ix}: {e} - settings score=NaN")
+            score = np.nan
 
-        score = clf.score(X_mm[test_idx], y_te_perm)
         fold_scores.append(float(score))
 
         if not permute:
@@ -464,7 +491,10 @@ def _cv_mean_score(
                     roi_linidx=roi_linidx
                 )
 
-    return float(np.mean(fold_scores))
+    mean = float(np.nanmean(fold_scores))
+    if np.isnan(mean):
+        raise errors.NoFeaturesSelectedError("All folds produced 0 features; cannot compute score.")
+    return mean
 
 def tqdm_disabled():
     return (not sys.stderr.isatty()) # or bool(os.environ.get("PYTEST_CURRENT_TEST"))
