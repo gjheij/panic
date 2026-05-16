@@ -41,6 +41,7 @@ from . import simulate
 from . import noise
 from . import searchlight
 from . import factory
+from . import errors
 
 __all__ = [
     "data",
@@ -50,5 +51,6 @@ __all__ = [
     "simulate",
     "noise",
     "searchlight",
-    "factory"
+    "factory",
+    "errors"
 ]
