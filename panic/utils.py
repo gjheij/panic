@@ -15,6 +15,7 @@ from importlib.resources import files, as_file
 from sklearn.utils.validation import has_fit_parameter
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection._search import BaseSearchCV
+from sklearn.utils.validation import check_is_fitted
 
 import panic
 from panic.logger import get_logger
@@ -468,14 +469,16 @@ def _cv_mean_score(
         
         try:
             supports_groups = isinstance(clf, BaseSearchCV) or has_fit_parameter(clf, "groups")
+
             if g_tr is not None and supports_groups:
                 clf.fit(X_mm[train_idx], y_tr_perm, groups=g_tr)
             else:
                 clf.fit(X_mm[train_idx], y_tr_perm)
 
             score = clf.score(X_mm[test_idx], y_te_perm)
+
         except errors.NoFeaturesSelectedError as e:
-            logger.warning(f"Fold {f_ix}: {e} - settings score=NaN")
+            logger.warning(f"Fold {f_ix}: {e} - setting score=NaN")
             score = np.nan
 
         fold_scores.append(float(score))
@@ -696,7 +699,7 @@ def extract_from_pipeline(model, X, test_idx):
             "y_pred": y_pred,
         }
 
-    # --- non-PCA path (selectors with get_support or passthrough) -------------
+    # non-PCA path (selectors with get_support or passthrough)
     sel_idx = _safe_get_support(sel, len(var_idx))
     orig_idx = var_idx[sel_idx]
 
@@ -721,8 +724,13 @@ def extract_from_pipeline(model, X, test_idx):
     y_pred = pipe.predict(Xt)
 
     # contributions in selected space
-    Xt_test = pipe[:-1].transform(Xt)  # includes 'select' since it's not PCA
-    contrib_sel = Xt_test[:, None, :] * coef[None, :, :]  # (n_test, n_classes, n_selected)
+    Xt_test = Xt
+    for name, step in pipe.steps[:-1]:
+        if step is None or step == "passthrough":
+            continue
+        Xt_test = step.transform(Xt_test)
+
+    contrib_sel = Xt_test[:, None, :] * coef[None, :, :]
 
     # expand to ROI
     n_test = Xt_test.shape[0]

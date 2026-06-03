@@ -128,13 +128,13 @@ class PrepareROIs:
         self.src = src
         self.extension = extension
         
-        # derive mask dir from components or straight directory
-        self.mask_dir = self.derive_mask_dir()
-
-        assert os.path.exists(self.mask_dir), FileNotFoundError(f"Mask directory '{self.mask_dir}' does not exist")
-
         # load masks
         if isinstance(self.roi_labels, list):
+            # derive mask dir from components or straight directory
+            self.mask_dir = self.derive_mask_dir()
+
+            assert os.path.exists(self.mask_dir), FileNotFoundError(f"Mask directory '{self.mask_dir}' does not exist")
+
             self.roi_masks = self._from_labels(self.mask_dir)
         elif isinstance(self.roi_labels, str):
             if os.path.isdir(self.roi_labels):
@@ -534,7 +534,7 @@ class PrepareROIs:
 
         if roi_name is None:
             try:
-                bids_comps = utils.split_bids_components(i)
+                bids_comps = utils.split_bids_components(i, add_elements='roi')
             except Exception:
                 logger.warning(f"{i} is not in BIDS-format. Cannot extract 'roi-<roi_name>' key, so defaulting to 'roi' as roi_name. This can result in clashing names!")
                 roi_name = "roi"
