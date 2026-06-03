@@ -186,11 +186,8 @@ def action_run(args):
 
     for subj in subjects:
 
-        save_dir = opj(base_cfg["general_settings"]["save_dir"], subj)
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-
         # make directory
+        save_dir = opj(cfg_to_use["general_settings"]["save_dir"], subj)
         os.makedirs(save_dir, exist_ok=True)
         
         # define log file | will be overwritten
