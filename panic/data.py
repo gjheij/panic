@@ -237,7 +237,7 @@ class PrepareROIs:
 
         **Processing Steps**
             1. Find all files in ``directory`` with the extension ``.nii.gz`` using
-            :func:`utils.FindFiles`.
+            :func:`utils.FindFiles` (0 recursion, looks only in specified path).
             2. Load each image via :func:`nibabel.load`.
             3. Sanitize image data via :func:`self._sanitize`, replacing invalid
             voxel values with ``fill``.
@@ -274,6 +274,7 @@ class PrepareROIs:
         ddict = {}
         all_imgs = utils.FindFiles(
             directory,
+            maxdepth=0,
             extension=".nii.gz"
         ).files
 
