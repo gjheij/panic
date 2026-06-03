@@ -178,7 +178,8 @@ def action_run(args):
         print(f"Using temporary config with overrides at: {cfg_to_use}")
     else:
         cfg_to_use = cfg_path
-
+    
+    loaded_cfg = load_yaml(cfg_to_use)
     if changes:
         print("Applied overrides:")
         for c in changes:
@@ -187,7 +188,7 @@ def action_run(args):
     for subj in subjects:
 
         # make directory
-        save_dir = opj(cfg_to_use["general_settings"]["save_dir"], subj)
+        save_dir = opj(loaded_cfg["general_settings"]["save_dir"], subj)
         os.makedirs(save_dir, exist_ok=True)
         
         # define log file | will be overwritten
