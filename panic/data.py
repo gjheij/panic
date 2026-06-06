@@ -1070,14 +1070,15 @@ class PrepareBetas:
 
         #--------------------------------------------------------------------------------
         # stglm | glmsingle need to be concatenated; HALFpipe comes concatenated
+        allowed = ['glmsingle', 'bach', 'halfpipe', 'stglm']
         if src == "glmsingle":
             search = f"model-{model_mapper[model]}_beta-"
         elif src == "bach":
             search = "beta_"
-        elif src == "halfpipe":
+        elif src in ["halfpipe", "stglm"]:
             search = [f"feature-{model}_condition-", "effect_statmap.nii.gz"]
         else:
-            search = f"desc-{model}"
+            raise ValueError(f"Source must be on of {allowed}, not '{src}'")
 
         m_files = utils.FindFiles(
             subject_betas,
@@ -1098,7 +1099,7 @@ class PrepareBetas:
         niimgs = []
         trials = []
         groups = []
-        if src == "halfpipe":
+        if src in ["halfpipe", "stglm"]:
 
             if not isinstance(label_mapper, dict):
                 raise TypeError(f"When HALFpipe is used, 'label_mapper' must be a dictionary with keys representing the stimuli to include, not '{label_mapper}'")
@@ -1142,20 +1143,6 @@ class PrepareBetas:
                 # trials.extend([i] * n_vols)
                 niimgs.append(img)
 
-                # stGLM can be run-wise
-                if src == "stglm":
-
-                    # groups (run ID replicated per event in that run)
-                    m = run_re.search(f)
-                    if m:
-                        run_id = int(m.group(1))      # 1..R
-                    else:
-                        # fallback: index of file within condition list
-                        run_id = len(set(groups)) + 1
-                        logger.warning(f"Could not parse run-XX from '{f}'. Using fallback run_id={run_id}")
-
-                    groups.extend([run_id] * n_vols)
-
         #--------------------------------------------------------------------------------
         # concatenate
         logger.info("Concatenating these files into single 4D-object")
@@ -1176,22 +1163,6 @@ class PrepareBetas:
             )
 
             trials = np.loadtxt(trial_file, dtype=str)
-        else:
-
-            json_files = utils.FindFiles(
-                subject_betas,
-                extension=".json"
-            ).files
-
-            # stglm is run-wise
-            if src == "stglm":
-
-                trials = []
-                for j in json_files:
-                    with open(j, "r") as j_file:
-                        metadata = json.load(j_file)
-
-                    trials += metadata["TrialList"]
 
         #--------------------------------------------------------------------------------
         # verify
