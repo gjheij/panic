@@ -479,7 +479,7 @@ def permutation_searchlight(
     *,
     groups=None,          # run indices per trial (optional)
     seed=0,
-    tmpdir="~/.joblib_cache",
+    tmpdir=None,
     output_file=None,
     **kwargs
 ):
@@ -644,132 +644,139 @@ def permutation_searchlight(
     folds = utils._folds_for_labels(cfg, y, groups)
 
     # 3) memmap X once
+    if tmpdir is None:
+        tmpdir = os.environ.get("TMPDIR", "~/.joblib_cache")
+
     tmpdir = os.path.expanduser(tmpdir)
     os.makedirs(tmpdir, exist_ok=True)
-    tmpd = tempfile.mkdtemp(dir=tmpdir)
 
-    X_path = dump(
-        X,
-        opj(tmpd, f"Xsl_full_{uuid.uuid4().hex}.joblib"),
-        compress=0
-    )[0]
+    with tempfile.TemporaryDirectory(dir=tmpdir, prefix="panic_") as tmpd:
+        X_path = dump(
+            X,
+            os.path.join(tmpd, f"Xsl_full_{uuid.uuid4().hex}.joblib"),
+            compress=0
+        )[0]
 
-    zooms = mf.mask_resampled_to_betas.header.get_zooms()
-    offs  = _neighbors_ball_mm(zooms, radius_mm)
+        X_mm = load(X_path, mmap_mode="r")
+        logger.info(f"X={X_mm.shape} (n_samples, n_features)")
 
-    # 5) run per-center
-    rng = np.random.default_rng(seed)
-    center_seeds = rng.integers(0, 2**32 - 1, size=len(centers), dtype=np.uint32)
+        zooms = mf.mask_resampled_to_betas.header.get_zooms()
+        offs  = _neighbors_ball_mm(zooms, radius_mm)
 
-    save_dir = tmpdir
-    if "save_dir" in kwargs:
-        save_dir = opj(kwargs.pop("save_dir"), "searchlight")
+        # 5) run per-center
+        rng = np.random.default_rng(seed)
+        center_seeds = rng.integers(0, 2**32 - 1, size=len(centers), dtype=np.uint32)
 
-    logger.info(f"Storing searchlight information in {save_dir}")
-    n_perms = cfg.get("n_permutations", 1000)
-    n_jobs = par_cfg.get("n_jobs", 1)
-    def _run(ix):
-        return _one_center(
-            centers[ix], offs, col_index_vol, vol_shape, mf.roi_linidx,
-            X_path, y, folds, cfg,
-            groups=groups,
+        save_dir = tmpdir
+        if "save_dir" in kwargs:
+            save_dir = opj(kwargs.pop("save_dir"), "searchlight")
+
+        logger.info(f"Storing searchlight information in {save_dir}")
+        n_perms = cfg.get("n_permutations", 1000)
+        n_jobs = par_cfg.get("n_jobs", 1)
+        def _run(ix):
+            return _one_center(
+                centers[ix], offs, col_index_vol, vol_shape, mf.roi_linidx,
+                X_path, y, folds, cfg,
+                groups=groups,
+                n_perms=n_perms,
+                seed=int(center_seeds[ix]),
+                locked=locked_params,
+                searchlight=True,
+                save_dir=save_dir,
+                **kwargs
+            )
+
+        logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
+
+        if n_jobs == 1:
+            out = [
+                _run(i)
+                for i in tqdm(
+                    range(len(centers)),
+                    total=len(centers),
+                    disable=utils.tqdm_disabled(),
+                )
+            ]
+        else:
+            with tqdm_joblib(
+                tqdm(
+                    total=len(centers),
+                    disable=utils.tqdm_disabled(),
+                )
+            ):
+                out = Parallel(
+                    n_jobs=n_jobs,
+                    backend=par_cfg.get("backend", "loky"),
+                    prefer=par_cfg.get("prefer", "processes"),
+                    batch_size=par_cfg.get("batch_size", 16),
+                    verbose=par_cfg.get("verbose", 0)
+                )([delayed(_run)(i) for i in range(len(centers))])
+
+        # 6) assemble maps
+        obs_map   = np.full(vol_shape, np.nan, dtype=np.float32)
+        null_map  = np.full(vol_shape, np.nan, dtype=np.float32)
+        delta_map = np.full(vol_shape, np.nan, dtype=np.float32)
+        p_map     = np.full(vol_shape, np.nan, dtype=np.float32)
+        nfeat_map = np.zeros(vol_shape, dtype=np.int32)
+        nperms_run_map = np.zeros(vol_shape, dtype=np.int32)
+        stopped_map    = np.zeros(vol_shape, dtype=np.uint8)
+        stop_code_map  = np.zeros(vol_shape, dtype=np.uint8)
+
+        for (x,y,z), obs, nullm, dlt, p, nf, nrun, stopped, stop_code in out:
+            obs_map[x,y,z]   = obs
+            null_map[x,y,z]  = nullm
+            delta_map[x,y,z] = dlt
+            p_map[x,y,z]     = p
+            nfeat_map[x,y,z] = nf
+            nperms_run_map[x,y,z] = nrun
+            stopped_map[x,y,z]    = stopped
+            stop_code_map[x,y,z]  = stop_code
+
+        # 7) save NIfTIs
+        os.makedirs(save_dir, exist_ok=True)
+        base = opj(save_dir or tmpdir, "searchlight")
+
+        ref = mf.mask_resampled_to_betas  # SAME grid/affine as vol_shape
+        out_files = save_searchlight_maps(
+            base,
+            ref_img=ref,
+            observed_map=obs_map,
+            null_mean_map=null_map,
+            delta_map=delta_map,
+            pvalue_map=p_map,
+            nfeatures_map=nfeat_map,
+            nperms_run=nperms_run_map,
+            stopped=stopped_map,
+            stop_code=stop_code_map,
+            fdr_alpha=alpha,
             n_perms=n_perms,
-            seed=int(center_seeds[ix]),
-            locked=locked_params,
-            searchlight=True,
-            save_dir=save_dir,
-            **kwargs
+            mask_img=ref
         )
 
-    logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
+        # also drop a small JSON sidecar
+        meta = {
+            "radius_mm": float(radius_mm),
+            "n_permutations": int(n_perms),
+            "cv": cfg.get("outer_cv", {}),
+            "permute_within_groups": bool(cfg.get("permute_within_groups", False)),
+            "estimator": cfg.get("estimator", {}),
+            "feature_selection": cfg.get("feature_selection", {}),
+            "variance_threshold": float(cfg.get("variance_threshold", 1e-12)),
+            "fdr_alpha": float(alpha),
+            "early_stop_alpha": float(early_stop_alpha) if early_stop_alpha is not None else None,
+            "n_centers": int(np.isfinite(p_map).sum()),
+            "stopped_total": int(np.sum(stopped_map)),
+            "stopped_pmin": int(np.sum(stop_code_map == 1)),
+            "stopped_pmax": int(np.sum(stop_code_map == 2)),
+            "median_nperms_run": float(np.median(nperms_run_map[nperms_run_map > 0])) if (nperms_run_map > 0).any() else 0.0,        
+        }
 
-    if n_jobs == 1:
-        out = [
-            _run(i)
-            for i in tqdm(
-                range(len(centers)),
-                total=len(centers),
-                disable=utils.tqdm_disabled(),
-            )
-        ]
-    else:
-        with tqdm_joblib(
-            tqdm(
-                total=len(centers),
-                disable=utils.tqdm_disabled(),
-            )
-        ):
-            out = Parallel(
-                n_jobs=n_jobs,
-                backend=par_cfg.get("backend", "loky"),
-                prefer=par_cfg.get("prefer", "processes"),
-                batch_size=par_cfg.get("batch_size", 16),
-                verbose=par_cfg.get("verbose", 0)
-            )([delayed(_run)(i) for i in range(len(centers))])
+        with open(f"{base}_desc-metadata.json", "w") as f:
+            json.dump(meta, f, indent=2)
 
-    # 6) assemble maps
-    obs_map   = np.full(vol_shape, np.nan, dtype=np.float32)
-    null_map  = np.full(vol_shape, np.nan, dtype=np.float32)
-    delta_map = np.full(vol_shape, np.nan, dtype=np.float32)
-    p_map     = np.full(vol_shape, np.nan, dtype=np.float32)
-    nfeat_map = np.zeros(vol_shape, dtype=np.int32)
-    nperms_run_map = np.zeros(vol_shape, dtype=np.int32)
-    stopped_map    = np.zeros(vol_shape, dtype=np.uint8)
-    stop_code_map  = np.zeros(vol_shape, dtype=np.uint8)
+        return out_files
 
-    for (x,y,z), obs, nullm, dlt, p, nf, nrun, stopped, stop_code in out:
-        obs_map[x,y,z]   = obs
-        null_map[x,y,z]  = nullm
-        delta_map[x,y,z] = dlt
-        p_map[x,y,z]     = p
-        nfeat_map[x,y,z] = nf
-        nperms_run_map[x,y,z] = nrun
-        stopped_map[x,y,z]    = stopped
-        stop_code_map[x,y,z]  = stop_code
-
-    # 7) save NIfTIs
-    os.makedirs(save_dir, exist_ok=True)
-    base = opj(save_dir or tmpdir, "searchlight")
-
-    ref = mf.mask_resampled_to_betas  # SAME grid/affine as vol_shape
-    out_files = save_searchlight_maps(
-        base,
-        ref_img=ref,
-        observed_map=obs_map,
-        null_mean_map=null_map,
-        delta_map=delta_map,
-        pvalue_map=p_map,
-        nfeatures_map=nfeat_map,
-        nperms_run=nperms_run_map,
-        stopped=stopped_map,
-        stop_code=stop_code_map,
-        fdr_alpha=alpha,
-        n_perms=n_perms,
-        mask_img=ref
-    )
-
-    # also drop a small JSON sidecar
-    meta = {
-        "radius_mm": float(radius_mm),
-        "n_permutations": int(n_perms),
-        "cv": cfg.get("outer_cv", {}),
-        "permute_within_groups": bool(cfg.get("permute_within_groups", False)),
-        "estimator": cfg.get("estimator", {}),
-        "feature_selection": cfg.get("feature_selection", {}),
-        "variance_threshold": float(cfg.get("variance_threshold", 1e-12)),
-        "fdr_alpha": float(alpha),
-        "early_stop_alpha": float(early_stop_alpha) if early_stop_alpha is not None else None,
-        "n_centers": int(np.isfinite(p_map).sum()),
-        "stopped_total": int(np.sum(stopped_map)),
-        "stopped_pmin": int(np.sum(stop_code_map == 1)),
-        "stopped_pmax": int(np.sum(stop_code_map == 2)),
-        "median_nperms_run": float(np.median(nperms_run_map[nperms_run_map > 0])) if (nperms_run_map > 0).any() else 0.0,        
-    }
-
-    with open(f"{base}_desc-metadata.json", "w") as f:
-        json.dump(meta, f, indent=2)
-
-    return out_files
 
 def save_searchlight_maps(
     base_path,

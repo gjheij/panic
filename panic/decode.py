@@ -28,7 +28,7 @@ def run_decoding_with_permutation(
         folds,
         cfg,
         seed=0,
-        tmpdir="~/.joblib_cache",
+        tmpdir=None,
         groups=None,
         **kwargs
     ):
@@ -167,173 +167,176 @@ def run_decoding_with_permutation(
     - Ideal for ROI- or whole-brain decoding when voxelwise searchlight is unnecessary.
     """
 
+    if tmpdir is None:
+        tmpdir = os.environ.get("TMPDIR", "~/.joblib_cache")
+
     tmpdir = os.path.expanduser(tmpdir)
     os.makedirs(tmpdir, exist_ok=True)
-    tmpd = tempfile.mkdtemp(dir=tmpdir)
     
     # read settings for parallellization
     par_cfg = cfg.get("parallel", {})
 
     # compress=0 keeps it as a plain .npy-like file for fast mmap
-    X_path = dump(
-        X,
-        os.path.join(tmpd, f"X_mm_{uuid.uuid4().hex}.joblib"),
-        compress=0
-    )[0]
+    with tempfile.TemporaryDirectory(dir=tmpdir, prefix="panic_") as tmpd:
+        X_path = dump(
+            X,
+            os.path.join(tmpd, f"X_mm_{uuid.uuid4().hex}.joblib"),
+            compress=0
+        )[0]
 
-    X_mm = load(X_path, mmap_mode="r")
-    logger.info(f"X={X_mm.shape} (n_samples, n_features)")
+        X_mm = load(X_path, mmap_mode="r")
+        logger.info(f"X={X_mm.shape} (n_samples, n_features)")
 
-    # config takes precedence over the presence of groups
-    if not cfg.get("permute_within_groups", False):
+        # config takes precedence over the presence of groups
+        if not cfg.get("permute_within_groups", False):
+            if groups is not None:
+                logger.info("Groups (or runs) were detected, but permute_within_groups=False, so ignoring groups..")
+
+            groups = None
+        
+        # log them
         if groups is not None:
-            logger.info("Groups (or runs) were detected, but permute_within_groups=False, so ignoring groups..")
+            logger.info(f"Groups = {groups}")
 
-        groups = None
-    
-    # log them
-    if groups is not None:
-        logger.info(f"Groups = {groups}")
+        labels = np.asarray(labels)
+        groups = None if groups is None else np.asarray(groups)
 
-    labels = np.asarray(labels)
-    groups = None if groups is None else np.asarray(groups)
+        # observed
+        if "save_dir" in kwargs:
+            logger.info(f"Storing fold information in {kwargs['save_dir']}")
 
-    # observed
-    if "save_dir" in kwargs:
-        logger.info(f"Storing fold information in {kwargs['save_dir']}")
+        try:
+            observed_acc = utils._cv_mean_score(
+                X_path, labels, folds, cfg,
+                groups=groups,
+                permute=False,
+                **kwargs
+            )
+        except NoFeaturesSelectedError as e:
+            logger.warning(f"Observed CV failed (no features): {e}. Skipping ROI.")
+            return None
 
-    try:
-        observed_acc = utils._cv_mean_score(
-            X_path, labels, folds, cfg,
-            groups=groups,
-            permute=False,
-            **kwargs
-        )
-    except NoFeaturesSelectedError as e:
-        logger.warning(f"Observed CV failed (no features): {e}. Skipping ROI.")
-        return None
+        logger.info("Observed accuracy after %d folds: %.4f", len(folds), observed_acc)
 
-    logger.info("Observed accuracy after %d folds: %.4f", len(folds), observed_acc)
+        # permutations in parallel with progress bar
+        n_perms = cfg.get("n_permutations", 1000)
+        n_jobs = par_cfg.get("n_jobs", 1)
+        rng = np.random.default_rng(seed)
+        seeds = rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
-    # permutations in parallel with progress bar
-    n_perms = cfg.get("n_permutations", 1000)
-    n_jobs = par_cfg.get("n_jobs", 1)
-    rng = np.random.default_rng(seed)
-    seeds = rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
+        # helper for one permutation draw
+        def _one_perm(seed):
+            return utils._cv_mean_score(
+                X_path, labels, folds, cfg,
+                groups=groups,
+                permute=True,
+                rng=np.random.default_rng(int(seed)),
+                **kwargs
+            )
 
-    # helper for one permutation draw
-    def _one_perm(seed):
-        return utils._cv_mean_score(
-            X_path, labels, folds, cfg,
-            groups=groups,
-            permute=True,
-            rng=np.random.default_rng(int(seed)),
-            **kwargs
-        )
+        # get early stop alpha
+        early_stop_alpha = cfg.get("early_stop_alpha", None)
+        early_stop_batch = cfg.get("early_stop_batch", 32)
+        logger.info("Starting permutation testing: n_perms=%d, n_jobs=%d", n_perms, n_jobs)
+        if early_stop_alpha is None:
 
-    # get early stop alpha
-    early_stop_alpha = cfg.get("early_stop_alpha", None)
-    early_stop_batch = cfg.get("early_stop_batch", 32)
-    logger.info("Starting permutation testing: n_perms=%d, n_jobs=%d", n_perms, n_jobs)
-    if early_stop_alpha is None:
-
-        if n_jobs == 1:
-            permuted_acc = [
-                _one_perm(s)
-                for s in tqdm(
-                    seeds,
-                    total=n_perms,
-                    disable=utils.tqdm_disabled()
-                )
-            ]
-        else:
-            with tqdm_joblib(
-                tqdm(
-                    total=n_perms,
-                    disable=utils.tqdm_disabled()
-                )
-            ):
-                permuted_acc = Parallel(
-                    n_jobs=n_jobs,
-                    backend=par_cfg.get("backend", "loky"),
-                    prefer=par_cfg.get("prefer", "processes"),
-                    batch_size=par_cfg.get("batch_size", 16),
-                    verbose=par_cfg.get("verbose", 0)
-                )([delayed(_one_perm)(s) for s in seeds])
-        permuted_acc = np.asarray(permuted_acc, dtype=float)
-        n_run = len(permuted_acc)
-
-    # --- EARLY-STOP ON: batched loop with fail-fast rule ---
-    else:
-        n_batches = int(np.ceil(n_perms / early_stop_batch))
-        logger.info(f"Fail-fast enabled with α={early_stop_alpha}, testing each {int(early_stop_batch)} permutations if significance can be reached (total #batches={n_batches})")
-        J0 = int(np.ceil(1.0 / early_stop_alpha) - 1)  # minimum perms before we can possibly detect p<α
-        count_exceed = 0
-        permuted_list = []
-        j = 0
-
-        # iterator over seeds in batches
-        def _batches(seq, k):
-            for i in range(0, len(seq), k):
-                yield seq[i:i+k]
-
-        for batch in tqdm(
-            _batches(seeds, early_stop_batch),
-            total=n_batches,
-            disable=utils.tqdm_disabled()
-        ):
             if n_jobs == 1:
-                vals = [_one_perm(s) for s in batch]
+                permuted_acc = [
+                    _one_perm(s)
+                    for s in tqdm(
+                        seeds,
+                        total=n_perms,
+                        disable=utils.tqdm_disabled()
+                    )
+                ]
             else:
-                # parallel within batch
-                vals = Parallel(
-                    n_jobs=n_jobs,
-                    backend=par_cfg.get("backend", "loky"),
-                    prefer=par_cfg.get("prefer", "processes"),
-                    batch_size=par_cfg.get("batch_size", 16),
-                    verbose=par_cfg.get("verbose", 0)
-                )([delayed(_one_perm)(s) for s in batch])
+                with tqdm_joblib(
+                    tqdm(
+                        total=n_perms,
+                        disable=utils.tqdm_disabled()
+                    )
+                ):
+                    permuted_acc = Parallel(
+                        n_jobs=n_jobs,
+                        backend=par_cfg.get("backend", "loky"),
+                        prefer=par_cfg.get("prefer", "processes"),
+                        batch_size=par_cfg.get("batch_size", 16),
+                        verbose=par_cfg.get("verbose", 0)
+                    )([delayed(_one_perm)(s) for s in seeds])
+            permuted_acc = np.asarray(permuted_acc, dtype=float)
+            n_run = len(permuted_acc)
 
-            vals = np.asarray(vals, float)
-            permuted_list.append(vals)
-            # update state
-            count_exceed += int(np.sum(vals >= observed_acc))
-            j += len(vals)
+        # --- EARLY-STOP ON: batched loop with fail-fast rule ---
+        else:
+            n_batches = int(np.ceil(n_perms / early_stop_batch))
+            logger.info(f"Fail-fast enabled with α={early_stop_alpha}, testing each {int(early_stop_batch)} permutations if significance can be reached (total #batches={n_batches})")
+            J0 = int(np.ceil(1.0 / early_stop_alpha) - 1)  # minimum perms before we can possibly detect p<α
+            count_exceed = 0
+            permuted_list = []
+            j = 0
 
-            # fail-fast only: stop if p cannot become < alpha
-            if j >= J0:
-                p_min = (count_exceed + 1) / (j + 1)
-                if p_min > early_stop_alpha:
+            # iterator over seeds in batches
+            def _batches(seq, k):
+                for i in range(0, len(seq), k):
+                    yield seq[i:i+k]
+
+            for batch in tqdm(
+                _batches(seeds, early_stop_batch),
+                total=n_batches,
+                disable=utils.tqdm_disabled()
+            ):
+                if n_jobs == 1:
+                    vals = [_one_perm(s) for s in batch]
+                else:
+                    # parallel within batch
+                    vals = Parallel(
+                        n_jobs=n_jobs,
+                        backend=par_cfg.get("backend", "loky"),
+                        prefer=par_cfg.get("prefer", "processes"),
+                        batch_size=par_cfg.get("batch_size", 16),
+                        verbose=par_cfg.get("verbose", 0)
+                    )([delayed(_one_perm)(s) for s in batch])
+
+                vals = np.asarray(vals, float)
+                permuted_list.append(vals)
+                # update state
+                count_exceed += int(np.sum(vals >= observed_acc))
+                j += len(vals)
+
+                # fail-fast only: stop if p cannot become < alpha
+                if j >= J0:
+                    p_min = (count_exceed + 1) / (j + 1)
+                    if p_min > early_stop_alpha:
+                        break
+
+                # also stop if we already hit all perms
+                if j >= n_perms:
                     break
 
-            # also stop if we already hit all perms
-            if j >= n_perms:
-                break
+            permuted_acc = np.concatenate(permuted_list, dtype=float) if permuted_list else np.empty(0, float)
+            n_run = len(permuted_acc)
 
-        permuted_acc = np.concatenate(permuted_list, dtype=float) if permuted_list else np.empty(0, float)
-        n_run = len(permuted_acc)
+        # aggregate
+        mean_permuted_acc = float(np.mean(permuted_acc)) if n_run else float("nan")
+        delta = float(observed_acc - mean_permuted_acc)
+        p_val = (np.sum(permuted_acc >= observed_acc) + 1) / (n_run + 1) if n_run else 1.0
 
-    # aggregate
-    mean_permuted_acc = float(np.mean(permuted_acc)) if n_run else float("nan")
-    delta = float(observed_acc - mean_permuted_acc)
-    p_val = (np.sum(permuted_acc >= observed_acc) + 1) / (n_run + 1) if n_run else 1.0
+        logger.info("Permutation complete. Null acc: %.4f | Observed acc: %.4f | Δ=%.4f | p=%.4f | n_run=%d",
+                    np.nanmean(permuted_acc) if n_run else float("nan"),
+                    observed_acc, delta, p_val, n_run)
 
-    logger.info("Permutation complete. Null acc: %.4f | Observed acc: %.4f | Δ=%.4f | p=%.4f | n_run=%d",
-                np.nanmean(permuted_acc) if n_run else float("nan"),
-                observed_acc, delta, p_val, n_run)
+        ddict = {
+            "observed": float(observed_acc),
+            "permuted": permuted_acc,
+            "mean_permuted": float(mean_permuted_acc),
+            "delta": float(delta),
+            "p": float(p_val),
+            "n_run": int(n_run),
+            "n_perms": int(n_perms),
+            "early_stop_alpha": None if early_stop_alpha is None else float(early_stop_alpha),
+        }
 
-    ddict = {
-        "observed": float(observed_acc),
-        "permuted": permuted_acc,
-        "mean_permuted": float(mean_permuted_acc),
-        "delta": float(delta),
-        "p": float(p_val),
-        "n_run": int(n_run),
-        "n_perms": int(n_perms),
-        "early_stop_alpha": None if early_stop_alpha is None else float(early_stop_alpha),
-    }
-
-    return ddict
+        return ddict
 
 class ClassifySubject(data.PrepareBetas):
 
@@ -867,6 +870,7 @@ class ClassifySubject(data.PrepareBetas):
                     label_mapper=self.cfg["label_dict"],
                     output_file=fname,
                     save_dir=roi_dir,
+                    tmpdir=self.gen_settings["tmp_dir"],
                     **kwargs
                 )
 
