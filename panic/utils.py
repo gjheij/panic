@@ -312,6 +312,7 @@ def _cv_mean_score(
         folds,
         cfg,
         *,
+        cols=None,
         groups=None,
         standardize=True,
         permute=False,
@@ -341,7 +342,8 @@ def _cv_mean_score(
     ----------
     X_path : str or Path
         Path to a ``joblib`` dump of a memory-mapped feature matrix
-        ``(n_samples, n_features)``.
+        ``(n_samples, n_features)``. If ``cols`` is provided, only the selected
+        feature columns are used for fitting and evaluation.
     labels : array-like of shape (n_samples,)
         Integer or categorical labels aligned with rows in ``X``.
     folds : list of tuple(ndarray, ndarray)
@@ -350,6 +352,12 @@ def _cv_mean_score(
     cfg : dict
         Configuration dictionary controlling decoding parameters and pipeline
         construction. Passed to :func:`pipeline_from_config`.
+    cols : array-like of int, optional
+        Optional subset of feature (column) indices to evaluate. If provided,
+        only ``X[:, cols]`` is used during cross-validation, while the underlying
+        memmapped array is loaded only once. This is primarily intended for
+        searchlight decoding, where each center evaluates a different voxel
+        neighborhood without creating additional temporary memmap files.        
     groups : array-like of shape (n_samples,), optional
         Optional grouping labels (e.g., run or subject IDs). Used both for
         stratified or grouped CV and for within-group label permutations.
@@ -422,6 +430,14 @@ def _cv_mean_score(
     _permute_within_groups : Shuffle labels within group boundaries.
     _save_pipeline : Persist fitted models and metadata.
     """
+
+    if isinstance(X_path, (str, os.PathLike)):
+        X_mm = load(X_path, mmap_mode="r")
+    else:
+        X_mm = X_path
+
+    if cols is not None:
+        X_mm = X_mm[:, cols]
 
     X_mm = load(X_path, mmap_mode="r")
     y = np.asarray(labels)

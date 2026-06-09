@@ -7,7 +7,7 @@ from tqdm import tqdm
 from nilearn import image
 import os, json, tempfile, uuid
 from joblib import Parallel, delayed, dump, load
-from panic.logger import get_logger, tqdm_joblib
+from panic.logger import get_logger, tqdm_joblib, _LoggedProgress
 from panic import (
     data,
     utils,
@@ -397,7 +397,6 @@ def _one_center(
     ((32, 40, 20), 0.71, 0.50, 0.21, 0.01, 87, 100, 0, 0)
     """
 
-    X_mm = load(X_mm_path, mmap_mode="r")  # shape [n_samples, n_features_all_roi]
     # Build neighborhood feature indices (in ROI feature space) for this center
     cx, cy, cz = map(int, center_ijk)
     cols = []
@@ -411,24 +410,10 @@ def _one_center(
     if len(cols) < 2:
         return (cx, cy, cz), np.nan, np.nan, np.nan, np.nan, len(cols)
 
-    # Build temporary mmap with only those columns for speed during CV
-    # (slice view is fine; _cv_mean_score already memmaps by path, so dump a small array)
-    tmp = X_mm[:, cols]
-
-    # Save light-weight array uncompressed for fast mmap
-    tmp_dir = os.path.dirname(X_mm_path)
-    tmp_path = dump(
-        tmp,
-        opj(
-            tmp_dir,
-            f"Xsl_{uuid.uuid4().hex}.joblib"
-        ),
-        compress=0
-    )[0]
-
     # observed
     obs = utils._cv_mean_score(
-        tmp_path, labels, folds, cfg,
+        X_mm_path, labels, folds, cfg,
+        cols=cols,
         groups=groups,
         permute=False,
         **kwargs
@@ -436,7 +421,6 @@ def _one_center(
 
     # permutations with early stop
     sl_cfg = cfg.get("searchlight", {}) or {}
-    alpha = sl_cfg.get("alpha", None)
     early_stop_alpha = sl_cfg.get("early_stop_alpha", None)
 
     # derive permutation seeds from this center's seed
@@ -446,7 +430,8 @@ def _one_center(
     def _score_once(rng):
         # delegate to utils._cv_mean_score
         return utils._cv_mean_score(
-            tmp_path, labels, folds, cfg,
+            X_mm_path, labels, folds, cfg,
+            cols=cols,
             rng=rng,
             permute=True,
             **kwargs
@@ -689,21 +674,30 @@ def permutation_searchlight(
 
         logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
 
+        log_every = int(par_cfg.get("update_interval", 0))
+        log_progress = _LoggedProgress(
+            total=len(centers),
+            label="Searchlight",
+            every=log_every,
+            logger=logger,
+        )
+
         if n_jobs == 1:
-            out = [
-                _run(i)
-                for i in tqdm(
-                    range(len(centers)),
-                    total=len(centers),
-                    disable=utils.tqdm_disabled(),
-                )
-            ]
+            out = []
+            for i in tqdm(
+                range(len(centers)),
+                total=len(centers),
+                disable=utils.tqdm_disabled(),
+            ):
+                out.append(_run(i))
+                log_progress.update(1)
         else:
             with tqdm_joblib(
                 tqdm(
                     total=len(centers),
-                    disable=utils.tqdm_disabled(),
-                )
+                    disable=utils.tqdm_disabled()
+                ),
+                log_progress=log_progress,
             ):
                 out = Parallel(
                     n_jobs=n_jobs,
@@ -712,6 +706,7 @@ def permutation_searchlight(
                     batch_size=par_cfg.get("batch_size", 16),
                     verbose=par_cfg.get("verbose", 0)
                 )([delayed(_run)(i) for i in range(len(centers))])
+
 
         # 6) assemble maps
         obs_map   = np.full(vol_shape, np.nan, dtype=np.float32)
