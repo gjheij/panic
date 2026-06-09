@@ -28,7 +28,7 @@ fitted_derivative: false
 
 decoding_settings:
   fold_interval: 3              # if not LORO/LOSO, iterate over labels
-  n_permutations: 10            # permutations for ROI-decoding/searchlight
+  n_permutations: 250           # permutations for ROI-decoding/searchlight
   early_stop_alpha: 0.05        # enable early stopping
   early_stop_batch: 32          # check after X permutations if significance can be reached
   variance_threshold: 1e-12     # avoid flat time series
@@ -38,7 +38,7 @@ decoding_settings:
 
   parallel:
     n_jobs: 1                   # this one actually parallizes over permutations/batches
-    batch_size: 16              # batch size Parallel process
+    batch_size: 1               # batch size Parallel process
     backend: "loky"             # backend for Parallel process
     prefer: "processes"         # preference for Parallel process
     verbose: 0                  # verbosity of Parallel process
@@ -91,6 +91,6 @@ decoding_settings:
   # searchlight
   searchlight:
     alpha: 0.05               # value for FDR correction
-    radius_mm: 10             # radius around center
+    radius_mm: 6              # radius around center
     locked:                   # no gridsearch within searchlight..
       clf__C: 1.0
