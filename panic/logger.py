@@ -6,8 +6,9 @@ import os
 import sys
 import joblib
 import logging
-import tqdm as tqmod
 import contextvars
+import numpy as np
+import tqdm as tqmod
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional, Union
@@ -145,20 +146,39 @@ def get_logger(
     return logger
 
 
-def worker_init(
-    log_dir: Union[str, Path],
-    log_level: int,
-) -> None:
-    pid = os.getpid()
-    worker_log = os.path.join(log_dir, f"log.worker.{pid}.log")
+class _LoggedProgress:
+    """Log progress at readable intervals while tqdm handles terminal output."""
 
-    init_logging(
-        level=log_level,
-        logfile=worker_log,
-        use_tqdm=False,
-        use_color=True,
-        filemode="a",
-    )
+    def __init__(self, total, label="Searchlight", every=None, logger=None):
+        self.total = max(0, int(total))
+        self.label = str(label)
+        self.done = 0
+        self.logger = logger or logging.getLogger(__name__)
 
-    logger = logging.getLogger("calinet.worker")
-    logger.info(f"Worker {pid} logging to {worker_log}")
+        if every is None:
+            self.every = max(1, int(np.ceil(self.total / 20))) if self.total else 1
+        else:
+            self.every = int(every)
+
+        # every <= 0 disables logfile progress
+        self.enabled = self.every > 0 and self.total > 0
+        self.next_log = self.every if self.enabled else None
+
+    def update(self, n=1):
+        if not self.enabled:
+            return
+
+        self.done += int(n)
+        shown = min(self.done, self.total)
+
+        if shown >= self.next_log or shown >= self.total:
+            self.logger.info(
+                "%s progress: %d/%d (%.1f%%)",
+                self.label,
+                shown,
+                self.total,
+                100.0 * shown / max(1, self.total),
+            )
+
+            while self.next_log <= shown:
+                self.next_log += self.every
