@@ -62,11 +62,17 @@ class TqdmSafeHandler(logging.Handler):
 
 
 @contextmanager
-def tqdm_joblib(tqdm_object):
-    """Context manager to patch joblib to report into tqdm progress bar."""
+def tqdm_joblib(tqdm_object, log_progress=None):
+    """Context manager to patch joblib to report into tqdm and optional logfile progress."""
+
     class TqdmBatchCallback(joblib.parallel.BatchCompletionCallBack):
         def __call__(self, *args, **kwargs):
-            tqdm_object.update(n=self.batch_size)
+            n = self.batch_size
+            tqdm_object.update(n=n)
+
+            if log_progress is not None:
+                log_progress.update(n)
+
             return super().__call__(*args, **kwargs)
 
     old_cb = joblib.parallel.BatchCompletionCallBack
