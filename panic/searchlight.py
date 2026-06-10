@@ -594,7 +594,6 @@ def permutation_searchlight(
         logger.info(f"Groups = {groups}")
 
     # 0) Extract settings from cfg
-    early_stop_alpha = cfg.get("early_stop_alpha", None)
     sl_cfg = cfg.get("searchlight", {})
     par_cfg = cfg.get("parallel", {})
     radius_mm = sl_cfg.get("radius_mm", 6)
@@ -747,7 +746,6 @@ def permutation_searchlight(
             "feature_selection": cfg.get("feature_selection", {}),
             "variance_threshold": float(cfg.get("variance_threshold", 1e-12)),
             "fdr_alpha": float(alpha),
-            "early_stop_alpha": None,
             "null_mode": "fixed_count_mean",
             "n_centers": int(np.isfinite(p_map).sum()),
             "stopped_total": int(np.sum(stopped_map)),

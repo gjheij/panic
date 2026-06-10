@@ -45,38 +45,48 @@ Example config.yml:
 
 ```yaml
 label_dict:
-  CS-: 0
-  CS+_noUCS: 1
+  CSm: 0     # class 1
+  CSpu: 1    # class 2
 
-roi_dict:
+roi_dict: 
   lateral: [7001]
   basal: [7003]
   central: [7005]
   medial: [7006]
   total: [7001, 7003, 7005, 7006]
 
+roi_settings:                   # kwargs passed to data.PrepareROIs()
+  src: "freesurfer"             # used in conjunction with {project_dir} below
+  roi_dir: null                 # use all files with {extension}
+  roi_base: "hippo-amygdala"    # folder name within {project_dir}/{src}
+  roi_src: "hippoAmygLabels.mgz"   # ?h.{roi_name}.{extension}
+  extension: ".nii.gz"              # generally mgz or nii.gz
+
 general_settings:
   project_dir: "/mnt/d/fMRI/HRA"
-  save_dir: "/mnt/d/fMRI/HRA/derivatives/decoding"
-  method: "lss"
-  source: "stglm"
-  n_jobs: 10
+  save_dir: "/mnt/d/fMRI/Development/HRA/derivatives/decoding"
+  tmp_dir: "~/.joblib_cache"    # stores temp memmaps
+  method: LSA                   # or LSS, if you have GLMsingle: use 'lss', 'lsa'
+  source: stglm                 # or 'stglm', 'glmsingle'
+  standardize: zscore           # best to keep this
+
+fitted_derivative: false
 
 decoding_settings:
-  fold_interval: 3            # if not LORO/LOSO, iterate over labels
-  n_permutations: 10         # permutations for ROI-decoding/searchlight
-  early_stop_alpha: 0.05      # enable early stopping
-  early_stop_batch: 32        # check after X permutations if significance can be reached
-  variance_threshold: 1e-12   # avoid flat time series
-  permute_both_sets: false    # false: only permute training labels
-  permute_within_groups: true # true: LOSO/LORO set up; see 'outer_cv'
+  fold_interval: 3              # if not LORO/LOSO, iterate over labels
+  n_permutations: 250           # permutations for ROI-decoding/searchlight
+  variance_threshold: 1e-12     # avoid flat time series
+  permute_both_sets: true       # false: only permute training labels
+  permute_within_groups: false  # true: LOSO/LORO set up; see 'outer_cv'
+  scoring: balanced_accuracy    # scoring metric for decoder
 
   parallel:
-    n_jobs: 1                 # this one actually parallizes over permutations/batches
-    batch_size: 16            # batch size Parallel process
-    backend: "loky"           # backend for Parallel process
-    prefer: "processes"       # preference for Parallel process
-    verbose: 0                # verbosity of Parallel process
+    n_jobs: 1                   # this one actually parallizes over permutations/batches
+    batch_size: 1               # batch size Parallel process
+    backend: "loky"             # backend for Parallel process
+    prefer: "processes"         # preference for Parallel process
+    verbose: 0                  # verbosity of Parallel process
+    update_interval: 100        # log progress every N completed searchlights (0 = disable)
 
   # Pipeline settings: DO NOT CHANGE THE HEADER NAMES ('SCALER', 'CV', 'ESTIMATOR', etc)
   # preprocessing | if 'standardize' is null
@@ -93,7 +103,7 @@ decoding_settings:
 
   # select test/training labels
   cv:
-    name: StratifiedGroupKFold
+    name: StratifiedKFold
     args:
       n_splits: 3
       shuffle: False
@@ -110,7 +120,7 @@ decoding_settings:
   feature_selection:
     name: SelectPercentile
     args:
-      percentile: 5
+      percentile: 10
       score_func: f_classif
 
   # grid search
@@ -120,13 +130,14 @@ decoding_settings:
       param_grid:
         select__percentile: [10, 20, 40, 100] # see 'feature_selection'
         clf__C: [0.01, 0.1, 1, 10]
-      scoring: balanced_accuracy
       n_jobs: 1               # keep this at 1 to avoid nesting
 
+  # searchlight
   searchlight:
-    alpha: 0.05               # value for FDR correction
-    radius_mm: 10             # radius around center
-    locked:                   # no gridsearch within searchlight..
+    alpha: 0.05                   # value for FDR correction
+    radius_mm: 6                  # radius around center
+    target_zooms: null            # downsample data to reduce number of centers; e.g., [2.0, 2.0, 2.0]
+    locked:                       # disable gridsearch within searchlight
       clf__C: 1.0
 ```
 
