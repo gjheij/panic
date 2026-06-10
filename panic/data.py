@@ -4,7 +4,6 @@
 
 import re
 import os
-import json
 import numpy as np
 from nilearn import (
     image,
@@ -12,6 +11,7 @@ from nilearn import (
 )
 import nibabel as nib
 from lazyfmri import utils
+from collections import Counter
 from panic.logger import get_logger
 from panic.errors import EmptyMaskError
 
@@ -106,16 +106,16 @@ class PrepareROIs:
     """
 
     def __init__(
-        self,
-        subject=None,
-        project_dir="/mnt/d/fMRI/HRA",
-        roi_dir=None,
-        roi_src="hippoAmygLabels.mgz",
-        roi_name=None,
-        roi_labels=None,
-        roi_base="hippo-amygdala",
-        src="freesurfer",
-        extension="mgz",
+            self,
+            subject=None,
+            project_dir="/mnt/d/fMRI/HRA",
+            roi_dir=None,
+            roi_src="hippoAmygLabels.mgz",
+            roi_name=None,
+            roi_labels=None,
+            roi_base="hippo-amygdala",
+            src="freesurfer",
+            extension="mgz",
         ):
         
         self.subject = subject
@@ -622,13 +622,13 @@ class PrepareROIs:
 
     @classmethod
     def select_labels_from_mgh(
-        self,
-        input_file,
-        labels,
-        mode="mgz",
-        binary=False,
-        fill=0.0
-    ):
+            self,
+            input_file,
+            labels,
+            mode="mgz",
+            binary=False,
+            fill=0.0
+        ):
         """
         Extract one or more label values from a FreeSurfer ``.mgz``/``.mgh`` file and
         return a new image containing only those regions.
@@ -817,7 +817,10 @@ class PrepareBetas:
 
         if isinstance(beta_file, str):
             logger.info(f"Beta-file: '{beta_file}'")
-            self.betas, self.do_standardization = self.sanitize_img(beta_file, **kwargs)
+            self.betas, self.do_standardization = self.sanitize_img(
+                beta_file,
+                **kwargs
+            )
             
             if not isinstance(trial_list, (list, np.ndarray)):
                 logger.exception("Please specify a list representing the trials")
@@ -910,8 +913,10 @@ class PrepareBetas:
 
         img = image.load_img(img)
         data = img.get_fdata(dtype=np.float32)
+
         # replace NaN/±inf
         data = np.nan_to_num(data, nan=fill, posinf=fill, neginf=fill)
+
         # optional safety clip to avoid huge outliers
         if clip is not None:
             data = np.clip(data, -clip, clip)
@@ -956,16 +961,16 @@ class PrepareBetas:
 
     @classmethod
     def load_and_merge_betas(
-        self,
-        subject,
-        beta_dir="/mnt/d/fMRI/HRA/derivatives/stglm",
-        save_imgs=False,
-        output_dir=None,
-        derivative=False,
-        label_mapper=None,
-        model="lsa",
-        **kwargs
-    ):
+            self,
+            subject,
+            beta_dir="/mnt/d/fMRI/HRA/derivatives/stglm",
+            save_imgs=False,
+            output_dir=None,
+            derivative=False,
+            label_mapper=None,
+            model="lsa",
+            **kwargs
+        ):
         """
         Load, sanitize, and concatenate trialwise beta images for a subject from
         different preprocessing pipelines, returning a single 4D image plus
@@ -1053,7 +1058,7 @@ class PrepareBetas:
         run_re = re.compile(r"run-(\d+)", flags=re.IGNORECASE)
         groups = None
 
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # stglm | halfpipe | glmsingle
         src = os.path.basename(beta_dir)
         subject_betas = opj(beta_dir, subject)
@@ -1061,14 +1066,14 @@ class PrepareBetas:
         assert os.path.exists(subject_betas), FileNotFoundError(f"Input beta directory '{subject_betas}' does not exist")
         logger.info(f"Loading betas from: '{subject_betas}'")
 
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # define GLMsingle mapper
         model_mapper = {
             "lss": "typeb",
             "lsa": "typed"
         }
 
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # stglm | glmsingle need to be concatenated; HALFpipe comes concatenated
         allowed = ['glmsingle', 'bach', 'halfpipe', 'stglm']
         if src == "glmsingle":
@@ -1088,21 +1093,20 @@ class PrepareBetas:
 
         assert len(m_files)>0, ValueError(f"No *.nii.gz files in '{subject_betas}'")
 
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # D. Bach's beta values
         if derivative:
             logger.info("Directory contains trialwise estimates of the temporal derivative. Selecting every other beta file.")
             m_files = m_files[0::2]
         
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # HALFpipe outputs condition-wise single-trial files > match with "label_dict" in config.yml
         niimgs = []
         trials = []
         groups = []
         if src in ["halfpipe", "stglm"]:
 
-            if not isinstance(label_mapper, dict):
-                raise TypeError(f"When HALFpipe is used, 'label_mapper' must be a dictionary with keys representing the stimuli to include, not '{label_mapper}'")
+            assert isinstance(label_mapper, dict), f"When HALFpipe is used, 'label_mapper' must be a dictionary with keys representing the stimuli to include, not '{label_mapper}'"
 
             # select ev-specific files
             include_events = list(label_mapper.keys())
@@ -1143,12 +1147,12 @@ class PrepareBetas:
                 # trials.extend([i] * n_vols)
                 niimgs.append(img)
 
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # concatenate
         logger.info("Concatenating these files into single 4D-object")
         beta_imgs = image.concat_imgs(niimgs)
         
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # glmsingle has separate trial_list.txt file in directory; stGLM has json sidecar
         # HALFpipe trials are read above
         if src in ["glmsingle", "bach"]:
@@ -1164,17 +1168,17 @@ class PrepareBetas:
 
             trials = np.loadtxt(trial_file, dtype=str)
 
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # verify
         if beta_imgs.shape[-1] != len(trials):
             logger.error(f"Number of beta-images ({beta_imgs.shape[-1]}) does not match length of label/trial list ({len(trials)})")
 
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # sanitize images
         logger.info("Sanitizing beta images (e.g., remove NaN/inf and set float)")
         beta_imgs, is_standardized = self.sanitize_img(beta_imgs, **kwargs)
 
-        #--------------------------------------------------------------------------------
+        #-----------------------------------------------------------------------
         # save merged?
         if save_imgs:
             if output_dir is None:
@@ -1189,6 +1193,7 @@ class PrepareBetas:
             beta_imgs.to_filename(fname)
 
         return beta_imgs, trials, is_standardized, groups
+
 
 class MaskAndFilterBetas:
     """
@@ -1260,13 +1265,13 @@ class MaskAndFilterBetas:
     """
 
     def __init__(
-        self,
-        betas,
-        mask,
-        trial_list=None,
-        label_mapper=None,
-        **kwargs
-    ):
+            self,
+            betas,
+            mask,
+            trial_list=None,
+            label_mapper=None,
+            **kwargs
+        ):
         
         self.betas = betas
         self.mask = mask
@@ -1335,10 +1340,11 @@ class MaskAndFilterBetas:
             - This method is typically called before cross-validation or
             ROI decoding to align input data with the chosen conditions.
         """
-            
+
         filtered_trials = []
         labels = []
         trial_indices = []
+        condition_counts = Counter()
 
         for i, t in enumerate(self.trial_list):
             for key, val in self.label_mapper.items():
@@ -1346,32 +1352,48 @@ class MaskAndFilterBetas:
                     filtered_trials.append(key)
                     labels.append(val)
                     trial_indices.append(i)
+                    condition_counts[key] += 1
+                    break  # each trial may belong to only one condition
 
-        labels = np.array(labels)
+        labels = np.asarray(labels)
         n_trials = len(labels)
 
-        parts = [
-            f"{k}: {(labels == v).sum()}"
-            for k, v in self.label_mapper.items()
+        # Count samples per decoded class
+        label_counts = Counter(labels.tolist())
+
+        condition_parts = [
+            f"{k}: {condition_counts.get(k, 0)}"
+            for k in self.label_mapper.keys()
         ]
-        
-        # make sure n_trials>0
+
+        label_parts = [
+            f"{lab}: {label_counts.get(lab, 0)}"
+            for lab in sorted(label_counts)
+        ]
+
         if n_trials == 0:
             msg = (
                 "Number of trials equals 0. "
                 "Please check trial names to make sure filtering is correct. "
-                f"Label counts: {', '.join(parts)}"
+                f"Conditions: {', '.join(condition_parts)} | "
+                f"Classes: {', '.join(label_parts)}"
             )
             logger.error(msg)
             raise ValueError(msg)
-        
-        logger.info(f"Total included trials: {n_trials} ({', '.join(parts)})")
+
+        logger.info(
+            "Total included trials: %d | Conditions: %s | Classes: %s",
+            n_trials,
+            ", ".join(condition_parts),
+            ", ".join(label_parts),
+        )
 
         # Filter beta images and corresponding trial names
         X_filtered = self.betas_in_mask[trial_indices]
         filtered_trial_list = [self.trial_list[i] for i in trial_indices]
-    
+
         logger.info(f"Filtered beta images: {X_filtered.shape[0]}")
+
         return X_filtered, filtered_trial_list, labels
 
 
@@ -1379,13 +1401,14 @@ class MaskAndFilterBetas:
         return self.betas_in_mask
     
     def _masker(
-        self,
-        interpolation="nearest",
-        output_file=None,
-        var_thr=0.0,
-        masker_kws={},
-        fit_kws={}
-    ):
+            self,
+            interpolation="nearest",
+            output_file=None,
+            var_thr=0.0,
+            zooms=None,
+            masker_kws={},
+            fit_kws={}
+        ):
         """
         Create and apply a NIfTI masker aligned with the beta images,
         ensuring voxel-level intersection between the ROI mask and valid
@@ -1404,6 +1427,11 @@ class MaskAndFilterBetas:
         :param float var_thr:
             Minimum voxelwise variance threshold (in beta space). Voxels with
             variance ≤ ``var_thr`` are excluded. Default: ``0.0``.
+        :param list zooms:
+            Instead of using beta images as default for resampling, allow custom
+            zoom. This is particularly useful for searchlight, where you may
+            want to downsample the data to reduce the number of centers evalua-
+            ted.
         :param dict masker_kws:
             Additional keyword arguments passed to
             :class:`nilearn.maskers.NiftiMasker` during initialization.
@@ -1467,8 +1495,56 @@ class MaskAndFilterBetas:
             - Designed for internal use during ROI and searchlight decoding.
         """
 
-        # resample mask to betas
         betas_first_vol = image.index_img(self.betas, 0)
+        
+        # if custom zooms, downsample betas first, then use that as new target
+        # for the masks
+        if zooms is not None:
+            logger.info(f"Applying custom zoom to beta images: {zooms}")
+            
+            if isinstance(zooms, list):
+                if len(zooms)<3:
+                    raise ValueError(f"A list of zooms must contain 3 elements, not {len(zooms)}: {zooms}")
+                zooms = np.array(zooms)
+            elif isinstance(zooms, (int, float)):
+                zooms = np.full(3, float(zooms))
+            elif isinstance(zooms, np.ndarray):
+                pass
+            else:
+                raise TypeError(f"zooms must be a list of 3 elements, an integer/float, or a numpy array, not type {type(zooms)}")
+            
+            assert isinstance(zooms, np.ndarray) and len(zooms)==3, f"zooms must be a list of 3 elements, an integer/float, or a numpy array, not {zooms}"
+
+            logger.info(
+                "Original beta shape=%s, zooms=%s",
+                betas_first_vol.shape,
+                betas_first_vol.header.get_zooms()[:3],
+            )
+
+            target_affine = nib.affines.rescale_affine(
+                betas_first_vol.affine,
+                betas_first_vol.shape[:3],
+                zooms,
+            )
+
+            self.betas = image.resample_img(
+                self.betas,
+                target_affine=target_affine,
+                interpolation="continuous",
+                force_resample=True,
+                copy_header=True
+            )
+
+            # set new template
+            betas_first_vol = image.index_img(self.betas, 0)
+
+            logger.info(
+                "Resampled beta shape=%s, zooms=%s",
+                betas_first_vol.shape,
+                betas_first_vol.header.get_zooms()[:3],
+            )
+
+        # resample mask to betas
         logger.info(f"Resampling mask {self.mask.shape} to affine of beta-image {betas_first_vol.shape}")
 
         self.mask_resampled_to_betas = image.resample_to_img(
