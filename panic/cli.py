@@ -157,6 +157,7 @@ def _write_temp_config(base_cfg: Dict[str, Any]) -> Path:
 
 def action_run(args):
     cfg_path = Path(args.config or get_config_path())
+    print(f"Using base config: {cfg_path}")
     base_cfg = load_yaml(cfg_path)
 
     # Run PANIC
