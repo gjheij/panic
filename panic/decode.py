@@ -7,7 +7,6 @@ import shutil
 import numpy as np
 import pandas as pd
 
-import logging
 import tempfile, uuid
 from tqdm import tqdm
 from joblib import Parallel, delayed, dump, load
@@ -16,9 +15,9 @@ from panic import data, utils
 from panic.logger import get_logger, tqdm_joblib
 from lazyfmri.utils import FindFiles, update_kwargs
 from panic.searchlight import permutation_searchlight
-from panic.errors import EmptyMaskError, NoTrialsFoundError, NoFeaturesSelectedError
+from panic.errors import EmptyMaskError, NoFeaturesSelectedError
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 opj = os.path.join
 
 
@@ -33,18 +32,12 @@ def run_decoding_with_permutation(
         **kwargs
     ):
     """
-    Run decoding with permutation testing on ROI-level data, with optional *fail-fast* early stopping.
+    Run decoding with permutation testing on ROI-level data.
 
     This function performs cross-validated decoding on a feature matrix ``X``
     to compute the **observed accuracy** and a **null distribution** of accuracies
     obtained by label permutation. The implementation mirrors
     :func:`utils._cv_mean_score` and is optimized for reproducibility and parallelization.
-
-    Unlike symmetric early stopping (which can terminate for both early significance
-    and non-significance), the **fail-fast** variant only halts permutations when it becomes
-    mathematically impossible for the final empirical p-value to cross the threshold ``alpha``.
-    This ensures *conservative inference* — never stopping early in favor of significance,
-    only when continued computation cannot change a non-significant outcome.
 
     Parameters
     ----------
@@ -71,15 +64,6 @@ def run_decoding_with_permutation(
     groups : array_like, optional
         Optional group vector (e.g., run or session IDs) for group-aware CV
         and within-group permutations.
-    early_stop_alpha : float or None, optional
-        Significance threshold (e.g., 0.05) for fail-fast stopping. If set,
-        the procedure terminates once the smallest attainable empirical p-value
-        (given the number of observed exceedances so far) exceeds ``alpha``.
-        If ``None`` (default), all ``n_perms`` permutations are executed.
-    early_stop_batch : int, optional
-        Number of permutations to evaluate per batch before re-checking the
-        early-stopping condition. Smaller batches allow more frequent checks but
-        higher overhead. Default is 32.
     **kwargs :
         Additional keyword arguments passed to :func:`utils._cv_mean_score`
         (e.g., ``save_dir`` for saving fold-specific models).
@@ -94,8 +78,8 @@ def run_decoding_with_permutation(
         * ``"mean_permuted"`` – Mean permutation score (float)
         * ``"delta"`` – Observed − null mean difference (float)
         * ``"p"`` – Empirical one-tailed p-value
-        * ``"n_run"`` – Number of permutations actually executed
-        * ``"early_stop_alpha"`` – Early-stop threshold used (or ``None`` if disabled)
+        * ``"n_run"`` – Number of permutations executed
+        * ``"n_perms"`` – Number of requested permutations
 
     Workflow
     ---------
@@ -106,16 +90,7 @@ def run_decoding_with_permutation(
     3. Generates ``n_perms`` random seeds from a reproducible master RNG.
     4. Recomputes CV scores under label permutation, either serially or
     in parallel via :class:`joblib.Parallel`.
-    5. Applies fail-fast early stopping if enabled:
-    after each batch, compute:
-    ::
-
-        p_min = (count_exceed + 1) / (n_run + 1)
-
-    and terminate if ``p_min > alpha`` and ``n_run >= ceil(1/alpha) - 1``.
-    This guarantees that even in the most optimistic case,
-    the final empirical p-value could not fall below ``alpha``.
-    6. Aggregates permutation scores and computes empirical p-value:
+    5. Aggregates permutation scores and computes empirical p-value:
     ::
 
         p = (sum(perm >= obs) + 1) / (n_run + 1)
@@ -127,17 +102,19 @@ def run_decoding_with_permutation(
     - **Mean permuted** – Average null accuracy (expected under the null).
     - **Δ (delta)** – Observed − null mean difference (effect size).
     - **p-value** – Empirical one-tailed significance level.
-    - **n_run** – Number of permutations actually executed
-    (≤ ``n_perms`` when early stopping is active).
+    - **n_run** – Number of permutations executed. In the ROI decoder this is
+      normally equal to ``n_perms`` because all requested permutations are run.
 
-    Early-Stopping Behavior
-    -----------------------
-    - Stops **only** when continued permutations cannot yield significance
-    (i.e., ``p_min > alpha``).
-    - Never stops early for apparent significance, ensuring conservative inference.
-    - The batch size determines how often stopping is checked:
-    smaller batches → more precise, larger batches → more efficient.
-    - Parallelized batches maintain full reproducibility through explicit seeding.
+    Null-Distribution Behavior
+    --------------------------
+    - The ROI decoder uses a fixed-count permutation procedure: every requested
+      permutation is evaluated and retained.
+    - This makes the null mean, empirical p-value, and saved permutation table
+      directly interpretable because they are based on the same number of
+      permutations for every ROI.
+    - Searchlight decoding follows the same fixed-count null-mean principle in
+      Bach-style mode, but usually with far fewer permutations and group-level
+      inference downstream.
 
     Example
     -------
@@ -150,8 +127,6 @@ def run_decoding_with_permutation(
             cfg=cfg,
             groups=runs,
             seed=42,
-            early_stop_alpha=0.05,
-            early_stop_batch=32,
             save_dir="results/sub-01"
         )
 
@@ -234,87 +209,34 @@ def run_decoding_with_permutation(
                 **kwargs
             )
 
-        # get early stop alpha
-        early_stop_alpha = cfg.get("early_stop_alpha", None)
-        early_stop_batch = cfg.get("early_stop_batch", 32)
         logger.info("Starting permutation testing: n_perms=%d, n_jobs=%d", n_perms, n_jobs)
-        if early_stop_alpha is None:
 
-            if n_jobs == 1:
-                permuted_acc = [
-                    _one_perm(s)
-                    for s in tqdm(
-                        seeds,
-                        total=n_perms,
-                        disable=utils.tqdm_disabled()
-                    )
-                ]
-            else:
-                with tqdm_joblib(
-                    tqdm(
-                        total=n_perms,
-                        disable=utils.tqdm_disabled()
-                    )
-                ):
-                    permuted_acc = Parallel(
-                        n_jobs=n_jobs,
-                        backend=par_cfg.get("backend", "loky"),
-                        prefer=par_cfg.get("prefer", "processes"),
-                        batch_size=par_cfg.get("batch_size", 16),
-                        verbose=par_cfg.get("verbose", 0)
-                    )([delayed(_one_perm)(s) for s in seeds])
-            permuted_acc = np.asarray(permuted_acc, dtype=float)
-            n_run = len(permuted_acc)
-
-        # --- EARLY-STOP ON: batched loop with fail-fast rule ---
+        if n_jobs == 1:
+            permuted_acc = [
+                _one_perm(s)
+                for s in tqdm(
+                    seeds,
+                    total=n_perms,
+                    disable=utils.tqdm_disabled()
+                )
+            ]
         else:
-            n_batches = int(np.ceil(n_perms / early_stop_batch))
-            logger.info(f"Fail-fast enabled with α={early_stop_alpha}, testing each {int(early_stop_batch)} permutations if significance can be reached (total #batches={n_batches})")
-            J0 = int(np.ceil(1.0 / early_stop_alpha) - 1)  # minimum perms before we can possibly detect p<α
-            count_exceed = 0
-            permuted_list = []
-            j = 0
-
-            # iterator over seeds in batches
-            def _batches(seq, k):
-                for i in range(0, len(seq), k):
-                    yield seq[i:i+k]
-
-            for batch in tqdm(
-                _batches(seeds, early_stop_batch),
-                total=n_batches,
-                disable=utils.tqdm_disabled()
+            with tqdm_joblib(
+                tqdm(
+                    total=n_perms,
+                    disable=utils.tqdm_disabled()
+                )
             ):
-                if n_jobs == 1:
-                    vals = [_one_perm(s) for s in batch]
-                else:
-                    # parallel within batch
-                    vals = Parallel(
-                        n_jobs=n_jobs,
-                        backend=par_cfg.get("backend", "loky"),
-                        prefer=par_cfg.get("prefer", "processes"),
-                        batch_size=par_cfg.get("batch_size", 16),
-                        verbose=par_cfg.get("verbose", 0)
-                    )([delayed(_one_perm)(s) for s in batch])
+                permuted_acc = Parallel(
+                    n_jobs=n_jobs,
+                    backend=par_cfg.get("backend", "loky"),
+                    prefer=par_cfg.get("prefer", "processes"),
+                    batch_size=par_cfg.get("batch_size", 16),
+                    verbose=par_cfg.get("verbose", 0)
+                )([delayed(_one_perm)(s) for s in seeds])
 
-                vals = np.asarray(vals, float)
-                permuted_list.append(vals)
-                # update state
-                count_exceed += int(np.sum(vals >= observed_acc))
-                j += len(vals)
-
-                # fail-fast only: stop if p cannot become < alpha
-                if j >= J0:
-                    p_min = (count_exceed + 1) / (j + 1)
-                    if p_min > early_stop_alpha:
-                        break
-
-                # also stop if we already hit all perms
-                if j >= n_perms:
-                    break
-
-            permuted_acc = np.concatenate(permuted_list, dtype=float) if permuted_list else np.empty(0, float)
-            n_run = len(permuted_acc)
+        permuted_acc = np.asarray(permuted_acc, dtype=float)
+        n_run = len(permuted_acc)
 
         # aggregate
         mean_permuted_acc = float(np.mean(permuted_acc)) if n_run else float("nan")
@@ -333,10 +255,10 @@ def run_decoding_with_permutation(
             "p": float(p_val),
             "n_run": int(n_run),
             "n_perms": int(n_perms),
-            "early_stop_alpha": None if early_stop_alpha is None else float(early_stop_alpha),
         }
 
         return ddict
+
 
 class ClassifySubject(data.PrepareBetas):
 
@@ -390,9 +312,10 @@ class ClassifySubject(data.PrepareBetas):
           ``cfg["general_settings"]`` convenience reference.
         - ``dec_settings`` : dict  
           ``cfg["decoding_settings"]`` convenience reference.
-        - ``dec_settings_no_feature_selection`` : dict  
-          Copy of ``dec_settings`` with ``feature_selection=None`` for
-          searchlight runs.
+        - ``dec_settings_searchlight`` : dict  
+          Copy of ``dec_settings`` adapted for searchlight runs: ROI-level
+          feature selection and grid search are disabled, and fail-fast
+          permutation stopping is disabled for fixed-count null estimation.
         - ``save_dir`` : str  
           Output directory for the subject (``<save_dir>/<subject>``), created
           if missing.
@@ -419,19 +342,20 @@ class ClassifySubject(data.PrepareBetas):
             )
 
     **Notes**
-        - ``dec_settings_no_feature_selection`` is used to ensure that
-          searchlight decoding does not perform ROI-level feature selection.
+        - ``dec_settings_searchlight`` is used to ensure that searchlight
+          decoding uses all voxels in each sphere, fixed estimator settings,
+          and fixed-count permutations for null-mean estimation.
         - Logging provides a reproducible record of the configuration used for
           each subject, including the full decoding settings dictionary.
     """
 
     def __init__(
-        self,
-        subject,
-        config_file,
-        save_imgs=False,
-        searchlight=False,
-        **kwargs
+            self,
+            subject,
+            config_file,
+            save_imgs=False,
+            searchlight=False,
+            **kwargs
         ):
         
         # init
@@ -451,14 +375,25 @@ class ClassifySubject(data.PrepareBetas):
         self.dec_settings = self.cfg["decoding_settings"]
         self.roi_settings = self.cfg["roi_settings"]
 
-        # turn off feature selection within searchlight
-        self.dec_settings_no_feature_selection = {**self.dec_settings, "feature_selection": None}
+        # Searchlight uses local spherical neighborhoods as the feature definition.
+        # Disable ROI-level feature selection and grid search so each center uses
+        # all voxels in the sphere with fixed estimator settings.  Permutations
+        # are fixed-count null-mean estimates; fail-fast is intentionally disabled
+        # for searchlight because Bach-style inference is performed at group level.
+        self.dec_settings_searchlight = {
+            **self.dec_settings,
+            "feature_selection": None,
+            "gridsearch": None
+        }
         self.save_dir = opj(self.gen_settings["save_dir"], self.subject)
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
     
         logger.info(f"Decoding configuration:")
         logger.info(self.dec_settings)
+        if self.searchlight:
+            logger.info("Searchlight configuration (effective):")
+            logger.info(self.dec_settings_searchlight)
 
 
     def _fit(self, **kwargs):
@@ -611,15 +546,15 @@ class ClassifySubject(data.PrepareBetas):
 
 
     def decode_single_mask(
-        self,
-        betas,
-        mask,
-        trial_list=None,
-        label_mapper=None,
-        output_file=None,
-        groups=None,
-        **kwargs
-    ):
+            self,
+            betas,
+            mask,
+            trial_list=None,
+            label_mapper=None,
+            output_file=None,
+            groups=None,
+            **kwargs
+        ):
         """
         Run decoding analysis on a single ROI mask or perform searchlight decoding.
 
@@ -728,7 +663,11 @@ class ClassifySubject(data.PrepareBetas):
                 return None
 
             # outer folds
-            folds = utils._folds_for_labels(self.dec_settings, extract.labels, groups)
+            folds = utils._folds_for_labels(
+                self.dec_settings,
+                extract.labels,
+                groups
+            )
             
             # run classifier
             logger.info(f"Feature mapper: {label_mapper}")
@@ -759,7 +698,7 @@ class ClassifySubject(data.PrepareBetas):
                     mask,
                     trial_list,
                     label_mapper, 
-                    self.dec_settings_no_feature_selection,
+                    self.dec_settings_searchlight,
                     groups=groups,
                     **kwargs
                 )
@@ -823,6 +762,59 @@ class ClassifySubject(data.PrepareBetas):
             hemi_key="hemi",
             **kwargs
         ):
+        """
+        Decode all ROIs or searchlight masks defined for the current subject.
+
+        This method iterates over all ROI definitions returned by
+        :meth:`define_mask_inputs`, prepares each mask for beta extraction,
+        performs decoding via :meth:`decode_single_mask`, and aggregates the
+        resulting statistics.
+
+        For ROI-based decoding (``self.searchlight=False``), summary statistics
+        and null distributions are collected across all masks and written to disk
+        as CSV files together with the configuration used for the analysis.
+
+        For searchlight decoding (``self.searchlight=True``), each processed mask
+        returns a dictionary containing the searchlight images (e.g., observed
+        accuracy, null mean, p-values, and delta maps), which are collected into a
+        dictionary keyed by ROI name.
+
+        Parameters
+        ----------
+        hemi_key : str, optional
+            Column name used to identify hemisphere labels in the output results
+            table. Defaults to ``"hemi"``.
+        **kwargs
+            Additional keyword arguments passed directly to
+            :meth:`decode_single_mask`. These typically include decoding settings
+            such as searchlight parameters, permutation options, or classifier
+            configuration.
+
+        Returns
+        -------
+        pandas.DataFrame or dict
+            If ``self.searchlight`` is ``False``, returns a dataframe containing
+            one row per decoded ROI with observed accuracy, null expectation,
+            delta score, empirical p-value, ROI label, hemisphere, and metadata.
+
+            If ``self.searchlight`` is ``True``, returns a dictionary mapping ROI
+            names to the output dictionaries returned by
+            :meth:`decode_single_mask`, typically containing searchlight NIfTI
+            images and associated statistics.
+
+        Notes
+        -----
+        - Empty masks (for which ``decode_single_mask`` returns ``None``) are
+        silently skipped.
+        - ROI decoding writes three output files:
+            1. ``*_desc-null_distribution.csv``
+            2. ``*_desc-results.csv``
+            3. ``*_desc-config.yml``
+        - Searchlight decoding delegates image writing to
+        ``decode_single_mask`` and only returns the resulting file dictionary.
+        - The configuration file permissions are copied to all generated output
+        files to maintain consistent filesystem metadata.
+        """
         
         out_files = {}
         results = []
@@ -963,9 +955,9 @@ class ClassifySubject(data.PrepareBetas):
     
     @classmethod
     def extract_betas_from_rois(
-        self,
-        *args,
-        **kwargs
+            self,
+            *args,
+            **kwargs
         ):
 
         return data.MaskAndFilterBetas(
@@ -973,7 +965,11 @@ class ClassifySubject(data.PrepareBetas):
             **kwargs
         )
 
-    def prepare_rois(self, roi_labels, roi_name=None):
+    def prepare_rois(
+            self,
+            roi_labels,
+            roi_name=None
+        ):
 
         # prepare ROIs
         obj = data.PrepareROIs(

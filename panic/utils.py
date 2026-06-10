@@ -439,7 +439,6 @@ def _cv_mean_score(
     if cols is not None:
         X_mm = X_mm[:, cols]
 
-    X_mm = load(X_path, mmap_mode="r")
     y = np.asarray(labels)
     g_full = None if groups is None else np.asarray(groups)
     

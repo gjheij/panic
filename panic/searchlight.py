@@ -13,21 +13,19 @@ from panic import (
     utils,
 )
 from statsmodels.stats.multitest import fdrcorrection
+from typing import Callable, Tuple, Optional
 
 logger = get_logger(__name__)
 opj = os.path.join
 
 
-import numpy as np
-from typing import Callable, Tuple, Optional
-
 def _permute_with_early_stop(
-    obs_score: float,
-    seeds: np.ndarray,
-    n_perms: int,
-    alpha: Optional[float],
-    score_fn: Callable[[np.random.Generator], float],
-) -> Tuple[float, float, int]:
+        obs_score: float,
+        seeds: np.ndarray,
+        n_perms: int,
+        alpha: Optional[float],
+        score_fn: Callable[[np.random.Generator], float],
+    ) -> Tuple[float, float, int]:
     """
     Perform permutation testing with optional *fail-fast* early stopping.
 
@@ -152,9 +150,11 @@ def _permute_with_early_stop(
                 break
 
     perm_vals = np.asarray(perm_vals, dtype=float)
+
     # Empirical p using the permutations actually run
     p_value = (np.sum(perm_vals >= obs_score) + 1.0) / (len(perm_vals) + 1.0)
     null_mean = float(np.mean(perm_vals)) if perm_vals.size else np.nan
+    
     return null_mean, float(p_value), int(perm_vals.size), stopped, reason
 
 
@@ -263,6 +263,7 @@ def _neighbors_ball_mm(zooms, r_mm):
     >>> offsets = _neighbors_ball_mm(zooms, r_mm)
     >>> print(f"{len(offsets)} neighbors within {r_mm} mm radius")
     """
+    logger.info(f"Compute voxel offset coordinates | zoom = {zooms} | radius = {r_mm}")
     vx, vy, vz = map(float, zooms[:3])     # e.g. (3.5, 3.75, 5.0)
     rx, ry, rz = int(r_mm // vx), int(r_mm // vy), int(r_mm // vz)
     offs = []
@@ -276,20 +277,19 @@ def _neighbors_ball_mm(zooms, r_mm):
 
 
 def _one_center(
-    center_ijk,
-    offsets,
-    col_index_vol,
-    vol_shape,
-    roi_linidx,
-    X_mm_path,
-    labels,
-    folds,
-    cfg,
-    groups,
-    n_perms,
-    seed,
-    **kwargs
-):
+        center_ijk,
+        offsets,
+        col_index_vol,
+        vol_shape,
+        X_mm_path,
+        labels,
+        folds,
+        cfg,
+        groups,
+        n_perms,
+        seed,
+        **kwargs
+    ):
     """
     Compute observed and permutation-based decoding accuracy for a single
     searchlight center voxel.
@@ -313,9 +313,6 @@ def _one_center(
         the ROI feature space. Entries < 0 indicate non-ROI voxels.
     vol_shape : tuple of int
         Shape of the full 3D brain volume (e.g., from the mask image).
-    roi_linidx : numpy.ndarray
-        Linear indices of voxels included in the ROI feature space.
-        Used for mapping between image and feature coordinates.
     X_mm_path : str
         Path to a ``joblib`` dump containing the full memory-mapped feature
         matrix of shape ``(n_samples, n_features_all_roi)``.
@@ -354,24 +351,23 @@ def _one_center(
         6. ``n_feat`` : int  
            Number of voxels included in the neighborhood.
         7. ``n_run`` : int  
-           Number of permutation runs actually executed (may stop early).
+           Number of permutation runs actually executed. In null-mean mode this equals ``n_perms``.
         8. ``stopped`` : int  
-           Flag indicating if early stopping occurred (0 or 1).
+           Flag indicating if early stopping occurred (always 0 in null-mean searchlight mode).
         9. ``stop_code`` : int  
-           Encoded reason for stopping (0: none, 1: cannot be significant, 2: already significant).
+           Encoded reason for stopping (always 0 in null-mean searchlight mode).
 
     Notes
     -----
     - Identifies valid voxel neighbors within the searchlight radius
       using ``offsets`` and ``col_index_vol``.
     - Skips computation if fewer than 2 valid features are available.
-    - Extracts the relevant feature subset from the memmapped matrix
-      and saves a lightweight temporary file for fast I/O.
+    - Uses the relevant feature subset from the shared memmapped matrix without writing per-center temporary arrays.
     - Computes the observed decoding score via :func:`utils._cv_mean_score`.
     - Performs ``n_perms`` permutation runs with an independent RNG initialized from ``seed``.
     - Aggregates permutation scores and computes ``null_mean``, ``delta``,
-      and empirical ``p``.
-    - The empirical p-value is bias-corrected using a +1 numerator and denominator adjustment.
+      and empirical ``p``. The p-value is retained as a diagnostic; Bach-style searchlight inference should generally use the delta map at the group level.
+    - The empirical p-value is bias-corrected using a +1 numerator and denominator adjustment when fixed permutations are available.
     - Uses :func:`numpy.random.default_rng` for reproducible random sampling.
     - Designed for internal use within parallelized searchlight loops.
 
@@ -419,63 +415,63 @@ def _one_center(
         **kwargs
     )
 
-    # permutations with early stop
-    sl_cfg = cfg.get("searchlight", {}) or {}
-    early_stop_alpha = sl_cfg.get("early_stop_alpha", None)
-
-    # derive permutation seeds from this center's seed
+    # Permutations: fixed-count null estimation.
+    #
+    # Bach-style searchlight analyses use a small, fixed number of random
+    # permutations to estimate the null mean performance, not to run an exact
+    # voxelwise permutation test. Therefore we deliberately do *not* apply
+    # fail-fast early stopping here: stopping early would bias the null mean
+    # because the number of sampled null scores would depend on the observed
+    # score and interim exceedance count.
     center_rng = np.random.default_rng(int(seed))
     seeds = center_rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
-    def _score_once(rng):
-        # delegate to utils._cv_mean_score
-        return utils._cv_mean_score(
-            X_mm_path, labels, folds, cfg,
-            cols=cols,
-            rng=rng,
-            permute=True,
-            **kwargs
-        )
-
-    null_mean, p, n_run, stopped, reason = _permute_with_early_stop(
-        obs_score=obs,
-        seeds=seeds,
-        n_perms=n_perms,
-        alpha=early_stop_alpha,
-        score_fn=_score_once,
+    perm_vals = np.asarray(
+        [
+            utils._cv_mean_score(
+                X_mm_path, labels, folds, cfg,
+                cols=cols,
+                rng=np.random.default_rng(int(s)),
+                permute=True,
+                **kwargs
+            )
+            for s in seeds
+        ],
+        dtype=float,
     )
 
+    n_run = int(perm_vals.size)
+    null_mean = float(np.mean(perm_vals)) if n_run else np.nan
+    p = float((np.sum(perm_vals >= obs) + 1.0) / (n_run + 1.0)) if n_run else np.nan
     delta = float(obs - null_mean) if np.isfinite(null_mean) else np.nan
 
-    # encode reason as small int for a compact NIfTI if you like
+    # No fail-fast in null-mean mode.
+    stopped = 0
     stop_code = 0
-    if stopped:
-        stop_code = 1 if reason == "p_min>alpha" else 2  # (1) cannot be sig, (2) already sig
-            
-    return (cx, cy, cz), float(obs), float(null_mean), float(delta), float(p), int(len(cols)), n_run, int(stopped), int(stop_code)
+
+    return (cx, cy, cz), float(obs), float(null_mean), float(delta), float(p), int(len(cols)), n_run, stopped, stop_code
 
 
 def permutation_searchlight(
-    betas_img,            # 4D betas (nifti)
-    mask_img,             # binary ROI/brain mask (nifti)
-    trial_list,           # list[str] or array[str] per volume in betas
-    label_mapper,         # dict like {'CS-':0,'CS+':1}
-    cfg,
-    *,
-    groups=None,          # run indices per trial (optional)
-    seed=0,
-    tmpdir=None,
-    output_file=None,
-    **kwargs
-):
-    
+        betas_img,            # 4D betas (nifti)
+        mask_img,             # binary ROI/brain mask (nifti)
+        trial_list,           # list[str] or array[str] per volume in betas
+        label_mapper,         # dict like {'CS-':0,'CS+':1}
+        cfg,
+        *,
+        groups=None,          # run indices per trial (optional)
+        seed=0,
+        tmpdir=None,
+        output_file=None,
+        **kwargs
+    ):
     """
     Run a permutation-based searchlight decoding analysis and write result maps.
 
     This function computes, for each voxel center inside the ROI, the observed
     cross-validated decoding score and a permutation-based null model, then
     assembles NIfTI maps of observed score, null mean, delta (observed − null),
-    empirical p-value, and number of features used. Work can be parallelized
+    diagnostic empirical p-value, and number of features used. Work can be parallelized
     across centers.
 
     Parameters
@@ -528,7 +524,7 @@ def permutation_searchlight(
         - ``"observed"`` : NIfTI of observed cross-validated scores.
         - ``"null_mean"`` : NIfTI of permutation null mean scores.
         - ``"delta"`` : NIfTI of observed − null mean.
-        - ``"pvalue"`` : NIfTI of empirical p-values.
+        - ``"pvalue"`` : NIfTI of diagnostic empirical p-values from the fixed null samples.
         - ``"nfeatures"`` : NIfTI of neighborhood sizes per center.
 
     Notes
@@ -541,7 +537,7 @@ def permutation_searchlight(
         4. Memmap the full ROI feature matrix once; compute searchlight offsets with
            :func:`_neighbors_ball_mm`.
         5. For each center, call :func:`_one_center` to compute observed score and
-           permutation null (optionally in parallel with joblib).
+           fixed-count permutation null (optionally in parallel with joblib).
         6. Assemble result volumes and write NIfTIs aligned to the resampled mask grid.
         7. Save a JSON sidecar with key metadata (radius, permutations, CV, etc.).
 
@@ -605,12 +601,13 @@ def permutation_searchlight(
     locked_params = sl_cfg.get("locked", None)
     alpha = sl_cfg.get("alpha", 0.05)
 
-    # 1) Extract X/labels inside ROI∩valid using your existing path
+    # 1) Extract X/labels inside ROI ∩ valid using your existing path
     mf = data.MaskAndFilterBetas(
         betas_img, mask_img,
         trial_list=trial_list,
         label_mapper=label_mapper,
-        output_file=output_file
+        output_file=output_file,
+        zooms=sl_cfg.get("target_zooms", None)
     )
 
     X = mf.X.astype("float32", copy=False)
@@ -625,7 +622,7 @@ def permutation_searchlight(
     # Centers = every voxel that is actually a feature column
     centers = np.column_stack(np.where(col_index_vol >= 0))  # shape (N, 3)
 
-    # 2) folds exactly like your ROI path
+    # 2) folds exactly like ROI path
     folds = utils._folds_for_labels(cfg, y, groups)
 
     # 3) memmap X once
@@ -661,7 +658,7 @@ def permutation_searchlight(
         n_jobs = par_cfg.get("n_jobs", 1)
         def _run(ix):
             return _one_center(
-                centers[ix], offs, col_index_vol, vol_shape, mf.roi_linidx,
+                centers[ix], offs, col_index_vol, vol_shape,
                 X_path, y, folds, cfg,
                 groups=groups,
                 n_perms=n_perms,
@@ -673,14 +670,7 @@ def permutation_searchlight(
             )
 
         logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
-
-        log_every = int(par_cfg.get("update_interval", 0))
-        log_progress = _LoggedProgress(
-            total=len(centers),
-            label="Searchlight",
-            every=log_every,
-            logger=logger,
-        )
+        logger.info("Searchlight null estimation: fixed_count_mean; fail-fast disabled")
 
         if n_jobs == 1:
             out = []
@@ -690,14 +680,12 @@ def permutation_searchlight(
                 disable=utils.tqdm_disabled(),
             ):
                 out.append(_run(i))
-                log_progress.update(1)
         else:
             with tqdm_joblib(
                 tqdm(
                     total=len(centers),
                     disable=utils.tqdm_disabled()
                 ),
-                log_progress=log_progress,
             ):
                 out = Parallel(
                     n_jobs=n_jobs,
@@ -759,7 +747,8 @@ def permutation_searchlight(
             "feature_selection": cfg.get("feature_selection", {}),
             "variance_threshold": float(cfg.get("variance_threshold", 1e-12)),
             "fdr_alpha": float(alpha),
-            "early_stop_alpha": float(early_stop_alpha) if early_stop_alpha is not None else None,
+            "early_stop_alpha": None,
+            "null_mode": "fixed_count_mean",
             "n_centers": int(np.isfinite(p_map).sum()),
             "stopped_total": int(np.sum(stopped_map)),
             "stopped_pmin": int(np.sum(stop_code_map == 1)),
@@ -774,21 +763,21 @@ def permutation_searchlight(
 
 
 def save_searchlight_maps(
-    base_path,
-    ref_img,
-    *,
-    observed_map,
-    null_mean_map,
-    delta_map,
-    pvalue_map,
-    nfeatures_map,
-    nperms_run,
-    stopped,
-    stop_code,
-    mask_img=None,
-    fdr_alpha=0.05,
-    n_perms=None
-):
+        base_path,
+        ref_img,
+        *,
+        observed_map,
+        null_mean_map,
+        delta_map,
+        pvalue_map,
+        nfeatures_map,
+        nperms_run,
+        stopped,
+        stop_code,
+        mask_img=None,
+        fdr_alpha=0.05,
+        n_perms=None
+    ):
     """
     Save and summarize searchlight decoding results to NIfTI images.
 

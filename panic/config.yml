@@ -90,7 +90,8 @@ decoding_settings:
 
   # searchlight
   searchlight:
-    alpha: 0.05               # value for FDR correction
-    radius_mm: 6              # radius around center
-    locked:                   # no gridsearch within searchlight..
+    alpha: 0.05                   # value for FDR correction
+    radius_mm: 6                  # radius around center
+    target_zooms: null            # downsample data to reduce number of centers; e.g., [2.0, 2.0, 2.0]
+    locked:                       # disable gridsearch within searchlight
       clf__C: 1.0
