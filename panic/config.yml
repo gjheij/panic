@@ -23,6 +23,7 @@ general_settings:
   method: LSA                   # or LSS, if you have GLMsingle: use 'lss', 'lsa'
   source: stglm                 # or 'stglm', 'glmsingle'
   standardize: zscore           # best to keep this
+  filters: task-HRA
 
 fitted_derivative: false
 
