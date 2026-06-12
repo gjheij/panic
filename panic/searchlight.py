@@ -525,8 +525,9 @@ def permutation_searchlight(
         center_seeds = rng.integers(0, 2**32 - 1, size=len(centers), dtype=np.uint32)
 
         save_dir = tmpdir
+        sl_base = sl_cfg.get("basepath", "searchlight")
         if "save_dir" in kwargs:
-            save_dir = opj(kwargs.pop("save_dir"), "searchlight")
+            save_dir = opj(kwargs.pop("save_dir"), sl_base)
 
         logger.info(f"Storing searchlight information in {save_dir}")
         n_perms = cfg.get("n_permutations", 1000)
