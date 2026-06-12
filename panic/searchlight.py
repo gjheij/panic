@@ -19,143 +19,23 @@ logger = get_logger(__name__)
 opj = os.path.join
 
 
-def _permute_with_early_stop(
-        obs_score: float,
-        seeds: np.ndarray,
-        n_perms: int,
-        alpha: Optional[float],
-        score_fn: Callable[[np.random.Generator], float],
-    ) -> Tuple[float, float, int]:
-    """
-    Perform permutation testing with optional *fail-fast* early stopping.
+def _cols_for_center(center_ijk, offsets, col_index_vol, vol_shape):
+    cx, cy, cz = map(int, center_ijk)
 
-    This function estimates an empirical one-sided p-value for a decoding or
-    cross-validation score by comparing the observed statistic against a
-    permutation-derived null distribution. It optionally implements a
-    **fail-fast early-stopping rule**, which halts permutations as soon as it
-    becomes *statistically impossible* for the voxel/ROI to reach significance
-    at level ``alpha``.
+    cols = []
+    for dx, dy, dz in offsets:
+        x, y, z = cx + dx, cy + dy, cz + dz
 
-    Unlike symmetric early stopping (which can also stop for early significance),
-    the fail-fast version only terminates permutations when the lower bound
-    on the attainable p-value exceeds ``alpha``—that is, when even the most
-    optimistic outcome would remain non-significant. This ensures conservative
-    inference without the risk of prematurely “accepting” significance.
+        if (
+            0 <= x < vol_shape[0]
+            and 0 <= y < vol_shape[1]
+            and 0 <= z < vol_shape[2]
+        ):
+            col = col_index_vol[x, y, z]
+            if col >= 0:
+                cols.append(col)
 
-    Parameters
-    ----------
-    obs_score : float
-        Observed score computed using true labels (e.g., cross-validated accuracy
-        or correlation coefficient). Compared against permutation scores to estimate
-        the empirical p-value.
-    seeds : ndarray of int, shape (n_perms,)
-        Integer random seeds used to initialize the RNG for each permutation.
-        Provides reproducible sampling of null scores.
-    n_perms : int
-        Maximum number of permutations to execute.
-    alpha : float or None, optional
-        Early-stopping significance level (e.g., ``0.05``).  
-        If provided, the algorithm stops early **only** when it becomes
-        impossible for the final empirical p-value to fall below ``alpha``—
-        specifically, when the lower bound
-        ``p_min = (count_exceed + 1) / (n_run + 1)`` exceeds ``alpha`` after
-        at least ``ceil(1/alpha) - 1`` permutations.  
-        If ``None`` (default), all permutations are executed.
-    score_fn : Callable[[numpy.random.Generator], float]
-        A callable that accepts a NumPy ``Generator`` and returns a single
-        permuted score (float). Typically wraps a decoding or cross-validation
-        routine with shuffled labels.
-
-    Returns
-    -------
-    null_mean : float
-        Mean of all computed permutation scores (approximate null expectation).
-    p_value : float
-        Empirical one-sided p-value computed as
-        ``p = (Σ(null ≥ obs) + 1) / (n_run + 1)``.
-    n_run : int
-        Number of permutations actually executed (≤ ``n_perms``).
-
-    Notes
-    -----
-    - Uses a one-sided test: ``p = P(null ≥ obs_score)``.
-    - Adds ``+1`` to numerator and denominator for finite-sample correction.
-    - The smallest attainable p-value is ``1 / (n_run + 1)``.
-    - Fail-fast early stopping only declares “cannot become significant”;
-      it never accepts significance prematurely.
-    - This rule typically saves computation for voxels with clearly null effects,
-      while leaving truly significant voxels to complete all permutations.
-
-    Example
-    -------
-    .. code-block:: python
-
-        import numpy as np
-
-        def score_fn(rng):
-            # Randomized null distribution centered at 0.5
-            return rng.normal(0.5, 0.05)
-
-        obs_score = 0.72
-        rng = np.random.default_rng(42)
-        seeds = rng.integers(0, 2**32, size=1000)
-
-        null_mean, p_val, n_run = run_permutations(
-            obs_score=obs_score,
-            seeds=seeds,
-            n_perms=1000,
-            alpha=0.05,
-            score_fn=score_fn
-        )
-
-        print(null_mean, p_val, n_run)
-        # Example output: 0.498, 0.002, 1000  (ran all perms; likely significant)
-
-    Computational rule
-    ------------------
-    For each permutation ``j = 1 … n_perms``:
-
-        1. Draw RNG = np.random.default_rng(int(seeds[j]))
-        2. Compute ``perm_score = score_fn(RNG)``
-        3. Update ``count_exceed += (perm_score >= obs_score)``
-        4. Compute ``p_min = (count_exceed + 1) / (j + 1)``  
-           If ``p_min > alpha`` and ``j >= ceil(1/alpha) - 1``, stop early.
-
-    After termination, compute the final p-value as:
-
-    .. math::
-
-        p = \\frac{\\text{count}_\\text{exceed} + 1}{n_\\text{run} + 1}
-
-    and report the mean null score as the empirical null expectation.
-    """
-
-    perm_vals = []
-    count_exceed = 0
-    stopped = False
-    reason = None
-
-    J0 = int(np.ceil(1.0/alpha) - 1) if alpha is not None else None
-    for j, s in enumerate(seeds[:n_perms], 1):
-        v = float(score_fn(np.random.default_rng(int(s))))
-        perm_vals.append(v)
-        if v >= obs_score:
-            count_exceed += 1
-
-        if alpha is not None and j >= J0:
-            p_min = (count_exceed + 1) / (j + 1)
-            if p_min > alpha:
-                stopped = True
-                reason = "p_min>alpha"   # fail-fast only
-                break
-
-    perm_vals = np.asarray(perm_vals, dtype=float)
-
-    # Empirical p using the permutations actually run
-    p_value = (np.sum(perm_vals >= obs_score) + 1.0) / (len(perm_vals) + 1.0)
-    null_mean = float(np.mean(perm_vals)) if perm_vals.size else np.nan
-    
-    return null_mean, float(p_value), int(perm_vals.size), stopped, reason
+    return cols
 
 
 def _voxel_radius_in_voxels(mask_img, radius_mm):
@@ -278,9 +158,7 @@ def _neighbors_ball_mm(zooms, r_mm):
 
 def _one_center(
         center_ijk,
-        offsets,
-        col_index_vol,
-        vol_shape,
+        cols,
         X_mm_path,
         labels,
         folds,
@@ -393,18 +271,10 @@ def _one_center(
     ((32, 40, 20), 0.71, 0.50, 0.21, 0.01, 87, 100, 0, 0)
     """
 
-    # Build neighborhood feature indices (in ROI feature space) for this center
     cx, cy, cz = map(int, center_ijk)
-    cols = []
-    for dx, dy, dz in offsets:
-        x, y, z = cx+dx, cy+dy, cz+dz
-        if 0 <= x < vol_shape[0] and 0 <= y < vol_shape[1] and 0 <= z < vol_shape[2]:
-            col = col_index_vol[x, y, z]
-            if col >= 0:
-                cols.append(col)
 
     if len(cols) < 2:
-        return (cx, cy, cz), np.nan, np.nan, np.nan, np.nan, len(cols)
+        return (cx, cy, cz), np.nan, np.nan, np.nan, np.nan, int(len(cols)), 0, 0, 0
 
     # observed
     obs = utils._cv_mean_score(
@@ -426,8 +296,12 @@ def _one_center(
     center_rng = np.random.default_rng(int(seed))
     seeds = center_rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
-    perm_vals = np.asarray(
-        [
+    null_sum = 0.0
+    count_exceed = 0
+    n_run = 0
+
+    for s in seeds:
+        v = float(
             utils._cv_mean_score(
                 X_mm_path, labels, folds, cfg,
                 cols=cols,
@@ -435,14 +309,16 @@ def _one_center(
                 permute=True,
                 **kwargs
             )
-            for s in seeds
-        ],
-        dtype=float,
-    )
+        )
 
-    n_run = int(perm_vals.size)
-    null_mean = float(np.mean(perm_vals)) if n_run else np.nan
-    p = float((np.sum(perm_vals >= obs) + 1.0) / (n_run + 1.0)) if n_run else np.nan
+        null_sum += v
+        count_exceed += int(v >= obs)
+        n_run += 1
+
+    null_mean = float(null_sum / n_run) if n_run else np.nan
+    p = float((count_exceed + 1.0) / (n_run + 1.0)) if n_run else np.nan
+
+    # compute delta
     delta = float(obs - null_mean) if np.isfinite(null_mean) else np.nan
 
     # No fail-fast in null-mean mode.
@@ -655,9 +531,37 @@ def permutation_searchlight(
         logger.info(f"Storing searchlight information in {save_dir}")
         n_perms = cfg.get("n_permutations", 1000)
         n_jobs = par_cfg.get("n_jobs", 1)
+
+        sample_ix = np.linspace(
+            0, len(centers) - 1,
+            min(1000, len(centers)),
+            dtype=int,
+        )
+
+        sample_sizes = np.asarray([
+            len(_cols_for_center(centers[i], offs, col_index_vol, vol_shape))
+            for i in sample_ix
+        ])
+
+        logger.info(
+            "Searchlight neighbourhood sizes (sample=%d): mean=%.1f, median=%d, range=[%d,%d]",
+            len(sample_sizes),
+            float(sample_sizes.mean()),
+            int(np.median(sample_sizes)),
+            int(sample_sizes.min()),
+            int(sample_sizes.max()),
+        )
+
+        logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
+        logger.info("Start searchlight analysis")
+
         def _run(ix):
+            center_ijk = tuple(map(int, centers[ix]))
+            cols = _cols_for_center(center_ijk, offs, col_index_vol, vol_shape)
+
             return _one_center(
-                centers[ix], offs, col_index_vol, vol_shape,
+                center_ijk,
+                cols,
                 X_path, y, folds, cfg,
                 groups=groups,
                 n_perms=n_perms,
@@ -667,10 +571,7 @@ def permutation_searchlight(
                 save_dir=save_dir,
                 **kwargs
             )
-
-        logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
-        logger.info("Searchlight null estimation: fixed_count_mean; fail-fast disabled")
-
+        
         if n_jobs == 1:
             out = []
             for i in tqdm(

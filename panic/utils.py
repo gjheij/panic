@@ -13,9 +13,8 @@ from typing import Any, Dict
 from joblib import dump, load
 from importlib.resources import files, as_file
 from sklearn.utils.validation import has_fit_parameter
-from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.model_selection._search import BaseSearchCV
-from sklearn.utils.validation import check_is_fitted
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 
 import panic
 from panic.logger import get_logger
@@ -342,8 +341,7 @@ def _cv_mean_score(
     ----------
     X_path : str or Path
         Path to a ``joblib`` dump of a memory-mapped feature matrix
-        ``(n_samples, n_features)``. If ``cols`` is provided, only the selected
-        feature columns are used for fitting and evaluation.
+        ``(n_samples, n_features)``.
     labels : array-like of shape (n_samples,)
         Integer or categorical labels aligned with rows in ``X``.
     folds : list of tuple(ndarray, ndarray)
@@ -353,11 +351,11 @@ def _cv_mean_score(
         Configuration dictionary controlling decoding parameters and pipeline
         construction. Passed to :func:`pipeline_from_config`.
     cols : array-like of int, optional
-        Optional subset of feature (column) indices to evaluate. If provided,
-        only ``X[:, cols]`` is used during cross-validation, while the underlying
-        memmapped array is loaded only once. This is primarily intended for
-        searchlight decoding, where each center evaluates a different voxel
-        neighborhood without creating additional temporary memmap files.        
+        Optional subset of feature columns to evaluate. If provided, the local
+        feature matrix ``X[:, cols]`` is materialized once in RAM before the CV
+        loop. This is intended for searchlight decoding and avoids repeated
+        memmap slicing across folds/permutations. ROI decoding should leave this
+        as ``None``.
     groups : array-like of shape (n_samples,), optional
         Optional grouping labels (e.g., run or subject IDs). Used both for
         stratified or grouped CV and for within-group label permutations.
@@ -436,14 +434,30 @@ def _cv_mean_score(
     else:
         X_mm = X_path
 
+    # Searchlight optimization: materialize the small local neighbourhood once
+    # in RAM. ROI decoding keeps the original matrix/memmap unchanged.
     if cols is not None:
-        X_mm = X_mm[:, cols]
+        X_eval = np.asarray(X_mm[:, cols])
+    else:
+        X_eval = X_mm
 
     y = np.asarray(labels)
     g_full = None if groups is None else np.asarray(groups)
     
     if rng is None and permute:
         rng = np.random.default_rng()
+
+    # These objects do not change across folds; creating them inside the fold
+    # loop is expensive for searchlight analyses.
+    scorer = factory.scorer_from_config(cfg.get("scoring", "balanced_accuracy"))
+    template_random_state = int(rng.integers(2**31 - 1)) if rng is not None else None
+    template_clf = pipeline_from_config(
+        cfg,
+        random_state=template_random_state,
+        labels=labels,
+        scoring=scorer,
+        **kwargs
+    )
 
     fold_scores = []
     for f_ix, (train_idx, test_idx) in enumerate(folds):
@@ -469,28 +483,23 @@ def _cv_mean_score(
             y_tr_perm = y_tr
             y_te_perm = y_te
 
-        # make scoring object
-        scorer = factory.scorer_from_config(cfg.get("scoring", "balanced_accuracy"))
-        
-        # define the pipeline
-        random_state = int(rng.integers(2**31 - 1)) if rng is not None else None
-        clf = pipeline_from_config(
-            cfg,
-            random_state=random_state,
-            labels=labels,
-            scoring=scorer,
-            **kwargs
-        )
+        # Clone a prebuilt template instead of reconstructing the pipeline
+        # from config for every fold. This preserves ROI behavior while reducing
+        # searchlight overhead substantially.
+        clf = clone(template_clf)
         
         try:
             supports_groups = isinstance(clf, BaseSearchCV) or has_fit_parameter(clf, "groups")
 
-            if g_tr is not None and supports_groups:
-                clf.fit(X_mm[train_idx], y_tr_perm, groups=g_tr)
-            else:
-                clf.fit(X_mm[train_idx], y_tr_perm)
+            X_tr = X_eval[train_idx]
+            X_te = X_eval[test_idx]
 
-            score = clf.score(X_mm[test_idx], y_te_perm)
+            if g_tr is not None and supports_groups:
+                clf.fit(X_tr, y_tr_perm, groups=g_tr)
+            else:
+                clf.fit(X_tr, y_tr_perm)
+
+            score = clf.score(X_te, y_te_perm)
 
         except errors.NoFeaturesSelectedError as e:
             logger.warning(f"Fold {f_ix}: {e} - setting score=NaN")
@@ -502,7 +511,7 @@ def _cv_mean_score(
             if isinstance(fold_dir, str):
                 _save_pipeline(
                     clf,
-                    X_mm,
+                    X_eval,
                     test_idx,
                     train_idx,
                     fold_dir,
