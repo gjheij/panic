@@ -1207,7 +1207,6 @@ class PrepareBetas:
             logger.info(f"Saving merged beta image as '{fname}'")
             beta_imgs.to_filename(fname)
 
-        raise
         return beta_imgs, trials, is_standardized, groups
 
 
