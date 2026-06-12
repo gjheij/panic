@@ -742,10 +742,12 @@ class ClassifySubject(data.PrepareBetas):
         if isinstance(roi_dict, str):
             assert os.path.exists(roi_dict), FileNotFoundError(f"Input ROI-directory '{roi_dict}' does not exist")
             if os.path.isdir(roi_dict):
+                logger.info(f"Defining ROIs from directory: '{roi_dict}'")
                 extension = self.cfg["roi_settings"].get("extension", ".nii.gz")
                 mask_files = FindFiles(
                     roi_dict,
-                    extension=extension
+                    extension=extension,
+                    maxdepth=0
                 ).files
 
                 if isinstance(mask_files, str):
@@ -764,9 +766,11 @@ class ClassifySubject(data.PrepareBetas):
                     run_dict[lbl] = m
 
             elif isinstance(roi_dict, dict):
+                logger.info(f"Defining ROIs dictionary: '{roi_dict}'")
                 run_dict = roi_dict
                 is_labels = True                    
             else:
+                logger.info(f"Defining single ROI from file: '{roi_dict}'")
                 run_dict = {
                     "mask_1": self.cfg["roi_dict"]
                 }
