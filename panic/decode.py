@@ -260,6 +260,18 @@ def run_decoding_with_permutation(
         return ddict
 
 
+def _searchlight_outputs_exist(sl_dir):
+    expected = [
+        "searchlight_observed.nii.gz",
+        "searchlight_null_mean.nii.gz",
+        "searchlight_delta.nii.gz",
+        "searchlight_pvalue.nii.gz",
+        "searchlight_nfeatures.nii.gz",
+        "searchlight_desc-metadata.json",
+    ]
+    return all(os.path.exists(opj(sl_dir, f)) for f in expected)
+        
+        
 class ClassifySubject(data.PrepareBetas):
 
     """
@@ -717,6 +729,7 @@ class ClassifySubject(data.PrepareBetas):
 
         return ddict
     
+
     def define_mask_inputs(self):
 
         # roi_dict options:
@@ -760,7 +773,7 @@ class ClassifySubject(data.PrepareBetas):
         
         assert len(run_dict)>0, ValueError(f"No ROIs were detected using: '{roi_dict}'")
         return run_dict, is_labels
-
+    
 
     def decode_masks(
             self,
@@ -825,41 +838,65 @@ class ClassifySubject(data.PrepareBetas):
         results = []
         null = []
 
+        overwrite = bool(getattr(self, "overwrite", self.gen_settings.get("overwrite", False)))
+
+        # ROI mode has one subject-level results file, so it can be checked up front.
+        if not self.searchlight:
+            res_file = self.generate_filename(desc="results", ext="csv")
+            if os.path.exists(res_file) and not overwrite:
+                logger.warning(f"Results file '{res_file}' already exists; skipping ROI decoding.")
+                return pd.read_csv(res_file)
+
         roi_dict, is_labels = self.define_mask_inputs()
+
         for r_key, r_val in roi_dict.items():
             logger.info(f"Processing '{r_key}' (labels|file={r_val})")
 
-            # prepare ROIs for beta-series extraction
-            roi_name = None
-            if is_labels:
-                roi_name = r_key
-
+            roi_name = r_key if is_labels else None
             _, roi_masks = self.prepare_rois(r_val, roi_name=roi_name)
 
-            # extract betas
             for h_key, h_val in roi_masks.items():
                 logger.info(f"hemi-key={h_key} | roi-key={h_val[0]}..")
 
                 model_src_dir = opj(
                     self.save_dir,
                     f"model-{self.gen_settings['method']}",
-                    f"source-{self.gen_settings['source']}"
+                    f"source-{self.gen_settings['source']}",
                 )
 
-                # extract beta-series
+                roi_dir = opj(model_src_dir, f"roi-{h_val[0]}")
+
+                # Searchlight mode has one output directory per ROI/mask.
+                # Check completion here, because roi_dir depends on h_val.
+                if self.searchlight:
+                    sl_dir = opj(roi_dir, "searchlight")
+                    if _searchlight_outputs_exist(sl_dir) and not overwrite:
+                        logger.warning(
+                            "Searchlight outputs already exist for ROI '%s'; skipping: %s",
+                            h_val[0],
+                            sl_dir,
+                        )
+                        out_files[h_val[0]] = {
+                            "observed":     opj(sl_dir, "searchlight_observed.nii.gz"),
+                            "null_mean":    opj(sl_dir, "searchlight_null_mean.nii.gz"),
+                            "delta":        opj(sl_dir, "searchlight_delta.nii.gz"),
+                            "pvalue":       opj(sl_dir, "searchlight_pvalue.nii.gz"),
+                            "nfeatures":    opj(sl_dir, "searchlight_nfeatures.nii.gz"),
+                            "metadata":     opj(sl_dir, "searchlight_desc-metadata.json"),
+                        }
+                        continue
+                    else:
+                        logger.info(f"Searchlight outputs not found or overwrite=True for ROI '{h_val[0]}'; running searchlight decoding.")
+
                 fname = None
-                roi_dir = None
                 if self.save_imgs:
                     resampled_dir = opj(self.save_dir, "rois")
-                    if not os.path.exists(resampled_dir):
-                        os.makedirs(resampled_dir, exist_ok=True)
-
+                    os.makedirs(resampled_dir, exist_ok=True)
                     fname = opj(
                         resampled_dir,
-                        f"{self.subject}_roi-{h_val[0]}_hemi-{h_key}_desc-valid_mask.nii.gz"
+                        f"{self.subject}_roi-{h_val[0]}_hemi-{h_key}_desc-valid_mask.nii.gz",
                     )
-                
-                roi_dir = opj(model_src_dir, f"roi-{h_val[0]}")
+
                 ddict = self.decode_single_mask(
                     self.betas,
                     h_val[1],
@@ -868,10 +905,9 @@ class ClassifySubject(data.PrepareBetas):
                     output_file=fname,
                     save_dir=roi_dir,
                     tmpdir=self.gen_settings["tmp_dir"],
-                    **kwargs
+                    **kwargs,
                 )
 
-                # exit if mask is empty
                 if ddict is None:
                     continue
 
@@ -924,11 +960,6 @@ class ClassifySubject(data.PrepareBetas):
 
             # write results to dataframe and save
             res_df = pd.DataFrame(results)
-            res_file = self.generate_filename(
-                desc="results",
-                ext="csv"
-            )
-
             logger.info(f"Writing results to: '{res_file}'")
             res_df.to_csv(res_file, index=False)
             shutil.copymode(self.config_file, res_file)

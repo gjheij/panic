@@ -24,6 +24,7 @@ general_settings:
   source: stglm                 # or 'stglm', 'glmsingle'
   standardize: zscore           # best to keep this
   filters: task-HRA
+  overwrite: false
 
 fitted_derivative: false
 
@@ -92,5 +93,6 @@ decoding_settings:
     alpha: 0.05                   # value for FDR correction
     radius_mm: 6                  # radius around center
     target_zooms: null            # downsample data to reduce number of centers; e.g., [2.0, 2.0, 2.0]
+    basepath: "searchlight"       # subfolder within {save_dir} to save searchlight results
     locked:                       # disable gridsearch within searchlight
       clf__C: 1.0
