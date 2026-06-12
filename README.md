@@ -69,6 +69,7 @@ general_settings:
   method: LSA                   # or LSS, if you have GLMsingle: use 'lss', 'lsa'
   source: stglm                 # or 'stglm', 'glmsingle'
   standardize: zscore           # best to keep this
+  filters: null                 # string/list of strings of extra filters to discover beta images (e.g., task-ID)
 
 fitted_derivative: false
 
@@ -86,7 +87,6 @@ decoding_settings:
     backend: "loky"             # backend for Parallel process
     prefer: "processes"         # preference for Parallel process
     verbose: 0                  # verbosity of Parallel process
-    update_interval: 100        # log progress every N completed searchlights (0 = disable)
 
   # Pipeline settings: DO NOT CHANGE THE HEADER NAMES ('SCALER', 'CV', 'ESTIMATOR', etc)
   # preprocessing | if 'standardize' is null
