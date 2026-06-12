@@ -522,17 +522,22 @@ class ClassifySubject(data.PrepareBetas):
             ``self.gen_settings["source"]``.
         """
 
+        beta_dir = opj(
+            self.gen_settings["project_dir"],
+            "derivatives",
+            self.gen_settings["source"]
+        )
+
+        assert os.path.exists(beta_dir), FileNotFoundError(f"Beta directory '{beta_dir}' does not exist")
+
         ddict = {
             "subject": self.subject,
-            "beta_dir": opj(
-                self.gen_settings["project_dir"],
-                "derivatives",
-                self.gen_settings["source"]
-            ),
-            "derivative": self.cfg["fitted_derivative"],
-            "model": self.gen_settings["method"],
-            "standardize": self.gen_settings["standardize"],
-            "label_mapper": self.cfg["label_dict"]
+            "beta_dir": beta_dir,
+            "derivative": self.cfg.get("fitted_derivative", False),
+            "model": self.gen_settings.get("method", "lsa"),
+            "standardize": self.gen_settings.get("standardize", False),
+            "label_mapper": self.cfg.get("label_dict"),
+            "filters": self.gen_settings.get("filters", None)
         }
 
         for key, val in ddict.items():

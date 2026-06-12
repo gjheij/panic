@@ -809,12 +809,12 @@ class PrepareBetas:
     """
 
     def __init__(
-        self,
-        beta_file: str=None,
-        trial_list: list=None,
-        **kwargs
-    ):
-
+            self,
+            beta_file: str=None,
+            trial_list: list=None,
+            **kwargs
+        ):
+                
         if isinstance(beta_file, str):
             logger.info(f"Beta-file: '{beta_file}'")
             self.betas, self.do_standardization = self.sanitize_img(
@@ -969,6 +969,7 @@ class PrepareBetas:
             derivative=False,
             label_mapper=None,
             model="lsa",
+            filters=None,
             **kwargs
         ):
         """
@@ -1084,7 +1085,16 @@ class PrepareBetas:
             search = [f"feature-{model}_condition-", "effect_statmap.nii.gz"]
         else:
             raise ValueError(f"Source must be on of {allowed}, not '{src}'")
+        
+        # add custom filters
+        if filters is not None:
+            if isinstance(filters, str):
+                filters = [filters]
 
+            if len(filters)>0:
+                search += filters
+
+        logger.info(f"Search criteria: {search}")
         m_files = utils.FindFiles(
             subject_betas,
             extension=".nii.gz",
@@ -1092,7 +1102,7 @@ class PrepareBetas:
         ).files
 
         assert len(m_files)>0, ValueError(f"No *.nii.gz files in '{subject_betas}'")
-
+    
         #-----------------------------------------------------------------------
         # D. Bach's beta values
         if derivative:
@@ -1111,7 +1121,12 @@ class PrepareBetas:
             # select ev-specific files
             include_events = list(label_mapper.keys())
             for i in include_events:
-                incl_files = utils.get_file_from_substring([f"-{i}_stat"], m_files)
+
+                incl_files = utils.get_file_from_substring(
+                    [f"-{i}_stat"],
+                    m_files
+                )
+
                 if isinstance(incl_files, str):
                     incl_files = [incl_files]
 
@@ -1192,6 +1207,7 @@ class PrepareBetas:
             logger.info(f"Saving merged beta image as '{fname}'")
             beta_imgs.to_filename(fname)
 
+        raise
         return beta_imgs, trials, is_standardized, groups
 
 
