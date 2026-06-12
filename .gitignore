@@ -1,9 +1,9 @@
 # Ignore egg files and directories
 *.egg
 *.egg-info/
-stglm/__pycache__/
+panic/__pycache__/
 *.pyc
 *.pyo
 .DS_Store
-stglm/version.py
+panic/version.py
 build/*
