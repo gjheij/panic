@@ -2,18 +2,22 @@
 # emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: nil -*-
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 
+import json
+import os
+import tempfile
+import uuid
+
 import numpy as np
-from tqdm import tqdm
-from nilearn import image
-import os, json, tempfile, uuid
 from joblib import Parallel, delayed, dump, load
-from panic.logger import get_logger, tqdm_joblib, _LoggedProgress
-from panic import (
-    data,
-    utils,
-)
+from nilearn import image
 from statsmodels.stats.multitest import fdrcorrection
-from typing import Callable, Tuple, Optional
+from tqdm import tqdm
+
+from panic import data
+from panic.logger import get_logger, tqdm_joblib
+from panic.pipeline import _folds_for_labels
+from panic.plugins import core
+from panic.utils import tqdm_disabled
 
 logger = get_logger(__name__)
 opj = os.path.join
@@ -166,7 +170,10 @@ def _one_center(
         groups,
         n_perms,
         seed,
-        **kwargs
+        *,
+        plugin,
+        plugin_kwargs,
+        **kwargs,
     ):
     """
     Compute observed and permutation-based decoding accuracy for a single
@@ -276,56 +283,83 @@ def _one_center(
     if len(cols) < 2:
         return (cx, cy, cz), np.nan, np.nan, np.nan, np.nan, int(len(cols)), 0, 0, 0
 
+    analysis_cfg = cfg.get("analysis", {})
+    do_permutations = bool(analysis_cfg.get("permutations", True))
+    higher_is_better = bool(analysis_cfg.get("higher_is_better", True))
+
     # observed
-    obs = utils._cv_mean_score(
-        X_mm_path, labels, folds, cfg,
+    output_kind = cfg.get("analysis", {}).get("output_kind", "scalar")
+
+    result = plugin(
+        X_mm_path,
+        labels,
+        cfg,
+        folds=folds,
         cols=cols,
-        groups=groups,
         permute=False,
-        **kwargs
+        return_artifacts=(output_kind == "timeseries"),
+        **plugin_kwargs,
+        **kwargs,
     )
 
-    # Permutations: fixed-count null estimation.
-    #
-    # Bach-style searchlight analyses use a small, fixed number of random
-    # permutations to estimate the null mean performance, not to run an exact
-    # voxelwise permutation test. Therefore we deliberately do *not* apply
-    # fail-fast early stopping here: stopping early would bias the null mean
-    # because the number of sampled null scores would depend on the observed
-    # score and interim exceedance count.
-    center_rng = np.random.default_rng(int(seed))
-    seeds = center_rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
+    obs, artifacts = core.unpack_plugin_result(result)
+
+    if output_kind == "timeseries":
+        ts = artifacts.get("cs_us_similarity", None)
+    else:
+        ts = None
 
     null_sum = 0.0
-    count_exceed = 0
+    count_extreme = 0
     n_run = 0
 
-    for s in seeds:
-        v = float(
-            utils._cv_mean_score(
-                X_mm_path, labels, folds, cfg,
-                cols=cols,
-                rng=np.random.default_rng(int(s)),
-                permute=True,
-                **kwargs
-            )
-        )
+    if do_permutations and n_perms > 0:
+        center_rng = np.random.default_rng(int(seed))
+        seeds = center_rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
-        null_sum += v
-        count_exceed += int(v >= obs)
-        n_run += 1
+        for s in seeds:
+            v = float(
+                plugin(
+                    X_mm_path,
+                    labels,
+                    cfg,
+                    folds=folds,
+                    cols=cols,
+                    rng=np.random.default_rng(int(s)),
+                    permute=True,
+                    **plugin_kwargs,
+                    **kwargs,
+                )
+            )
+
+            null_sum += v
+
+            if higher_is_better:
+                count_extreme += int(v >= obs)
+            else:
+                count_extreme += int(v <= obs)
+
+            n_run += 1
 
     null_mean = float(null_sum / n_run) if n_run else np.nan
-    p = float((count_exceed + 1.0) / (n_run + 1.0)) if n_run else np.nan
-
-    # compute delta
+    p = float((count_extreme + 1.0) / (n_run + 1.0)) if n_run else np.nan
     delta = float(obs - null_mean) if np.isfinite(null_mean) else np.nan
 
-    # No fail-fast in null-mean mode.
     stopped = 0
     stop_code = 0
 
-    return (cx, cy, cz), float(obs), float(null_mean), float(delta), float(p), int(len(cols)), n_run, stopped, stop_code
+    return (
+        (cx, cy, cz),
+        float(obs),
+        float(null_mean),
+        float(delta),
+        float(p),
+        int(len(cols)),
+        int(n_run),
+        stopped,
+        stop_code,
+        ts
+    )
 
 
 def permutation_searchlight(
@@ -339,6 +373,7 @@ def permutation_searchlight(
         seed=0,
         tmpdir=None,
         output_file=None,
+        hemi_key=None,
         **kwargs
     ):
     """
@@ -476,6 +511,18 @@ def permutation_searchlight(
     locked_params = sl_cfg.get("locked", None)
     alpha = sl_cfg.get("alpha", 0.05)
 
+    # get plugin
+    plugin, plugin_kwargs = core.get_analysis_plugin(
+        cfg,
+        label_dict=label_mapper,
+    )
+
+    logger.info(f"Running plugin: {plugin} with args: {plugin_kwargs}")
+
+    analysis_cfg = cfg.get("analysis", {})
+    output_kind = analysis_cfg.get("output_kind", "scalar")
+    save_timeseries = output_kind == "timeseries"
+
     # 1) Extract X/labels inside ROI ∩ valid using your existing path
     mf = data.MaskAndFilterBetas(
         betas_img, mask_img,
@@ -498,7 +545,7 @@ def permutation_searchlight(
     centers = np.column_stack(np.where(col_index_vol >= 0))  # shape (N, 3)
 
     # 2) folds exactly like ROI path
-    folds = utils._folds_for_labels(cfg, y, groups)
+    folds = _folds_for_labels(cfg, y, groups)
 
     # 3) memmap X once
     if tmpdir is None:
@@ -563,14 +610,19 @@ def permutation_searchlight(
             return _one_center(
                 center_ijk,
                 cols,
-                X_path, y, folds, cfg,
+                X_path,
+                y,
+                folds,
+                cfg,
                 groups=groups,
                 n_perms=n_perms,
                 seed=int(center_seeds[ix]),
+                plugin=plugin,
+                plugin_kwargs=plugin_kwargs,
                 locked=locked_params,
                 searchlight=True,
                 save_dir=save_dir,
-                **kwargs
+                **kwargs,
             )
         
         if n_jobs == 1:
@@ -578,14 +630,14 @@ def permutation_searchlight(
             for i in tqdm(
                 range(len(centers)),
                 total=len(centers),
-                disable=utils.tqdm_disabled(),
+                disable=tqdm_disabled(),
             ):
                 out.append(_run(i))
         else:
             with tqdm_joblib(
                 tqdm(
                     total=len(centers),
-                    disable=utils.tqdm_disabled()
+                    disable=tqdm_disabled()
                 ),
             ):
                 out = Parallel(
@@ -598,28 +650,45 @@ def permutation_searchlight(
 
 
         # 6) assemble maps
-        obs_map   = np.full(vol_shape, np.nan, dtype=np.float32)
-        null_map  = np.full(vol_shape, np.nan, dtype=np.float32)
-        delta_map = np.full(vol_shape, np.nan, dtype=np.float32)
-        p_map     = np.full(vol_shape, np.nan, dtype=np.float32)
-        nfeat_map = np.zeros(vol_shape, dtype=np.int32)
-        nperms_run_map = np.zeros(vol_shape, dtype=np.int32)
-        stopped_map    = np.zeros(vol_shape, dtype=np.uint8)
-        stop_code_map  = np.zeros(vol_shape, dtype=np.uint8)
+        logger.info(f"Saving output maps (timeseries={save_timeseries})")
+        obs_map         = np.full(vol_shape, np.nan, dtype=np.float32)
+        null_map        = np.full(vol_shape, np.nan, dtype=np.float32)
+        delta_map       = np.full(vol_shape, np.nan, dtype=np.float32)
+        p_map           = np.full(vol_shape, np.nan, dtype=np.float32)
+        nfeat_map       = np.zeros(vol_shape, dtype=np.int32)
+        nperms_run_map  = np.zeros(vol_shape, dtype=np.int32)
+        stopped_map     = np.zeros(vol_shape, dtype=np.uint8)
+        stop_code_map   = np.zeros(vol_shape, dtype=np.uint8)
 
-        for (x,y,z), obs, nullm, dlt, p, nf, nrun, stopped, stop_code in out:
-            obs_map[x,y,z]   = obs
-            null_map[x,y,z]  = nullm
-            delta_map[x,y,z] = dlt
-            p_map[x,y,z]     = p
-            nfeat_map[x,y,z] = nf
-            nperms_run_map[x,y,z] = nrun
-            stopped_map[x,y,z]    = stopped
-            stop_code_map[x,y,z]  = stop_code
+        # save CS-US similarity curve
+        ts_map = None
+        if save_timeseries:
+            first_ts = next((row[-1] for row in out if row[-1] is not None), None)
+            if first_ts is not None:
+                n_time = len(first_ts)
+                ts_map = np.full((*vol_shape, n_time), np.nan, dtype=np.float32)
+
+        for row in out:
+            (ix, iy, iz), obs, nullm, dlt, p, nf, nrun, stopped, stop_code, ts = row
+
+            obs_map[ix, iy, iz] = obs
+            null_map[ix, iy, iz] = nullm
+            delta_map[ix, iy, iz] = dlt
+            p_map[ix, iy, iz] = p
+            nfeat_map[ix, iy, iz] = nf
+            nperms_run_map[ix, iy, iz] = nrun
+            stopped_map[ix, iy, iz] = stopped
+            stop_code_map[ix, iy, iz] = stop_code
+
+            if ts_map is not None and ts is not None:
+                ts_map[ix, iy, iz, :] = ts
 
         # 7) save NIfTIs
         os.makedirs(save_dir, exist_ok=True)
         base = opj(save_dir or tmpdir, "searchlight")
+        
+        if hemi_key is not None and hemi_key != "uni":
+            base += f"_hemi-{hemi_key}"
 
         ref = mf.mask_resampled_to_betas  # SAME grid/affine as vol_shape
         out_files = save_searchlight_maps(
@@ -637,6 +706,22 @@ def permutation_searchlight(
             n_perms=n_perms,
             mask_img=ref
         )
+
+        if ts_map is not None:
+            f = f"{base}_cs_us_similarity_timeseries.nii.gz"
+            image.new_img_like(ref, ts_map, copy_header=True).to_filename(f)
+            out_files["cs_us_similarity_timeseries"] = f
+
+            logger.info(
+                "y type=%s shape=%s cs_label=%r",
+                type(y),
+                getattr(y, "shape", None),
+                plugin_kwargs.get("cs_label"),
+            )
+
+            cs_idx = np.where(np.asarray(y) == plugin_kwargs.get("cs_label"))[0]
+            np.save(f"{base}_cs_trial_indices.npy", cs_idx)
+            out_files["cs_trial_indices"] = f"{base}_cs_trial_indices.npy"
 
         # also drop a small JSON sidecar
         meta = {
@@ -659,6 +744,7 @@ def permutation_searchlight(
         with open(f"{base}_desc-metadata.json", "w") as f:
             json.dump(meta, f, indent=2)
 
+        logger.info("Done\n")
         return out_files
 
 
@@ -676,7 +762,7 @@ def save_searchlight_maps(
         stop_code,
         mask_img=None,
         fdr_alpha=0.05,
-        n_perms=None
+        n_perms=None,
     ):
     """
     Save and summarize searchlight decoding results to NIfTI images.

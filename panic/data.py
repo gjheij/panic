@@ -129,12 +129,16 @@ class PrepareROIs:
         self.extension = extension
         
         # load masks
+        if isinstance(self.roi_labels, (int, float)):
+            self.roi_labels = [self.roi_labels]
+            
         if isinstance(self.roi_labels, list):
             # derive mask dir from components or straight directory
             self.mask_dir = self.derive_mask_dir()
 
             assert os.path.exists(self.mask_dir), FileNotFoundError(f"Mask directory '{self.mask_dir}' does not exist")
 
+            logger.info(f"ROI-directory: '{self.mask_dir}'")
             self.roi_masks = self._from_labels(self.mask_dir)
         elif isinstance(self.roi_labels, str):
             if os.path.isdir(self.roi_labels):
@@ -142,7 +146,7 @@ class PrepareROIs:
             elif os.path.isfile(self.roi_labels):
                 self.roi_masks = self._from_file(self.roi_labels)
         else:
-            raise TypeError(f"roi_labels must be a list of FreeSurfer-compatible labels, a directory with *.nii.gz files, or an actual .nii.gz file, not '{self.roi_labels}'")
+            raise TypeError(f"roi_labels must be a list of FreeSurfer-compatible labels, a directory with *.nii.gz files, or an actual .nii.gz file, not '{self.roi_labels}' of type {type(self.roi_labels)}")
 
 
     def derive_mask_dir(self):
@@ -275,7 +279,7 @@ class PrepareROIs:
         all_imgs = utils.FindFiles(
             directory,
             maxdepth=0,
-            extension=".nii.gz"
+            extension=self.extension
         ).files
 
         if isinstance(all_imgs, str):
@@ -526,9 +530,19 @@ class PrepareROIs:
         """
 
         path_base = os.path.basename(i).lower()
-        if path_base.startswith("lh.") or "hemi-l" in path_base:
+
+        tokens = re.split(r'[._\-\s]+', path_base)
+
+        LEFT = {"lh", "left", "l"}
+        RIGHT = {"rh", "right", "r"}
+
+        if any(t in LEFT for t in tokens):
             lbl = "left"
-        elif os.path.basename(i).startswith("rh.") or "hemi-r" in path_base:
+        elif any(t in RIGHT for t in tokens):
+            lbl = "right"
+        elif "hemi-l" in path_base or "hemi_left" in path_base:
+            lbl = "left"
+        elif "hemi-r" in path_base or "hemi_right" in path_base:
             lbl = "right"
         else:
             lbl = "uni"
@@ -701,6 +715,9 @@ class PrepareROIs:
         data = self._sanitize(img, fill=fill)
 
         # 2) Work in integer label space
+        if isinstance(labels, (str, int, float)):
+            labels = [labels]
+
         data = np.rint(data).astype(np.int32, copy=False)
         labels = np.asarray(sorted(set(int(l) for l in labels)), dtype=np.int32)
 

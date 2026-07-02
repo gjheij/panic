@@ -11,11 +11,19 @@ import tempfile, uuid
 from tqdm import tqdm
 from joblib import Parallel, delayed, dump, load
 
-from panic import data, utils
+from panic import data
+from panic.pipeline import _folds_for_labels
+from panic.utils import (
+    tqdm_disabled,
+    load_yaml,
+    dump_yaml
+)
 from panic.logger import get_logger, tqdm_joblib
-from lazyfmri.utils import FindFiles, update_kwargs
 from panic.searchlight import permutation_searchlight
 from panic.errors import EmptyMaskError, NoFeaturesSelectedError
+from panic.plugins import core
+
+from lazyfmri.utils import FindFiles, update_kwargs
 
 logger = get_logger(__name__)
 opj = os.path.join
@@ -26,6 +34,7 @@ def run_decoding_with_permutation(
         labels,
         folds,
         cfg,
+        label_mapper=None,
         seed=0,
         tmpdir=None,
         groups=None,
@@ -54,6 +63,9 @@ def run_decoding_with_permutation(
     n_perms : int, optional
         Maximum number of label permutations to compute for the null distribution.
         Default is 1000.
+    label_mapper : dict
+        Mapping from trial labels (strings) to integer class labels,
+        e.g. ``{'CS-': 0, 'CS+': 1}``.        
     n_jobs : int, optional
         Number of parallel workers for permutation testing. Default is 1 (serial execution).
     seed : int, optional
@@ -180,96 +192,144 @@ def run_decoding_with_permutation(
         if "save_dir" in kwargs:
             logger.info(f"Storing fold information in {kwargs['save_dir']}")
 
+        plugin, plugin_kwargs = core.get_analysis_plugin(
+            cfg,
+            label_dict=label_mapper
+        )
+
+        logger.info(f"Running plugin: {plugin} with args: {plugin_kwargs}")
+        analysis_cfg = cfg.get("analysis", {})
+        score_name = analysis_cfg.get("name", "decoding")
+        do_permutations = bool(analysis_cfg.get("permutations", True))
+        higher_is_better = bool(analysis_cfg.get("higher_is_better", True))
+
         try:
-            observed_acc = utils._cv_mean_score(
-                X_path, labels, folds, cfg,
+            result  = plugin(
+                X_path,
+                labels,
+                cfg,
+                folds=folds,
                 groups=groups,
                 permute=False,
-                **kwargs
+                return_artifacts=True,
+                **plugin_kwargs,
+                **kwargs,
             )
+
+            observed_acc, artifacts = core.unpack_plugin_result(result)
+
         except NoFeaturesSelectedError as e:
-            logger.warning(f"Observed CV failed (no features): {e}. Skipping ROI.")
+            logger.warning(f"Observed analysis failed (no features): {e}. Skipping ROI.")
             return None
 
-        logger.info("Observed accuracy after %d folds: %.4f", len(folds), observed_acc)
+        logger.info("%s observed after %d folds: %.4f", score_name, len(folds), observed_acc)
 
-        # permutations in parallel with progress bar
-        n_perms = cfg.get("n_permutations", 1000)
-        n_jobs = par_cfg.get("n_jobs", 1)
-        rng = np.random.default_rng(seed)
-        seeds = rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
-
-        # helper for one permutation draw
-        def _one_perm(seed):
-            return utils._cv_mean_score(
-                X_path, labels, folds, cfg,
-                groups=groups,
-                permute=True,
-                rng=np.random.default_rng(int(seed)),
-                **kwargs
+        # save plugin-specific artifacts
+        if "save_dir" in kwargs:
+            core.save_analysis_artifacts(
+                kwargs["save_dir"],
+                artifacts,
+                roi_linidx=kwargs.get("roi_linidx"),
             )
+        
+        # check if we should do permutations
+        n_perms = int(cfg.get("n_permutations", 1000))
+        n_jobs = par_cfg.get("n_jobs", 1)
 
-        logger.info("Starting permutation testing: n_perms=%d, n_jobs=%d", n_perms, n_jobs)
+        if do_permutations and n_perms > 0:
+            rng = np.random.default_rng(seed)
+            seeds = rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
-        if n_jobs == 1:
-            permuted_acc = [
-                _one_perm(s)
-                for s in tqdm(
-                    seeds,
-                    total=n_perms,
-                    disable=utils.tqdm_disabled()
+            def _one_perm(seed):
+                return plugin(
+                    X_path,
+                    labels,
+                    cfg,
+                    folds=folds,
+                    groups=groups,
+                    permute=True,
+                    rng=np.random.default_rng(int(seed)),
+                    **plugin_kwargs,
+                    **kwargs,
                 )
-            ]
+
+            logger.info("Starting permutation testing: n_perms=%d, n_jobs=%d", n_perms, n_jobs)
+
+            if n_jobs == 1:
+                permuted_acc = [
+                    _one_perm(s)
+                    for s in tqdm(seeds, total=n_perms, disable=tqdm_disabled())
+                ]
+            else:
+                with tqdm_joblib(tqdm(total=n_perms, disable=tqdm_disabled())):
+                    permuted_acc = Parallel(
+                        n_jobs=n_jobs,
+                        backend=par_cfg.get("backend", "loky"),
+                        prefer=par_cfg.get("prefer", "processes"),
+                        batch_size=par_cfg.get("batch_size", 16),
+                        verbose=par_cfg.get("verbose", 0),
+                    )([delayed(_one_perm)(s) for s in seeds])
         else:
-            with tqdm_joblib(
-                tqdm(
-                    total=n_perms,
-                    disable=utils.tqdm_disabled()
-                )
-            ):
-                permuted_acc = Parallel(
-                    n_jobs=n_jobs,
-                    backend=par_cfg.get("backend", "loky"),
-                    prefer=par_cfg.get("prefer", "processes"),
-                    batch_size=par_cfg.get("batch_size", 16),
-                    verbose=par_cfg.get("verbose", 0)
-                )([delayed(_one_perm)(s) for s in seeds])
+            permuted_acc = []
 
-        permuted_acc = np.asarray(permuted_acc, dtype=float)
-        n_run = len(permuted_acc)
+        permuted = np.asarray(permuted_acc, dtype=float)
+        n_run = len(permuted)
 
-        # aggregate
-        mean_permuted_acc = float(np.mean(permuted_acc)) if n_run else float("nan")
-        delta = float(observed_acc - mean_permuted_acc)
-        p_val = (np.sum(permuted_acc >= observed_acc) + 1) / (n_run + 1) if n_run else 1.0
+        mean_permuted = float(np.nanmean(permuted)) if n_run else float("nan")
+        delta = float(observed_acc - mean_permuted) if n_run else float("nan")
 
-        logger.info("Permutation complete. Null acc: %.4f | Observed acc: %.4f | Δ=%.4f | p=%.4f | n_run=%d",
-                    np.nanmean(permuted_acc) if n_run else float("nan"),
-                    observed_acc, delta, p_val, n_run)
+        if n_run:
+            if higher_is_better:
+                p_val = (np.sum(permuted >= observed_acc) + 1) / (n_run + 1)
+            else:
+                p_val = (np.sum(permuted <= observed_acc) + 1) / (n_run + 1)
+        else:
+            p_val = float("nan")
+
+        logger.info(
+            "%s complete. Observed=%.4f | Null=%.4f | Δ=%.4f | p=%s | n_run=%d",
+            score_name,
+            observed_acc,
+            mean_permuted,
+            delta,
+            f"{p_val:.4f}" if np.isfinite(p_val) else "nan",
+            n_run,
+        )
 
         ddict = {
+            "analysis": score_name,
             "observed": float(observed_acc),
-            "permuted": permuted_acc,
-            "mean_permuted": float(mean_permuted_acc),
-            "delta": float(delta),
+            "permuted": permuted,
+            "mean_permuted": mean_permuted,
+            "delta": delta,
             "p": float(p_val),
             "n_run": int(n_run),
-            "n_perms": int(n_perms),
+            "n_perms": int(n_perms) if do_permutations else 0,
+            "permutations": bool(do_permutations),
+            "higher_is_better": bool(higher_is_better),
         }
 
         return ddict
 
 
-def _searchlight_outputs_exist(sl_dir):
+def _searchlight_outputs_exist(sl_dir, hemi_key=None):
+
+    if hemi_key is None or hemi_key == "uni":
+        base = "searchlight"
+    else:
+        base = f"searchlight_hemi-{hemi_key}"
+
     expected = [
-        "searchlight_observed.nii.gz",
-        "searchlight_null_mean.nii.gz",
-        "searchlight_delta.nii.gz",
-        "searchlight_pvalue.nii.gz",
-        "searchlight_nfeatures.nii.gz",
-        "searchlight_desc-metadata.json",
+        f"{base}_observed.nii.gz",
+        f"{base}_null_mean.nii.gz",
+        f"{base}_delta.nii.gz",
+        f"{base}_pvalue.nii.gz",
+        f"{base}_nfeatures.nii.gz",
+        f"{base}_desc-metadata.json",
     ]
-    return all(os.path.exists(opj(sl_dir, f)) for f in expected)
+
+    all_exist = all(os.path.exists(opj(sl_dir, f)) for f in expected)
+    return all_exist, [opj(sl_dir, f) for f in expected]
         
         
 class ClassifySubject(data.PrepareBetas):
@@ -380,7 +440,7 @@ class ClassifySubject(data.PrepareBetas):
         # load settings
         logger.info(f"Running decoding for {self.subject}")
         logger.info(f"Loading settings from {self.config_file}")
-        self.cfg = utils.load_yaml(self.config_file)
+        self.cfg = load_yaml(self.config_file)
 
         # append subject to save_dir
         self.gen_settings = self.cfg["general_settings"]
@@ -397,7 +457,15 @@ class ClassifySubject(data.PrepareBetas):
             "feature_selection": None,
             "gridsearch": None
         }
-        self.save_dir = opj(self.gen_settings["save_dir"], self.subject)
+
+        # set output directory based on analysis name
+        # e.g., 'decoding'/'cs_us_similarity'/'dimensionality'
+        self.save_dir = opj(
+            self.gen_settings["save_dir"],
+            self.dec_settings["analysis"].get("name", "decoding"),
+            self.subject
+        )
+
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
     
@@ -680,7 +748,7 @@ class ClassifySubject(data.PrepareBetas):
                 return None
 
             # outer folds
-            folds = utils._folds_for_labels(
+            folds = _folds_for_labels(
                 self.dec_settings,
                 extract.labels,
                 groups
@@ -695,6 +763,7 @@ class ClassifySubject(data.PrepareBetas):
                     extract.labels,
                     folds,
                     self.dec_settings,
+                    label_mapper=label_mapper,
                     groups=groups,
                     roi_linidx=extract.roi_linidx,
                     **kwargs
@@ -717,6 +786,7 @@ class ClassifySubject(data.PrepareBetas):
                     label_mapper, 
                     self.dec_settings_searchlight,
                     groups=groups,
+                    output_file=output_file,
                     **kwargs
                 )
             except (NoFeaturesSelectedError, ValueError) as e:
@@ -739,6 +809,7 @@ class ClassifySubject(data.PrepareBetas):
 
         is_labels = False
         roi_dict = self.cfg["roi_dict"]
+        run_dict = {}
         if isinstance(roi_dict, str):
             assert os.path.exists(roi_dict), FileNotFoundError(f"Input ROI-directory '{roi_dict}' does not exist")
             if os.path.isdir(roi_dict):
@@ -759,21 +830,21 @@ class ClassifySubject(data.PrepareBetas):
                     if len(mask_files)<1:
                         raise ValueError(f"ROI-list from '{roi_dict}' with extension '{extension}' is empty..")
                     
-                run_dict = {}
                 n_digits = len(str(len(mask_files)))
                 for ix, m in enumerate(mask_files):
                     lbl = f"mask_{str(ix+1).zfill(n_digits)}"
                     run_dict[lbl] = m
-
-            elif isinstance(roi_dict, dict):
-                logger.info(f"Defining ROIs dictionary: '{roi_dict}'")
-                run_dict = roi_dict
-                is_labels = True                    
             else:
                 logger.info(f"Defining single ROI from file: '{roi_dict}'")
                 run_dict = {
                     "mask_1": self.cfg["roi_dict"]
                 }
+        elif isinstance(roi_dict, dict):
+            logger.info(f"Defining ROIs dictionary: '{roi_dict}'")
+            run_dict = roi_dict
+            is_labels = True                    
+        else:
+            raise TypeError(f"roi_dict input must be a dict or str, not {type(roi_dict)}")
         
         assert len(run_dict)>0, ValueError(f"No ROIs were detected using: '{roi_dict}'")
         return run_dict, is_labels
@@ -873,21 +944,15 @@ class ClassifySubject(data.PrepareBetas):
                 # Searchlight mode has one output directory per ROI/mask.
                 # Check completion here, because roi_dir depends on h_val.
                 if self.searchlight:
-                    sl_dir = opj(roi_dir, "searchlight")
-                    if _searchlight_outputs_exist(sl_dir) and not overwrite:
+                    sl_dir = opj(roi_dir, self.dec_settings['searchlight'].get("basepath", "searchlight"))
+                    all_exist, sl_files = _searchlight_outputs_exist(sl_dir, hemi_key=h_key)
+                    if all_exist and not overwrite:
                         logger.warning(
                             "Searchlight outputs already exist for ROI '%s'; skipping: %s",
                             h_val[0],
                             sl_dir,
                         )
-                        out_files[h_val[0]] = {
-                            "observed":     opj(sl_dir, "searchlight_observed.nii.gz"),
-                            "null_mean":    opj(sl_dir, "searchlight_null_mean.nii.gz"),
-                            "delta":        opj(sl_dir, "searchlight_delta.nii.gz"),
-                            "pvalue":       opj(sl_dir, "searchlight_pvalue.nii.gz"),
-                            "nfeatures":    opj(sl_dir, "searchlight_nfeatures.nii.gz"),
-                            "metadata":     opj(sl_dir, "searchlight_desc-metadata.json"),
-                        }
+                        out_files[h_val[0]] = sl_files
                         continue
                     else:
                         logger.info(f"Searchlight outputs not found or overwrite=True for ROI '{h_val[0]}'; running searchlight decoding.")
@@ -909,6 +974,7 @@ class ClassifySubject(data.PrepareBetas):
                     output_file=fname,
                     save_dir=roi_dir,
                     tmpdir=self.gen_settings["tmp_dir"],
+                    hemi_key=h_key,
                     **kwargs,
                 )
 
@@ -950,6 +1016,16 @@ class ClassifySubject(data.PrepareBetas):
                 else:
                     out_files[h_val[0]] = ddict
         
+        # copy config file
+        cfg_file = self.generate_filename(
+            desc="config",
+            ext="yml"
+        )        
+        
+        # Writing the data to a YAML file
+        dump_yaml(self.cfg, cfg_file)
+        shutil.copymode(self.config_file, cfg_file)
+
         if not self.searchlight:
             # write null-distributions
             null_df = pd.DataFrame(null)
@@ -967,16 +1043,6 @@ class ClassifySubject(data.PrepareBetas):
             logger.info(f"Writing results to: '{res_file}'")
             res_df.to_csv(res_file, index=False)
             shutil.copymode(self.config_file, res_file)
-
-            # copy config file
-            cfg_file = self.generate_filename(
-                desc="config",
-                ext="yml"
-            )
-
-            # Writing the data to a YAML file
-            utils.dump_yaml(self.cfg, cfg_file)
-            shutil.copymode(self.config_file, cfg_file)
 
             # return results
             return res_df
