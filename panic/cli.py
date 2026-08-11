@@ -189,7 +189,19 @@ def action_run(args):
     for subj in subjects:
 
         # make directory
-        save_dir = opj(loaded_cfg["general_settings"]["save_dir"], subj)
+        gen_settings = loaded_cfg["general_settings"]
+        dec_settings = loaded_cfg["decoding_settings"]
+        analysis = dec_settings["analysis"]
+
+        # name can be different
+        analysis_name = analysis.get("name") or analysis.get("type")
+
+        save_dir = opj(
+            gen_settings["save_dir"],
+            analysis_name,
+            subj,
+        )
+
         os.makedirs(save_dir, exist_ok=True)
         
         # define log file | will be overwritten
