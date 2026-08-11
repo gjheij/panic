@@ -1,34 +1,34 @@
-# label_dict:
-#   USp: 0     # class 1
-#   CSpu: 1    # class 2
-
 label_dict:
-  CSpr: 0
-  CSpu: 1
-  CSm: 2
-  USp: 3
-  USo: 4
-  USm: 5
+  CSm: 0     # class 1
+  CSpu: 1    # class 2
+
+# label_dict:
+#   CSpr: 0
+#   CSpu: 1
+#   CSm: 2
+#   USp: 3
+#   USo: 4
+#   USm: 5
 
 roi_dict:
   lat:  377         # Lateral nucleus
-  # bl:   216         # Basolateral (basal) nucleus
-  # bm:   217         # Basomedial nucleus
-  # cen:  [277, 278]  # Central nucleus
-  # med:  279         # Medial nucleus
-  # pl:   240         # Paralaminar nucleus
+  bl:   216         # Basolateral (basal) nucleus
+  bm:   217         # Basomedial nucleus
+  cen:  [277, 278]  # Central nucleus
+  med:  279         # Medial nucleus
+  pl:   240         # Paralaminar nucleus
 
-  # aaa:  215         # Anterior amygdaloid area
-  # coa:  238         # Cortical amygdaloid nucleus
-  # cat:  242         # Corticoamygdaloid transition area
-  # asta: 295         # Amygdalostriatal transition area
-  # aha:  301         # Amygdalohippocampal area
-  # ahta: 320         # Amygdalohippocampal transition area
+  aaa:  215         # Anterior amygdaloid area
+  coa:  238         # Cortical amygdaloid nucleus
+  cat:  242         # Corticoamygdaloid transition area
+  asta: 295         # Amygdalostriatal transition area
+  aha:  301         # Amygdalohippocampal area
+  ahta: 320         # Amygdalohippocampal transition area
 
-  # nuc: [216, 217, 240, 277, 278, 279, 377]
-  # trans: [242, 295, 301, 320]
+  nuc: [216, 217, 240, 277, 278, 279, 377]
+  trans: [242, 295, 301, 320]
 
-  # total: [215, 216, 217, 238, 240, 242, 277, 278, 279, 295, 301, 320, 377]
+  total: [215, 216, 217, 238, 240, 242, 277, 278, 279, 295, 301, 320, 377]
 
 roi_settings:                   # kwargs passed to data.PrepareROIs()
   src: "freesurfer"             # used in conjunction with {project_dir} below
@@ -39,20 +39,20 @@ roi_settings:                   # kwargs passed to data.PrepareROIs()
 
 general_settings:
   project_dir: "/mnt/d/fMRI/HRA"
-  # save_dir: "/mnt/d/fMRI/Development/HRA/derivatives/panic"
-  save_dir: /tmp/test_searchlight
+  save_dir: "/mnt/d/fMRI/Development/HRA/derivatives/panic"
+  # save_dir: /tmp/test_panic
   tmp_dir: "~/.joblib_cache"    # stores temp memmaps
   method: LSA                   # or LSS, if you have GLMsingle: use 'lss', 'lsa'
   source: stglm                 # or 'stglm', 'glmsingle'
   standardize: zscore           # best to keep this
   filters: task-HRA
-  overwrite: false
+  overwrite: true
+  save_imgs: false
 
 fitted_derivative: false
 
 decoding_settings:
-  fold_interval: 3              # if not LORO/LOSO, iterate over labels
-  n_permutations: 1           # permutations for ROI-decoding/searchlight
+  n_permutations: 1000           # permutations for ROI-decoding/searchlight
   variance_threshold: 1e-12     # avoid flat time series
   permute_both_sets: true       # false: only permute training labels
   permute_within_groups: false  # true: LOSO/LORO set up; see 'outer_cv'
@@ -68,10 +68,42 @@ decoding_settings:
 
   # this field pertains to panic.plugins.PLUGIN_REGISTRY
   # analysis:
-  #   name: decoding
+  #   name: vanilla_nearest_centroid
   #   permutations: true
   #   higher_is_better: true
   #   args: {}
+
+  # analysis:
+  #   name: n_region_nearest_centroid
+  #   permutations: true
+  #   higher_is_better: true
+  #   args:
+  #     n_regions: 6
+  #     linkage: ward
+
+  # analysis:
+  #   name: fixed_n_region_generative
+  #   permutations: true
+  #   higher_is_better: true
+  #   args:
+  #     n_regions: 6
+  #     linkage: ward
+  #     drift_phi: 0.9
+  #     run_offset_ridge: 10.0
+  #     condition_signal_ridge: 1.0
+  #     drift_penalty: 10.0
+  #     min_noise_variance: 0.001
+  #     jitter: 1.0e-8
+  #     max_alternations: 30
+  #     n_random_initializations: 4
+  #     random_state: 42
+  #     run_seed_stride: 1000
+
+  analysis:
+    name: scikit_decoding
+    permutations: true
+    higher_is_better: true
+    args: {}
 
   # analysis:
   #   name: dimensionality
@@ -88,28 +120,28 @@ decoding_settings:
   #     us_label: USp
   #     metric: cosine
 
-  analysis:
-    name: rsa
-    permutations: false
-    higher_is_better: true
-    args:
-      metric: correlation
-      compare: spearman
-      conditions: [CSpr, CSpu, CSm, USp, USo, USm]
-      target_model: contingency
-      model_rdms:
-        contingency:
-          matrix:
-            - [0, 0.25, 1.00, 0.25, 0.50, 1.00]  # CSpr
-            - [0.25, 0, 1.00, 0.50, 0.25, 1.00]  # CSpu
-            - [1.00, 1.00, 0, 1.00, 1.00, 0.25]  # CSm
-            - [0.25, 0.50, 1.00, 0, 0.25, 1.00]  # USp
-            - [0.50, 0.25, 1.00, 0.25, 0, 1.00]  # USo
-            - [1.00, 1.00, 0.25, 1.00, 1.00, 0]  # USm
+  # analysis:
+  #   name: rsa
+  #   permutations: false
+  #   higher_is_better: true
+  #   args:
+  #     metric: correlation
+  #     compare: spearman
+  #     conditions: [CSpr, CSpu, CSm, USp, USo, USm]
+  #     target_model: contingency
+  #     model_rdms:
+  #       contingency:
+  #         matrix:
+  #           - [0, 0.25, 1.00, 0.25, 0.50, 1.00]  # CSpr
+  #           - [0.25, 0, 1.00, 0.50, 0.25, 1.00]  # CSpu
+  #           - [1.00, 1.00, 0, 1.00, 1.00, 0.25]  # CSm
+  #           - [0.25, 0.50, 1.00, 0, 0.25, 1.00]  # USp
+  #           - [0.50, 0.25, 1.00, 0.25, 0, 1.00]  # USo
+  #           - [1.00, 1.00, 0.25, 1.00, 1.00, 0]  # USm
     
-  # # CSpr ~ USp     reinforced CS+ should resemble actual threat
-  # # CSpu ~ USo     unreinforced CS+ should resemble omitted-US timepoint
-  # # CSm  ~ USm     CS− should resemble matched no-threat US timepoint
+  # # # CSpr ~ USp     reinforced CS+ should resemble actual threat
+  # # # CSpu ~ USo     unreinforced CS+ should resemble omitted-US timepoint
+  # # # CSm  ~ USm     CS− should resemble matched no-threat US timepoint
 
   # Pipeline settings: DO NOT CHANGE THE HEADER NAMES ('SCALER', 'CV', 'ESTIMATOR', etc)
   # preprocessing | if 'standardize' is null
@@ -119,18 +151,32 @@ decoding_settings:
       with_mean: true
       with_std: true
 
-  # outer cv
-  outer_cv:
-    name: LeaveOneGroupOut
-    args: {}
+  # # Group-aware outer CV
+  # outer_cv:
+  #   mode: sklearn
+  #   name: LeaveOneGroupOut
+  #   args: {}
 
-  # select test/training labels
-  cv:
+  # outer_cv:
+  #   mode: sklearn
+  #   name: StratifiedKFold
+  #   args:
+  #     n_splits: 5
+  #     shuffle: false
+
+  # Bach-style nth-trial outer CV
+  outer_cv:
+    mode: nth_trial
+    args:
+      fold_interval: 3
+
+  # hyperparameter optimization
+  inner_cv:
     name: StratifiedKFold
     args:
-      n_splits: 3
-      shuffle: False
-
+      n_splits: 5
+      shuffle: false
+      
   # estimator
   estimator:
     name: SVC

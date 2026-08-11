@@ -3,20 +3,43 @@ import numpy as np
 
 from sklearn.decomposition import PCA
 from sklearn.model_selection import (
-    StratifiedKFold, RepeatedStratifiedKFold, StratifiedShuffleSplit,
-    GroupKFold, StratifiedGroupKFold, LeaveOneGroupOut, LeavePGroupsOut,
-    TimeSeriesSplit, PredefinedSplit,
-    GridSearchCV, RandomizedSearchCV, HalvingGridSearchCV, HalvingRandomSearchCV
+    StratifiedKFold,
+    RepeatedStratifiedKFold,
+    StratifiedShuffleSplit,
+    GroupKFold,
+    StratifiedGroupKFold,
+    LeaveOneGroupOut,
+    LeavePGroupsOut,
+    TimeSeriesSplit,
+    PredefinedSplit,
+    GridSearchCV,
+    RandomizedSearchCV,
+    HalvingGridSearchCV,
+    HalvingRandomSearchCV
 )
 
 from sklearn.feature_selection import (
-    SelectKBest, SelectPercentile, SelectFromModel, RFE, RFECV, VarianceThreshold,
-    f_classif, f_regression, chi2, mutual_info_classif, mutual_info_regression
+    SelectKBest,
+    SelectPercentile,
+    SelectFromModel,
+    RFE,
+    RFECV,
+    VarianceThreshold,
+    f_classif,
+    f_regression,
+    chi2,
+    mutual_info_classif,
+    mutual_info_regression
 )
 
 from sklearn.preprocessing import (
-    StandardScaler, MinMaxScaler, RobustScaler, MaxAbsScaler,
-    QuantileTransformer, PowerTransformer, Normalizer
+    StandardScaler,
+    MinMaxScaler,
+    RobustScaler,
+    MaxAbsScaler,
+    QuantileTransformer,
+    PowerTransformer,
+    Normalizer
 )
 
 from sklearn.discriminant_analysis import (
@@ -30,8 +53,13 @@ from sklearn.naive_bayes import (
     MultinomialNB
 )
 
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neighbors import (
+    KNeighborsClassifier,
+    NearestCentroid
+)
+
 from sklearn.tree import DecisionTreeClassifier
+
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     GradientBoostingClassifier,
@@ -40,8 +68,12 @@ from sklearn.ensemble import (
 )
 
 from sklearn.metrics import (
-    make_scorer, accuracy_score, balanced_accuracy_score, f1_score,
-    matthews_corrcoef, cohen_kappa_score
+    make_scorer,
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    matthews_corrcoef,
+    cohen_kappa_score
 )
 
 from sklearn.gaussian_process import GaussianProcessClassifier
@@ -102,6 +134,7 @@ _ESTIMATOR_REGISTRY = {
 
     # Neighbors
     "KNeighborsClassifier": KNeighborsClassifier,
+    "NearestCentroid": NearestCentroid,
 
     # Trees & ensembles
     "DecisionTreeClassifier": DecisionTreeClassifier,
@@ -244,21 +277,87 @@ def scaler_from_config(cfg: dict | None):
 
     return cls(**args)
 
+
 def cv_from_config(cfg):
-    """cfg like {'name': 'StratifiedKFold', 'args': {'n_splits': 3, 'shuffle': False}}"""
+    """Construct a cross-validation splitter from configuration.
+
+    Parameters
+    ----------
+    cfg : dict
+        Cross-validation configuration with the structure::
+
+            {
+                "name": "StratifiedKFold",
+                "args": {
+                    "n_splits": 5,
+                    "shuffle": False,
+                },
+            }
+
+        ``name`` must correspond to an entry in ``_CV_REGISTRY``.
+        ``args`` are forwarded to the splitter constructor after validation.
+
+    Returns
+    -------
+    sklearn.model_selection.BaseCrossValidator
+        Instantiated cross-validation splitter.
+
+    Raises
+    ------
+    TypeError
+        If ``cfg`` is not a dictionary or contains constructor arguments
+        unsupported by the selected splitter.
+    ValueError
+        If the requested splitter is not registered.
+    KeyError
+        If ``name`` is missing from the configuration.
+    """
+    if not isinstance(cfg, dict):
+        raise TypeError(
+            f"`cfg` must be a dictionary, got {type(cfg).__name__}."
+        )
+
     name = cfg["name"]
     args = dict(cfg.get("args", {}))
+
     if name not in _CV_REGISTRY:
-        raise ValueError(f"Unknown CV splitter: {name}")
+        raise ValueError(
+            f"Unknown CV splitter {name!r}. "
+            f"Available splitters: {sorted(_CV_REGISTRY)}"
+        )
+
     cls = _CV_REGISTRY[name]
 
-    # filter unknown kwargs to fail-fast with a clear error message
+    # Validate constructor arguments before instantiation.
     sig = inspect.signature(cls.__init__)
-    extra = set(args) - set(sig.parameters)
-    if extra:
-        raise TypeError(f"{name} got unexpected args: {sorted(extra)}")
+    parameters = sig.parameters
+
+    accepts_kwargs = any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in parameters.values()
+    )
+
+    if not accepts_kwargs:
+        valid_args = {
+            key
+            for key, param in parameters.items()
+            if key != "self"
+            and param.kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        }
+
+        extra = set(args) - valid_args
+
+        if extra:
+            raise TypeError(
+                f"{name} got unexpected args: {sorted(extra)}"
+            )
 
     return cls(**args)
+
 
 def _scorer_needs_proba(scoring: str | object) -> bool:
     # Strings that sklearn handles natively and need proba/decision_function
@@ -430,3 +529,8 @@ def selector_from_config(cfg, estimator_factory=None, *, task=None, random_state
         raise TypeError(f"{name} got unexpected args: {sorted(extra)}")
 
     return cls(**args)
+
+def _splitter_accepts_groups(cv):
+    """Return whether ``cv.split`` accepts a groups argument."""
+    signature = inspect.signature(cv.split)
+    return "groups" in signature.parameters

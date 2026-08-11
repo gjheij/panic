@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from panic import data
 from panic.logger import get_logger, tqdm_joblib
-from panic.pipeline import _folds_for_labels
+from panic.pipeline import create_outer_folds
 from panic.plugins import core
 from panic.utils import tqdm_disabled
 
@@ -322,7 +322,7 @@ def _one_center(
                 plugin(
                     X_mm_path,
                     labels,
-                    cfg,
+                    cfg=cfg,
                     folds=folds,
                     cols=cols,
                     rng=np.random.default_rng(int(s)),
@@ -444,7 +444,7 @@ def permutation_searchlight(
         1. Build features and labels within ``ROI ∩ valid`` using
            :class:`data.MaskAndFilterBetas`.
         2. Create a voxel-to-column index volume and enumerate centers (ROI voxels).
-        3. Generate outer folds via :func:`_folds_for_labels` to mirror the ROI path.
+        3. Generate outer folds via :func:`create_outer_folds` to mirror the ROI path.
         4. Memmap the full ROI feature matrix once; compute searchlight offsets with
            :func:`_neighbors_ball_mm`.
         5. For each center, call :func:`_one_center` to compute observed score and
@@ -545,7 +545,7 @@ def permutation_searchlight(
     centers = np.column_stack(np.where(col_index_vol >= 0))  # shape (N, 3)
 
     # 2) folds exactly like ROI path
-    folds = _folds_for_labels(cfg, y, groups)
+    folds = create_outer_folds(cfg, y, groups=groups)
 
     # 3) memmap X once
     if tmpdir is None:

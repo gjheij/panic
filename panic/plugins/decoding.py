@@ -8,7 +8,19 @@ import os
 import numpy as np
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
-from panic.pipeline import _cv_mean_score
+from panic.pipeline import (
+    sklearn_pipeline_score,
+    load_feature_matrix,
+    cv_mean_function_score
+)
+
+
+from .spatially_informed import (
+    vanilla_nearest_centroid_score,
+    n_region_nearest_centroid_score,
+    fixed_six_region_generative_score,
+)
+
 
 opj = os.path.join
 
@@ -108,19 +120,309 @@ def decoding_plugin(
     cosine_similarity_plugin
         CS-to-US representational similarity analysis.
     """
-    score = _cv_mean_score(
-        X_path,
+
+    X = load_feature_matrix(X_path, cols=cols)
+    score = cv_mean_function_score(
+        X,
         labels,
         folds,
+        sklearn_pipeline_score,
+        groups=groups,
+        permute=permute,
+        rng=rng,
+        cfg=cfg,
+        **kwargs,
+    )
+
+    return (score, {}) if return_artifacts else score
+
+
+def vanilla_nearest_centroid_plugin(
+        X_path,
+        labels,
         cfg,
-        cols=cols,
+        *,
+        folds=None,
+        groups=None,
+        permute=False,
+        rng=None,
+        return_artifacts=False,
+        **kwargs,
+    ):
+    """
+    Perform cross-validated voxel-level nearest-centroid decoding.
+
+    This plugin evaluates :func:`vanilla_nearest_centroid_score` independently
+    on each supplied train/test fold and returns the mean balanced accuracy
+    across folds.
+
+    Parameters
+    ----------
+    X_path : array-like
+        Trial-by-feature matrix with shape ``(n_samples, n_features)``.
+    labels : array-like of shape (n_samples,)
+        Binary class labels aligned to rows of ``X_path``.
+    cfg : mapping
+        Analysis configuration. Included for plugin-interface compatibility.
+    folds : iterable of tuple(ndarray, ndarray)
+        Cross-validation folds supplied as ``(train_idx, test_idx)`` pairs.
+    cols : array-like of int, optional
+        Included for plugin-interface compatibility. Currently unused.
+    groups : array-like, optional
+        Included for plugin-interface compatibility. Currently unused.
+    permute : bool, default=False
+        Included for plugin-interface compatibility. Label permutation is
+        expected to be handled externally.
+    rng : numpy.random.Generator, optional
+        Included for plugin-interface compatibility. Currently unused.
+    return_artifacts : bool, default=False
+        If True, return ``(score, {})`` instead of only the scalar score.
+    **kwargs
+        Additional plugin arguments. Currently unused.
+
+    Returns
+    -------
+    float or tuple
+        Mean balanced accuracy across the supplied folds. If
+        ``return_artifacts=True``, returns ``(score, {})``.
+
+    See Also
+    --------
+    vanilla_nearest_centroid_score
+        Scores a single train/test split.
+    """
+    if folds is None:
+        raise ValueError("vanilla_nearest_centroid requires folds.")
+
+    X = load_feature_matrix(X_path)
+
+    score = cv_mean_function_score(
+        X,
+        labels,
+        folds,
+        vanilla_nearest_centroid_score,
         groups=groups,
         permute=permute,
         rng=rng,
         **kwargs,
     )
 
-    if return_artifacts:
-        return float(score), {}
+    return (score, {}) if return_artifacts else score
 
-    return float(score)
+
+def n_region_nearest_centroid_plugin(
+        X_path,
+        labels,
+        *,
+        folds=None,
+        cols=None,
+        groups=None,
+        permute=False,
+        rng=None,
+        return_artifacts=False,
+        mask=None,
+        **kwargs,
+    ):
+    """
+    Perform cross-validated nearest-centroid decoding on spatial regions.
+
+    The ROI voxels are reduced to contiguous spatial regions within each fold
+    by :func:`n_region_nearest_centroid_score`. The resulting fold-wise
+    balanced accuracies are averaged to produce the plugin score.
+
+    Parameters
+    ----------
+    X_path : array-like
+        Trial-by-voxel feature matrix with shape
+        ``(n_samples, n_voxels)``.
+    labels : array-like of shape (n_samples,)
+        Binary class labels aligned to rows of ``X_path``.
+    cfg : mapping
+        Analysis configuration. Included for plugin-interface compatibility.
+    folds : iterable of tuple(ndarray, ndarray)
+        Cross-validation folds supplied as ``(train_idx, test_idx)`` pairs.
+    cols : array-like of int, optional
+        Feature subset used by searchlight analyses. This decoder does not
+        currently support ``cols`` because ``mask`` must correspond exactly
+        to the columns of ``X_path``.
+    groups : array-like, optional
+        Included for plugin-interface compatibility. Currently unused.
+    permute : bool, default=False
+        Included for plugin-interface compatibility. Label permutation is
+        expected to be handled externally.
+    rng : numpy.random.Generator, optional
+        Included for plugin-interface compatibility. Currently unused.
+    return_artifacts : bool, default=False
+        If True, return ``(score, {})`` instead of only the scalar score.
+    mask : str or path-like
+        ROI NIfTI mask whose nonzero voxels correspond to the feature columns
+        in ``X_path``.
+    **kwargs
+        Additional plugin arguments. Currently unused.
+
+    Returns
+    -------
+    float or tuple
+        Mean balanced accuracy across the supplied folds. If
+        ``return_artifacts=True``, returns ``(score, {})``.
+
+    Raises
+    ------
+    ValueError
+        If ``mask`` or ``folds`` is not supplied, or if ``cols`` is used.
+
+    See Also
+    --------
+    n_region_nearest_centroid_score
+        Scores one train/test split after spatial region reduction.
+    """
+
+    if folds is None:
+        raise ValueError("n_region_nearest_centroid_plugin requires folds.")
+
+    if mask is None:
+        raise ValueError(
+            "n_region_nearest_centroid_plugin requires mask=<ROI mask>."
+        )
+
+    if cols is not None:
+        raise ValueError(
+            "n_region_nearest_centroid_plugin cannot currently be used with "
+            "cols/searchlight because the mask must correspond exactly "
+            "to the feature columns."
+        )
+
+    X = load_feature_matrix(X_path)
+
+    score = cv_mean_function_score(
+        X,
+        labels,
+        folds,
+        n_region_nearest_centroid_score,
+        groups=groups,
+        permute=permute,
+        rng=rng,
+        mask_path=mask,
+        **kwargs,
+    )
+
+    return (score, {}) if return_artifacts else score
+
+
+def fixed_n_region_generative_plugin(
+        X_path,
+        labels,
+        *,
+        folds=None,
+        cols=None,
+        groups=None,
+        permute=False,
+        rng=None,
+        return_artifacts=False,
+        mask=None,
+        trial_order_path=None,
+        **kwargs,
+    ):
+    """
+    Perform cross-validated spatially informed generative decoding.
+
+    This plugin evaluates :func:`fixed_six_region_generative_score` on each
+    supplied train/test fold and returns the mean balanced accuracy. The
+    original labels are retained separately so the feature rows can remain
+    aligned with the chronological trial-order metadata when fitting with
+    permuted labels.
+
+    Parameters
+    ----------
+    X_path : array-like
+        Trial-by-voxel feature matrix with shape
+        ``(n_samples, n_voxels)``.
+    labels : array-like of shape (n_samples,)
+        Binary labels used for model fitting and scoring.
+    cfg : mapping
+        Analysis configuration. Included for plugin-interface compatibility.
+    folds : iterable of tuple(ndarray, ndarray)
+        Cross-validation folds supplied as ``(train_idx, test_idx)`` pairs.
+    cols : array-like of int, optional
+        Feature subset used by searchlight analyses. This decoder does not
+        currently support ``cols`` because ``mask`` must correspond exactly
+        to the columns of ``X_path``.
+    groups : array-like, optional
+        Included for plugin-interface compatibility. Currently unused.
+    permute : bool, default=False
+        Included for plugin-interface compatibility. Permuted labels may be
+        supplied through ``labels`` while their original ordering is retained
+        for trial-order alignment.
+    rng : numpy.random.Generator, optional
+        Included for plugin-interface compatibility. Currently unused.
+    return_artifacts : bool, default=False
+        If True, return ``(score, {})`` instead of only the scalar score.
+    mask : str or path-like
+        ROI NIfTI mask whose nonzero voxels correspond to the feature columns
+        in ``X_path``.
+    trial_order_path : str or path-like
+        CSV containing the chronological trial metadata required by the
+        generative decoder.
+    **kwargs
+        Additional keyword arguments forwarded to
+        :func:`fixed_six_region_generative_score`.
+
+    Returns
+    -------
+    float or tuple
+        Mean balanced accuracy across the supplied folds. If
+        ``return_artifacts=True``, returns ``(score, {})``.
+
+    Raises
+    ------
+    ValueError
+        If ``mask``, ``trial_order_path``, or ``folds`` is not supplied, or
+        if ``cols`` is used.
+
+    Notes
+    -----
+    ``original_labels`` is preserved separately from the fitting labels and
+    passed as ``alignment_labels``. This allows permutation analyses to alter
+    the labels used by the model without losing the original correspondence
+    between feature rows and the chronological trial-order CSV.
+
+    See Also
+    --------
+    fixed_six_region_generative_score
+        Scores one train/test split with the spatial generative model.
+    """
+
+    if folds is None:
+        raise ValueError("fixed_n_region_generative_plugin requires folds.")
+
+    if mask is None:
+        raise ValueError(
+            "fixed_n_region_generative_plugin requires mask=<ROI mask>."
+        )
+
+    if cols is not None:
+        raise ValueError(
+            "fixed_n_region_generative_plugin cannot currently be used with "
+            "cols/searchlight because the mask must correspond exactly "
+            "to the feature columns."
+        )
+
+    # IMPORTANT: retain the original labels separately.
+    original_labels = np.asarray(labels).ravel().copy()
+    X = load_feature_matrix(X_path)
+
+    score = cv_mean_function_score(
+        X,
+        labels,
+        folds,
+        fixed_six_region_generative_score,
+        groups=groups,
+        permute=permute,
+        rng=rng,
+        mask_path=mask,
+        trial_order_path=trial_order_path,
+        alignment_labels=original_labels,
+        **kwargs,
+    )
+
+    return (score, {}) if return_artifacts else score

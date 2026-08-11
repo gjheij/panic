@@ -24,6 +24,10 @@ from sklearn.feature_selection import (
 )
 from sklearn.pipeline import Pipeline
 
+from typing import Any, Callable, Optional
+FoldScoreFunction = Callable[..., float]
+
+
 logger = get_logger(__name__)
 opj = os.path.join
 
@@ -48,6 +52,7 @@ def pipeline_from_config(
         labels=None,
         scoring=None,
         locked=None,
+        **kwargs
     ):
     """
     Construct a decoding pipeline from configuration.
@@ -194,20 +199,29 @@ def pipeline_from_config(
 
     # 6) Optional grid/random search (ROI path only)
     gs_cfg = cfg.get("gridsearch")
+
     if gs_cfg:
-        # Inner CV from cfg
-        inner_cv = factory.cv_from_config(cfg.get("cv"))
+        inner_cv_cfg = cfg.get("inner_cv")
 
-        # If grid args don't specify scoring but top-level does, propagate it
-        if "args" in gs_cfg and "scoring" not in gs_cfg["args"] and "scoring" in cfg:
-            gs_cfg = {**gs_cfg, "args": {**gs_cfg["args"], "scoring": cfg["scoring"]}}
+        if inner_cv_cfg is None:
+            raise ValueError(
+                "`inner_cv` must be configured when grid search is enabled."
+            )
 
-        # raise error if NaN
+        inner_cv = factory.cv_from_config(inner_cv_cfg)
+
         gs_args = dict(gs_cfg.get("args", {}))
+
+        if "scoring" not in gs_args and "scoring" in cfg:
+            gs_args["scoring"] = cfg["scoring"]
+
         gs_args.setdefault("error_score", "raise")
-        gs_cfg = {**gs_cfg, "args": gs_args}
-        
-        # generate GridsearchCV
+
+        gs_cfg = {
+            **gs_cfg,
+            "args": gs_args,
+        }
+
         pipe = factory.search_from_config(
             estimator=pipe,
             cv=inner_cv,
@@ -289,212 +303,66 @@ def _permute_within_groups(y, g, rng):
     return y_perm
 
 
-def _cv_mean_score(
-        X_path,
+def sklearn_pipeline_score(
+        X,
         labels,
-        folds,
-        cfg,
+        train_idx,
+        test_idx,
         *,
-        cols=None,
-        groups=None,
-        standardize=True,
-        permute=False,
-        permute_both_sets=True,
-        permute_within_groups=True,
-        rng=None,
-        save_dir=None,
-        roi_linidx=None,
-        **kwargs
-    ):
-    """
-    Compute the mean cross-validated decoding score across user-specified folds.
-
-    This function performs outer-loop evaluation for ROI-based or searchlight decoding.
-    For each fold, it builds a full decoding pipeline using
-    :func:`pipeline_from_config`, fits on the training data, and scores on the
-    test data. When ``permute=True``, it performs label permutations to estimate
-    a null-distribution sample under the hypothesis of no label–feature
-    relationship.
-
-    The same scoring metric (configured via ``cfg['scoring']`` or
-    :func:`factory.scorer_from_config`) is used for both observed and permuted
-    evaluations, ensuring consistency between model optimization (e.g., during
-    grid search) and final scoring.
-
-    Parameters
-    ----------
-    X_path : str or Path
-        Path to a ``joblib`` dump of a memory-mapped feature matrix
-        ``(n_samples, n_features)``.
-    labels : array-like of shape (n_samples,)
-        Integer or categorical labels aligned with rows in ``X``.
-    folds : list of tuple(ndarray, ndarray)
-        List of (train_idx, test_idx) splits defining the outer cross-validation
-        scheme (e.g., leave-one-run-out, leave-one-subject-out).
-    cfg : dict
-        Configuration dictionary controlling decoding parameters and pipeline
-        construction. Passed to :func:`pipeline_from_config`.
-    cols : array-like of int, optional
-        Optional subset of feature columns to evaluate. If provided, the local
-        feature matrix ``X[:, cols]`` is materialized once in RAM before the CV
-        loop. This is intended for searchlight decoding and avoids repeated
-        memmap slicing across folds/permutations. ROI decoding should leave this
-        as ``None``.
-    groups : array-like of shape (n_samples,), optional
-        Optional grouping labels (e.g., run or subject IDs). Used both for
-        stratified or grouped CV and for within-group label permutations.
-    standardize : bool, default=True
-        If True, enables the scaling step in the pipeline. When False, scaling
-        is skipped (equivalent to a "passthrough" scaler).
-    permute : bool, default=False
-        If True, permutes labels in each fold to compute a null score.
-    permute_both_sets : bool, default=True
-        If True, permutes both training and test labels within each fold.
-        If False, permutes only training labels (recommended for
-        most decoding-based null distributions).
-    permute_within_groups : bool, default=True
-        If True and ``groups`` are provided, permutations are restricted
-        to within-group shuffles via :func:`_permute_within_groups`.
-        If False, labels are permuted globally using ``rng.permutation``.
-    rng : numpy.random.Generator, optional
-        Random number generator controlling label shuffling and per-model
-        random_state seeds. If None and ``permute=True``, a default generator
-        is created via :func:`numpy.random.default_rng()`.
-    save_dir : str or Path, optional
-        If provided and ``permute=False``, per-fold artifacts (fitted pipeline,
-        metadata) are stored under ``save_dir/fold-XX`` using :func:`_save_pipeline`.
-    roi_linidx : numpy.ndarray, optional
-        Linear voxel indices corresponding to the ROI mask for saving fold outputs.
-    **kwargs
-        Additional keyword arguments forwarded to :func:`pipeline_from_config`
-        (e.g., estimator- or searchlight-specific parameters). ``locked_params``
-        may be used to disable grid search in searchlight mode.
-
-    Returns
-    -------
-    float
-        Mean cross-validation score across folds.
-
-    Notes
-    -----
-    - A new pipeline is instantiated for each fold. If ``permute=True``, the
-      same RNG is used to derive an integer ``random_state`` for that instance,
-      ensuring reproducible results across permutations.
-    - If the pipeline (or inner estimator) supports a ``groups`` argument
-      (checked via :func:`sklearn.utils.validation.has_fit_parameter` or
-      subclassing :class:`sklearn.model_selection.BaseSearchCV`), ``groups`` are
-      passed to ``fit`` automatically.
-    - Scoring consistency:
-        * The same scorer is used for both observed and permuted evaluations.
-        * Grid search (if configured) inherits the same scoring metric unless
-          explicitly overridden in ``cfg['gridsearch']['args']``.
-
-    Example
-    -------
-    .. code-block:: python
-
-        folds = [(tr, te) for tr, te in logo.split(X_idx, y, groups)]
-        mean_score = _cv_mean_score(
-            X_path="/path/to/X.dump",
-            labels=y,
-            folds=folds,
-            cfg=cfg,
-            groups=groups,
-            permute=False,
-            save_dir="results/run-01",
-            roi_linidx=roi_idx,
-        )
-        print(f"Mean CV {cfg['scoring']}: {mean_score:.3f}")
-
-    See Also
-    --------
-    pipeline_from_config : Build scaler → selector → estimator pipeline.
-    _permute_within_groups : Shuffle labels within group boundaries.
-    _save_pipeline : Persist fitted models and metadata.
-    """
-    
-    X_eval = load_feature_matrix(X_path, cols=cols)
-    y = np.asarray(labels)
-    g_full = None if groups is None else np.asarray(groups)
-    
-    if rng is None and permute:
-        rng = np.random.default_rng()
-
-    # These objects do not change across folds; creating them inside the fold
-    # loop is expensive for searchlight analyses.
-    scorer = factory.scorer_from_config(cfg.get("scoring", "balanced_accuracy"))
-    template_random_state = int(rng.integers(2**31 - 1)) if rng is not None else None
-    template_clf = pipeline_from_config(
         cfg,
-        random_state=template_random_state,
-        labels=labels,
-        scoring=scorer,
-        **kwargs
+        groups=None,
+        rng=None,
+        **kwargs,
+    ) -> float:
+    """Fit and score one train/test split using a configured sklearn pipeline."""
+    random_state = (
+        int(rng.integers(2**31 - 1))
+        if rng is not None
+        else None
     )
 
-    fold_scores = []
-    for f_ix, (train_idx, test_idx) in enumerate(folds):
-        
-        fold_dir = None
-        if isinstance(save_dir, str):
-            fold_dir = opj(save_dir, f"fold-{str(f_ix).zfill(len(str(len(folds))))}")
-            os.makedirs(fold_dir, exist_ok=True)
+    scorer = factory.scorer_from_config(
+        cfg.get("scoring", "balanced_accuracy")
+    )
 
-        y_tr = y[train_idx]
-        y_te = y[test_idx]
-        g_tr = None if g_full is None else g_full[train_idx]
-        g_te = None if g_full is None else g_full[test_idx]
+    clf = pipeline_from_config(
+        cfg,
+        random_state=random_state,
+        labels=labels,
+        scoring=scorer,
+        **kwargs,
+    )
 
-        if permute:
-            if permute_within_groups and g_full is not None:
-                y_tr_perm = _permute_within_groups(y_tr, g_tr, rng)
-                y_te_perm = _permute_within_groups(y_te, g_te, rng) if permute_both_sets else y_te
-            else:
-                y_tr_perm = rng.permutation(y_tr)
-                y_te_perm = rng.permutation(y_te) if permute_both_sets else y_te
+    X_train = X[train_idx]
+    X_test  = X[test_idx]
+    y_train = labels[train_idx]
+    y_test  = labels[test_idx]
+
+    groups_train = (
+        None
+        if groups is None
+        else np.asarray(groups)[train_idx]
+    )
+
+    supports_groups = (
+        isinstance(clf, BaseSearchCV)
+        or has_fit_parameter(clf, "groups")
+    )
+
+    try:
+        if groups_train is not None and supports_groups:
+            clf.fit(
+                X_train,
+                y_train,
+                groups=groups_train,
+            )
         else:
-            y_tr_perm = y_tr
-            y_te_perm = y_te
+            clf.fit(X_train, y_train)
 
-        # Clone a prebuilt template instead of reconstructing the pipeline
-        # from config for every fold. This preserves ROI behavior while reducing
-        # searchlight overhead substantially.
-        clf = clone(template_clf)
-        
-        try:
-            supports_groups = isinstance(clf, BaseSearchCV) or has_fit_parameter(clf, "groups")
+        return float(clf.score(X_test, y_test))
 
-            X_tr = X_eval[train_idx]
-            X_te = X_eval[test_idx]
-
-            if g_tr is not None and supports_groups:
-                clf.fit(X_tr, y_tr_perm, groups=g_tr)
-            else:
-                clf.fit(X_tr, y_tr_perm)
-
-            score = clf.score(X_te, y_te_perm)
-
-        except errors.NoFeaturesSelectedError as e:
-            logger.warning(f"Fold {f_ix}: {e} - setting score=NaN")
-            score = np.nan
-
-        fold_scores.append(float(score))
-
-        if not permute:
-            if isinstance(fold_dir, str):
-                _save_pipeline(
-                    clf,
-                    X_eval,
-                    test_idx,
-                    train_idx,
-                    fold_dir,
-                    roi_linidx=roi_linidx
-                )
-
-    mean = float(np.nanmean(fold_scores))
-    if np.isnan(mean):
-        raise errors.NoFeaturesSelectedError("All folds produced 0 features; cannot compute score.")
-    return mean
+    except errors.NoFeaturesSelectedError:
+        return float("nan")
 
 
 def extract_from_pipeline(model, X, test_idx):
@@ -887,136 +755,228 @@ def _save_pipeline(model, X, test_idx, train_idx, output_dir, roi_linidx=None):
         np.save(opj(output_dir, "roi_linidx.npy"), roi_linidx)
 
 
-def _folds_for_labels(cfg, labels, groups=None):
-    """
-    Generate outer cross-validation folds for decoding, supporting both
-    group-based and legacy within-class split schemes.
-
-    This helper determines how outer folds are constructed for decoding analyses,
-    depending on the configuration flags in ``cfg``. It mirrors the ROI decoding
-    pipeline logic while maintaining backward compatibility with legacy
-    “every-kth” splitting for simpler setups.
-
-    Specifically:
-      - When ``permute_within_groups=True``, group-aware CV is performed using
-        a splitter constructed via :func:`factory.cv_from_config`.
-      - When ``permute_within_groups=False``, a deterministic “every-kth”
-        split scheme is used, in which samples are divided within each class.
+def create_outer_folds(cfg, labels, groups=None):
+    """Construct outer train/test folds from the decoding configuration.
 
     Parameters
     ----------
     cfg : dict
-        Decoding configuration dictionary. Expected keys include:
+        Decoding configuration containing an ``outer_cv`` section.
 
-        - ``"permute_within_groups"`` : bool
-            Whether to perform group-aware outer CV (e.g., leave-one-run-out).
-        - ``"outer_cv"`` : dict
-            Cross-validation configuration passed to
-            :func:`factory.cv_from_config` when group-based splitting is used.
-        - ``"fold_interval"`` : int
-            Interval controlling the legacy “every-kth” folding strategy,
-            used when ``permute_within_groups=False``.
+        Standard scikit-learn splitters use::
+
+            outer_cv:
+                name: LeaveOneGroupOut
+                args: {}
+
+        Custom per-class n-th-trial splitting uses::
+
+            outer_cv:
+                mode: nth_trial
+                args:
+                    fold_interval: 3
+
+        If ``mode`` is omitted, ``"sklearn"`` is assumed.
+
     labels : array-like of shape (n_samples,)
-        Class labels for decoding (binary or multiclass). Must be aligned
-        with the feature matrix used elsewhere in decoding.
+        Class labels aligned with the samples being decoded.
+
     groups : array-like of shape (n_samples,), optional
-        Group identifiers used for cross-validation when
-        ``permute_within_groups=True``. Typically corresponds to runs,
-        sessions, or subjects.
+        Group identifiers aligned with ``labels``. Required by group-aware
+        splitters such as ``LeaveOneGroupOut`` and ``GroupKFold``.
 
     Returns
     -------
-    folds : list of tuple(ndarray, ndarray)
-        List of (train_idx, test_idx) pairs defining each outer fold.
-        Each index array contains integer sample indices for the corresponding split.
+    list[tuple[numpy.ndarray, numpy.ndarray]]
+        List of ``(train_idx, test_idx)`` pairs.
 
-    Notes
-    -----
-    **Group-aware mode (``permute_within_groups=True``)**
-        - Uses :func:`factory.cv_from_config(cfg["outer_cv"])` to instantiate
-          a cross-validation splitter (e.g., StratifiedKFold, LeaveOneGroupOut,
-          StratifiedGroupKFold).
-        - Generates folds by calling ``split(dummy_X, labels, groups)``, where
-          ``dummy_X`` is a placeholder array of zeros with length equal to ``labels``.
-        - Ensures group-respecting splits compatible with permutation-based
-          decoding when labels are shuffled within groups.
-
-    **Legacy “every-kth” mode (``permute_within_groups=False``)**
-        - Implements a deterministic split that partitions samples within
-          each class label such that every *k*-th sample (as specified by
-          ``fold_interval``) is used for testing in a distinct fold.
-        - Training indices are all remaining samples not in the current test set.
-        - The number of folds equals the value of ``fold_interval``.
-
-    **Multiclass Behavior**
-        - For multiclass data, the legacy path applies the same “every-kth”
-          logic independently to each class label, ensuring each class
-          contributes approximately equal samples per fold.
-        - When ``permute_within_groups=True``, any valid scikit-learn CV
-          splitter compatible with multiclass labels can be used.
-
-    Examples
-    --------
-    Group-aware outer CV (recommended for ROI decoding):
-
-    >>> cfg = {
-    ...     "permute_within_groups": True,
-    ...     "outer_cv": {"type": "LeaveOneGroupOut"}
-    ... }
-    >>> folds = _folds_for_labels(cfg, labels, groups=runs)
-    >>> print(f"{len(folds)} outer folds generated")
-
-    Legacy “every third” fallback (simple binary or multiclass):
-
-    >>> cfg = {"permute_within_groups": False, "fold_interval": 3}
-    >>> folds = _folds_for_labels(cfg, labels)
-    >>> len(folds)
-    3
-
-    See Also
-    --------
-    factory.cv_from_config : Builds scikit-learn CV splitters from configuration.
-    sklearn.model_selection.StratifiedKFold
-    sklearn.model_selection.LeaveOneGroupOut
-    sklearn.model_selection.StratifiedGroupKFold
-
-    Notes
-    -----
-    - The legacy mode assumes roughly balanced class distributions.
-      It is deterministic and ensures that each sample appears once
-      in the test set across all folds.
-    - The group-aware path is recommended for reproducibility and
-      consistency with ROI-based decoding pipelines.
-    - When labels are permuted within groups during permutation testing,
-      group-aware CV ensures that group boundaries are respected.
+    Raises
+    ------
+    ValueError
+        If labels are empty, labels and groups have different lengths,
+        a group-aware splitter is selected without providing ``groups``,
+        ``fold_interval`` is invalid, a generated fold contains no test
+        samples, or ``outer_cv.mode`` is unknown.
     """
-
     labs = np.asarray(labels)
-    n = len(labs)
-    
-    if cfg.get("permute_within_groups"):
-        cv = factory.cv_from_config(cfg["outer_cv"])
-        dummy_X = np.zeros((n, 1), dtype=int)
-        folds = [(tr, te) for tr, te in (
-            cv.split(dummy_X, labs, groups) if groups is not None else cv.split(dummy_X, labs)
-        )]
+
+    if labs.ndim != 1:
+        labs = labs.ravel()
+
+    n_samples = len(labs)
+
+    if n_samples == 0:
+        raise ValueError("`labels` must contain at least one sample.")
+
+    cv_cfg = cfg.get("outer_cv", {})
+
+    if not cv_cfg:
+        raise ValueError(
+            "No `outer_cv` configuration was provided."
+        )
+
+    mode = cv_cfg.get("mode", "sklearn")
+
+    # --------------------------------------------------------------
+    # Standard scikit-learn CV
+    if mode == "sklearn":
+        if "name" not in cv_cfg:
+            raise ValueError(
+                "`outer_cv.name` is required when mode is 'sklearn'."
+            )
+
+        sklearn_cv_cfg = {
+            "name": cv_cfg["name"],
+            "args": cv_cfg.get("args", {}),
+        }
+
+        logger.info(
+            "Creating outer folds with scikit-learn: %s",
+            sklearn_cv_cfg,
+        )
+
+        cv = factory.cv_from_config(sklearn_cv_cfg)
+
+        dummy_X = np.zeros(
+            (n_samples, 1),
+            dtype=np.uint8,
+        )
+
+        # check if splitter requires groups (e.g., LeaveOneGroupOut)
+        requires_groups = factory._splitter_accepts_groups(cv)
+        groups_arr = None
+        if requires_groups:
+
+            # check if groups were passed
+            if groups is not None:
+                groups_arr = np.asarray(groups)
+
+                if groups_arr.ndim != 1:
+                    groups_arr = groups_arr.ravel()
+
+                if len(groups_arr) != n_samples:
+                    raise ValueError(
+                        "Number of group labels must match number of samples: "
+                        f"{len(groups_arr)} != {n_samples}."
+                    )
+            else:     
+                raise ValueError(
+                    f"{type(cv).__name__} requires `groups`, "
+                    "but no group labels were provided."
+                )
+
+        try:
+            if groups_arr is not None:
+                folds = list(
+                    cv.split(
+                        dummy_X,
+                        labs,
+                        groups=groups_arr,
+                    )
+                )
+            else:
+                folds = list(
+                    cv.split(
+                        dummy_X,
+                        labs,
+                    )
+                )
+
+        except ValueError as exc:
+            raise ValueError(
+                f"Could not construct outer folds with "
+                f"{type(cv).__name__}: {exc}"
+            ) from exc
+
         return folds
 
-    # legacy “every third within class” (your define_folds)
-    k = int(cfg.get("fold_interval", 3))
-    classes = np.unique(labs)
-    folds = []
-    all_idx = np.arange(n)
+    # --------------------------------------------------------------
+    # Bach-style per-class n-th-trial CV
+    if mode == "nth_trial":
+        k = int(
+            cv_cfg.get("args", {}).get(
+                "fold_interval",
+                3,
+            )
+        )
 
-    # Build test sets by taking every k-th index *within each class*, then union across classes
-    per_class_indices = {c: np.where(labs == c)[0] for c in classes}
-    for off in range(k):
-        te_slices = [idxs[off::k] for idxs in per_class_indices.values()]
-        te = np.concatenate(te_slices, dtype=int) if te_slices else np.empty(0, int)
-        tr = np.setdiff1d(all_idx, te, assume_unique=False)
-        folds.append((tr, te))
+        if k < 2:
+            raise ValueError(
+                "`fold_interval` must be >= 2 for nth-trial CV."
+            )
 
-    return folds
+        logger.info(
+            "Creating outer folds with per-class n-th trial: "
+            "interval=%d (Bach et al. 2011)",
+            k,
+        )
+
+        all_idx = np.arange(n_samples)
+
+        per_class_indices = {
+            class_label: np.flatnonzero(
+                labs == class_label
+            )
+            for class_label in np.unique(labs)
+        }
+
+        # double check validity
+        class_counts = {
+            label: len(indices)
+            for label, indices in per_class_indices.items()
+        }
+
+        too_small = {
+            label: count
+            for label, count in class_counts.items()
+            if count < k
+        }
+
+        if too_small:
+            raise ValueError(
+                "`fold_interval` is larger than the number of "
+                f"samples in one or more classes: {too_small}"
+            )
+
+        # create folds
+        folds = []
+
+        for offset in range(k):
+            test_slices = [
+                indices[offset::k]
+                for indices in per_class_indices.values()
+            ]
+
+            test_idx = np.concatenate(test_slices)
+
+            # Preserve original sample/trial order.
+            test_idx = np.sort(test_idx)
+
+            if test_idx.size == 0:
+                raise ValueError(
+                    f"Outer fold {offset} contains no test samples. "
+                    f"`fold_interval={k}` may be too large."
+                )
+
+            train_mask = np.ones(
+                n_samples,
+                dtype=bool,
+            )
+            train_mask[test_idx] = False
+
+            train_idx = all_idx[train_mask]
+
+            folds.append(
+                (train_idx, test_idx)
+            )
+
+        return folds
+
+
+    raise ValueError(
+        f"Unknown outer CV mode {mode!r}. "
+        "Expected 'sklearn' or 'nth_trial'."
+    )
 
 
 def recon_contribution(roi, lin_roi, contrib_path, output_file=None):
@@ -1196,3 +1156,125 @@ def recon_weights(roi, lin_roi, weights_path, output_file=None):
         return None
     else:
         return w_img
+
+
+def cv_mean_function_score(
+        X,
+        labels,
+        folds,
+        score_fn: FoldScoreFunction,
+        *,
+        groups=None,
+        permute: bool = False,
+        permute_both_sets: bool = True,
+        permute_within_groups: bool = True,
+        rng: Optional[np.random.Generator] = None,
+        **score_kwargs: Any,
+    ) -> float:
+    """
+    Compute mean cross-validated score using an arbitrary fold-scoring function.
+
+    The supplied ``score_fn`` is responsible only for fitting/evaluating one
+    train/test split. This function handles folds and optional label
+    permutation independently of the underlying model implementation.
+
+    Parameters
+    ----------
+    X : array-like
+        Feature matrix with shape ``(n_samples, n_features)``.
+    labels : array-like of shape (n_samples,)
+        Labels aligned to rows of ``X``.
+    folds : iterable of tuple(ndarray, ndarray)
+        Cross-validation splits as ``(train_idx, test_idx)`` pairs.
+    score_fn : callable
+        Function with signature::
+
+            score_fn(
+                X,
+                labels,
+                train_idx,
+                test_idx,
+                **score_kwargs,
+            ) -> float
+
+        The function should fit and evaluate one fold and return a scalar
+        score.
+    groups : array-like, optional
+        Group labels used for within-group permutations.
+    permute : bool, default=False
+        If True, evaluate folds using permuted labels.
+    permute_both_sets : bool, default=True
+        If True, permute both training and test labels. Otherwise, only
+        training labels are permuted.
+    permute_within_groups : bool, default=True
+        Restrict permutations to group boundaries when ``groups`` is given.
+    rng : numpy.random.Generator, optional
+        Random generator used for permutations.
+    **score_kwargs
+        Additional arguments forwarded unchanged to ``score_fn``.
+
+    Returns
+    -------
+    float
+        Mean score across folds.
+    """
+    X = np.asarray(X)
+    y = np.asarray(labels)
+    groups = None if groups is None else np.asarray(groups)
+
+    if permute and rng is None:
+        rng = np.random.default_rng()
+
+    fold_scores = []
+
+    for train_idx, test_idx in folds:
+        fold_labels = y.copy()
+
+        if permute:
+            y_train = y[train_idx]
+            y_test = y[test_idx]
+
+            if permute_within_groups and groups is not None:
+                y_train = _permute_within_groups(
+                    y_train,
+                    groups[train_idx],
+                    rng,
+                )
+
+                if permute_both_sets:
+                    y_test = _permute_within_groups(
+                        y_test,
+                        groups[test_idx],
+                        rng,
+                    )
+            else:
+                y_train = rng.permutation(y_train)
+
+                if permute_both_sets:
+                    y_test = rng.permutation(y_test)
+
+            fold_labels[train_idx] = y_train
+
+            if permute_both_sets:
+                fold_labels[test_idx] = y_test
+
+        score = score_fn(
+            X,
+            fold_labels,
+            train_idx,
+            test_idx,
+            groups=groups,
+            rng=rng,
+            **score_kwargs,
+        )
+
+        fold_scores.append(float(score))
+
+    mean_score = float(np.nanmean(fold_scores))
+
+    if np.isnan(mean_score):
+        raise errors.NoFeaturesSelectedError(
+            "All folds produced NaN scores; cannot compute mean score."
+        )
+
+    return mean_score

@@ -159,7 +159,12 @@ import numpy as np
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
-from .decoding import decoding_plugin
+from .decoding import (
+    decoding_plugin,
+    vanilla_nearest_centroid_plugin,
+    n_region_nearest_centroid_plugin,
+    fixed_n_region_generative_plugin,
+)
 from .rsa import rsa_plugin
 from .similarity import cosine_similarity_plugin
 from .dimensionality import dimensionality_plugin
@@ -320,7 +325,10 @@ def save_analysis_artifacts(
 
 PLUGIN_REGISTRY: Dict[str, PluginCallable] = {
     "rsa": rsa_plugin,
-    "decoding": decoding_plugin,
+    "scikit_decoding": decoding_plugin,
     "dimensionality": dimensionality_plugin,
     "cs_us_similarity": cosine_similarity_plugin,
+    "vanilla_nearest_centroid": vanilla_nearest_centroid_plugin,
+    "n_region_nearest_centroid": n_region_nearest_centroid_plugin,
+    "fixed_n_region_generative": fixed_n_region_generative_plugin,
 }

@@ -4,7 +4,9 @@
 
 import re
 import os
+import json
 import numpy as np
+import pandas as pd
 from nilearn import (
     image,
     maskers
@@ -14,6 +16,9 @@ from lazyfmri import utils
 from collections import Counter
 from panic.logger import get_logger
 from panic.errors import EmptyMaskError
+from panic.betas import BetaLoaderMixin
+
+from pathlib import Path
 
 opj = os.path.join
 
@@ -376,7 +381,42 @@ class PrepareROIs:
         return {
             lbl: [roi_name, out_img]
         }
-        
+
+
+    @staticmethod
+    def _strip_image_extension(path):
+        name = Path(path).name
+
+        for extension in (".nii.gz", ".nii", ".mgz", ".mgh"):
+            if name.lower().endswith(extension):
+                return name[:-len(extension)]
+
+        return Path(name).stem
+
+
+    def _prefer_specific_matches(self, files, roi_src):
+        roi_src = roi_src.rstrip(".")
+
+        generic = []
+        specific = []
+
+        for path in files:
+            stem = self._strip_image_extension(path)
+
+            if stem == roi_src:
+                generic.append(path)
+            elif stem.startswith(f"{roi_src}."):
+                specific.append(path)
+
+        logger.debug(
+            "roi_src=%r | generic=%r | specific=%r",
+            roi_src,
+            generic,
+            specific,
+        )
+
+        return specific if specific else generic
+
 
     def _from_labels(self, mask_dir):
         """
@@ -442,20 +482,24 @@ class PrepareROIs:
         """
         
         logger.info(f"Loading masks from '{mask_dir}'")
-        masks = utils.get_file_from_substring(
+
+        all_masks = utils.FindFiles(
+            mask_dir,
+            extension=self.extension,
+            maxdepth=0,
+        ).files
+
+        if isinstance(all_masks, str):
+            all_masks = [all_masks]
+
+        masks = self._prefer_specific_matches(
+            all_masks,
             self.roi_src,
-            utils.FindFiles(
-                mask_dir,
-                extension=self.extension,
-            ).files
         )
-        
-        if not isinstance(masks, list):
-            masks = [masks]
 
         return_masks = {}
-        for ix, m in enumerate(masks):
-            logger.info(f" #{ix+1}: {m}")
+        for ix, m in enumerate(masks, start=1):
+            logger.info(f" #{ix}: {m}")
             # Create a binary mask from labeled mgz
             tmp_mask = self.select_labels_from_mgh(
                 input_file=m,
@@ -743,7 +787,7 @@ class PrepareROIs:
         return out_img
     
 
-class PrepareBetas:
+class PrepareBetas(BetaLoaderMixin):
     """
     Prepare trialwise beta images for decoding analyses.
 
@@ -833,20 +877,31 @@ class PrepareBetas:
         ):
                 
         if isinstance(beta_file, str):
-            logger.info(f"Beta-file: '{beta_file}'")
+            logger.info("Beta-file: '%s'", beta_file)
+
             self.betas, self.do_standardization = self.sanitize_img(
                 beta_file,
-                **kwargs
+                **kwargs,
             )
-            
+
             if not isinstance(trial_list, (list, np.ndarray)):
-                logger.exception("Please specify a list representing the trials")
+                raise TypeError(
+                    "`trial_list` must be a list or numpy array when "
+                    "`beta_file` is provided."
+                )
 
             self.trial_list = trial_list
+            self.groups = None
+            self.events_df = None
+
         else:
-            self.betas, self.trial_list, self.do_standardization, self.groups = self.load_and_merge_betas(
-                **kwargs
-            )
+            (
+                self.betas,
+                self.trial_list,
+                self.do_standardization,
+                self.groups,
+                self.events_df,
+            ) = self.load_and_merge_betas(**kwargs)
 
     def return_trials(self):
         return self.trial_list
@@ -974,257 +1029,6 @@ class PrepareBetas:
                 logger.error(f"'standardize' must be on of 'range' or 'zscore', not '{standardize}'")
 
         return image.new_img_like(img, data, copy_header=True), do_standardization
-    
-
-    @classmethod
-    def load_and_merge_betas(
-            self,
-            subject,
-            beta_dir="/mnt/d/fMRI/HRA/derivatives/stglm",
-            save_imgs=False,
-            output_dir=None,
-            derivative=False,
-            label_mapper=None,
-            model="lsa",
-            filters=None,
-            **kwargs
-        ):
-        """
-        Load, sanitize, and concatenate trialwise beta images for a subject from
-        different preprocessing pipelines, returning a single 4D image plus
-        trial labels and (optional) run groups.
-
-        Supported sources are inferred from ``beta_dir``'s basename:
-        - **"glmsingle"** – expects per-run/per-condition beta files and a
-        ``trial_list.txt``; model name is mapped to GLMsingle types:
-        ``"lss" → "typeb"``, ``"lsa" → "typed"``.
-        - **"stglm"** – expects per-run beta files with JSON sidecars carrying
-        ``"TrialList"``; groups are parsed from filenames (``run-XX``).
-        - **"bach"** – D. Bach format; may contain derivative estimates (see below).
-        - **"halfpipe"** – condition-wise single-trial files; requires
-        ``label_mapper`` to select conditions.
-
-        Optionally, trialwise derivative images can be selected for Bach-format
-        directories by taking every other file.
-
-        :param str subject:
-            Subject identifier (e.g., ``"sub-01"``) whose beta directory is
-            ``<beta_dir>/<subject>``.
-        :param str beta_dir:
-            Root directory of beta images. Its basename determines the source
-            format (``"stglm"``, ``"glmsingle"``, ``"halfpipe"``, or ``"bach"``).
-            Default: ``"/mnt/d/fMRI/HRA/derivatives/stglm"``.
-        :param bool save_imgs:
-            If ``True``, writes the merged 4D image to disk.
-        :param str | None output_dir:
-            Output directory used when ``save_imgs=True``. If ``None``, defaults
-            to ``<beta_dir>/<subject>``.
-        :param bool derivative:
-            For Bach format, select every other beta file (temporal derivative).
-            Ignored for other sources.
-        :param dict | None label_mapper:
-            Required for **halfpipe** to specify which conditions to include
-            (keys are condition names). Ignored for other sources.
-        :param str model:
-            Model identifier. For GLMsingle, mapped via
-            ``{"lss": "typeb", "lsa": "typed"}``. For other sources, used to
-            filter filenames (e.g., ``"desc-lsa"``).
-        :param kwargs:
-            Passed to :meth:`sanitize_img` (e.g., ``standardize="zscore"``, ``fill``, ``clip``).
-
-        :returns:
-            A tuple ``(beta_imgs, trials, is_standardized, groups)``:
-            
-            * ``beta_imgs`` – 4D NIfTI image of concatenated betas
-            * ``trials`` – list/array of trial labels (length equals last dim of ``beta_imgs``)
-            * ``is_standardized`` – ``bool`` flag from :meth:`sanitize_img`
-            indicating whether pipeline-level standardization should still occur
-            * ``groups`` – list of run IDs per trial or ``None`` if not applicable
-        :rtype:
-            tuple[nibabel.Nifti1Image, list[str] | numpy.ndarray, bool, list[int] | None]
-
-        **Workflow**
-            1. Discover beta files under ``<beta_dir>/<subject>`` based on the
-            source format and requested ``model``.
-            2. (Bach) If ``derivative=True``, select every other file.
-            3. Load images and track trial counts; for **stglm** and **halfpipe**,
-            parse ``run-XX`` from filenames to construct ``groups`` (with a
-            fallback when parsing fails).
-            4. Concatenate all beta images into a single 4D image via
-            :func:`nilearn.image.concat_imgs`.
-            5. Determine the trial list:
-            - **glmsingle / bach**: read from ``trial_list.txt`` in subject dir
-            - **stglm**: concatenate ``"TrialList"`` from JSON sidecars
-            - **halfpipe**: accumulated earlier while selecting files
-            6. Sanitize the merged image using :meth:`sanitize_img` (replace NaN/±∞,
-            optional clipping, optional z-score standardization).
-            7. Optionally save the merged image if ``save_imgs=True``.
-
-        **Saved filename (when ``save_imgs=True``)**
-            ``{subject}_model-{model}_source-{src}_desc-merged_betas.nii.gz``
-
-        **Notes**
-            - Validates that the last dimension of ``beta_imgs`` matches the number
-            of ``trials`` and logs an error if not.
-            - ``groups`` is ``None`` unless a source provides run parsing (e.g., stGLM,
-            halfpipe); for halfpipe, conditions are filtered by ``label_mapper``.
-            - The return flag ``is_standardized`` allows a downstream pipeline to
-            disable redundant scaling if z-scoring was already applied here.
-        """
-
-        # helper to parse run-XX from filenames like "...run-02_..."
-        run_re = re.compile(r"run-(\d+)", flags=re.IGNORECASE)
-        groups = None
-
-        #-----------------------------------------------------------------------
-        # stglm | halfpipe | glmsingle
-        src = os.path.basename(beta_dir)
-        subject_betas = opj(beta_dir, subject)
-
-        assert os.path.exists(subject_betas), FileNotFoundError(f"Input beta directory '{subject_betas}' does not exist")
-        logger.info(f"Loading betas from: '{subject_betas}'")
-
-        #-----------------------------------------------------------------------
-        # define GLMsingle mapper
-        model_mapper = {
-            "lss": "typeb",
-            "lsa": "typed"
-        }
-
-        #-----------------------------------------------------------------------
-        # stglm | glmsingle need to be concatenated; HALFpipe comes concatenated
-        allowed = ['glmsingle', 'bach', 'halfpipe', 'stglm']
-        if src == "glmsingle":
-            search = f"model-{model_mapper[model]}_beta-"
-        elif src == "bach":
-            search = "beta_"
-        elif src in ["halfpipe", "stglm"]:
-            search = [f"feature-{model}_condition-", "effect_statmap.nii.gz"]
-        else:
-            raise ValueError(f"Source must be on of {allowed}, not '{src}'")
-        
-        # add custom filters
-        if filters is not None:
-            if isinstance(filters, str):
-                filters = [filters]
-
-            if len(filters)>0:
-                search += filters
-
-        logger.info(f"Search criteria: {search}")
-        m_files = utils.FindFiles(
-            subject_betas,
-            extension=".nii.gz",
-            filters=search
-        ).files
-
-        assert len(m_files)>0, ValueError(f"No *.nii.gz files in '{subject_betas}'")
-    
-        #-----------------------------------------------------------------------
-        # D. Bach's beta values
-        if derivative:
-            logger.info("Directory contains trialwise estimates of the temporal derivative. Selecting every other beta file.")
-            m_files = m_files[0::2]
-        
-        #-----------------------------------------------------------------------
-        # HALFpipe outputs condition-wise single-trial files > match with "label_dict" in config.yml
-        niimgs = []
-        trials = []
-        groups = []
-        if src in ["halfpipe", "stglm"]:
-
-            assert isinstance(label_mapper, dict), f"When HALFpipe is used, 'label_mapper' must be a dictionary with keys representing the stimuli to include, not '{label_mapper}'"
-
-            # select ev-specific files
-            include_events = list(label_mapper.keys())
-            for i in include_events:
-
-                incl_files = utils.get_file_from_substring(
-                    [f"-{i}_stat"],
-                    m_files
-                )
-
-                if isinstance(incl_files, str):
-                    incl_files = [incl_files]
-
-                if not isinstance(incl_files, list):
-                    raise TypeError(f"We should have a list of beta-values by now, not {incl_files}")
-
-                # fetch nr of volumes and fill in with label_mapper
-                logger.info(f"Found {len(incl_files)} files for '{i}' [model = {model}]")
-                for f in incl_files:
-                    img = nib.load(f)
-                    header = img.header
-                    n_vols = header.get("dim")[4]
-                    trials.extend([i] * n_vols)
-                    niimgs.append(img)
-
-                    # groups (run ID replicated per event in that run)
-                    m = run_re.search(f)
-                    if m:
-                        run_id = int(m.group(1))      # 1..R
-                    else:
-                        # fallback: index of file within condition list
-                        run_id = len(set(groups)) + 1
-                        logger.warning(f"Could not parse run-XX from '{f}'. Using fallback run_id={run_id}")
-
-                    groups.extend([run_id] * n_vols)
-
-        else:
-            logger.info(f"Found {len(m_files)} files for {model}-model")
-            for f in m_files:
-                img = nib.load(f)
-                header = img.header
-                n_vols = header.get("dim")[4]
-                # trials.extend([i] * n_vols)
-                niimgs.append(img)
-
-        #-----------------------------------------------------------------------
-        # concatenate
-        logger.info("Concatenating these files into single 4D-object")
-        beta_imgs = image.concat_imgs(niimgs)
-        
-        #-----------------------------------------------------------------------
-        # glmsingle has separate trial_list.txt file in directory; stGLM has json sidecar
-        # HALFpipe trials are read above
-        if src in ["glmsingle", "bach"]:
-            txt_files = utils.FindFiles(
-                subject_betas,
-                extension=".txt"
-            ).files
-
-            trial_file = utils.get_file_from_substring(
-                "trial_list",
-                txt_files
-            )
-
-            trials = np.loadtxt(trial_file, dtype=str)
-
-        #-----------------------------------------------------------------------
-        # verify
-        if beta_imgs.shape[-1] != len(trials):
-            logger.error(f"Number of beta-images ({beta_imgs.shape[-1]}) does not match length of label/trial list ({len(trials)})")
-
-        #-----------------------------------------------------------------------
-        # sanitize images
-        logger.info("Sanitizing beta images (e.g., remove NaN/inf and set float)")
-        beta_imgs, is_standardized = self.sanitize_img(beta_imgs, **kwargs)
-
-        #-----------------------------------------------------------------------
-        # save merged?
-        if save_imgs:
-            if output_dir is None:
-                output_dir = subject_betas
-
-            fname = opj(
-                output_dir,
-                f"{subject}_model-{model}_source-{src}_desc-merged_betas.nii.gz"
-            )
-
-            logger.info(f"Saving merged beta image as '{fname}'")
-            beta_imgs.to_filename(fname)
-
-        return beta_imgs, trials, is_standardized, groups
 
 
 class MaskAndFilterBetas:

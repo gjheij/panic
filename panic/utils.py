@@ -8,11 +8,11 @@ import os
 import sys
 import yaml
 import numpy as np
+import nibabel as nib
 from joblib import load
 from pathlib import Path
-from typing import Any, Dict
 from importlib.resources import files, as_file
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, Tuple
 
 import panic
 from panic.logger import get_logger
@@ -99,3 +99,25 @@ def load_feature_matrix(
         return np.asarray(X_mm[:, cols])
 
     return np.asarray(X_mm)
+
+
+def load_mask(
+        mask: Any,
+        return_affine: bool = False,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, Optional[np.ndarray]]]:
+    """Load a mask from a path, NIfTI image, or array-like object."""
+    affine = None
+
+    if isinstance(mask, (str, os.PathLike)):
+        mask = nib.load(mask)
+
+    if isinstance(mask, nib.spatialimages.SpatialImage):
+        affine = np.asarray(mask.affine)
+        mask = mask.get_fdata()
+
+    mask_array = np.asarray(mask)
+
+    if return_affine:
+        return mask_array, affine
+
+    return mask_array
