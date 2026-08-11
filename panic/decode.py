@@ -876,121 +876,225 @@ class ClassifySubject(data.PrepareBetas):
     
 
     def decode_masks(
-            self,
-            hemi_key="hemi",
-            **kwargs
-        ):
-        """
-        Decode all ROIs or searchlight masks defined for the current subject.
+        self,
+        hemi_key="hemi",
+        **kwargs,
+    ):
+        """Decode all configured ROIs or searchlight masks.
 
-        This method iterates over all ROI definitions returned by
-        :meth:`define_mask_inputs`, prepares each mask for beta extraction,
-        performs decoding via :meth:`decode_single_mask`, and aggregates the
-        resulting statistics.
-
-        For ROI-based decoding (``self.searchlight=False``), summary statistics
-        and null distributions are collected across all masks and written to disk
-        as CSV files together with the configuration used for the analysis.
-
-        For searchlight decoding (``self.searchlight=True``), each processed mask
-        returns a dictionary containing the searchlight images (e.g., observed
-        accuracy, null mean, p-values, and delta maps), which are collected into a
-        dictionary keyed by ROI name.
+        Existing ROI-level result files are handled incrementally. When a previous
+        results CSV exists and ``overwrite=False``, each ROI is checked against the
+        rows already present in that file. Completed ROIs are skipped, while newly
+        added ROIs are decoded and appended to the existing results.
 
         Parameters
         ----------
-        hemi_key : str, optional
-            Column name used to identify hemisphere labels in the output results
-            table. Defaults to ``"hemi"``.
+        hemi_key : str, default="hemi"
+            Column name used for hemisphere information.
+
         **kwargs
-            Additional keyword arguments passed directly to
-            :meth:`decode_single_mask`. These typically include decoding settings
-            such as searchlight parameters, permutation options, or classifier
-            configuration.
+            Additional keyword arguments forwarded to
+            :meth:`decode_single_mask`.
 
         Returns
         -------
         pandas.DataFrame or dict
-            If ``self.searchlight`` is ``False``, returns a dataframe containing
-            one row per decoded ROI with observed accuracy, null expectation,
-            delta score, empirical p-value, ROI label, hemisphere, and metadata.
-
-            If ``self.searchlight`` is ``True``, returns a dictionary mapping ROI
-            names to the output dictionaries returned by
-            :meth:`decode_single_mask`, typically containing searchlight NIfTI
-            images and associated statistics.
-
-        Notes
-        -----
-        - Empty masks (for which ``decode_single_mask`` returns ``None``) are
-        silently skipped.
-        - ROI decoding writes three output files:
-            1. ``*_desc-null_distribution.csv``
-            2. ``*_desc-results.csv``
-            3. ``*_desc-config.yml``
-        - Searchlight decoding delegates image writing to
-        ``decode_single_mask`` and only returns the resulting file dictionary.
-        - The configuration file permissions are copied to all generated output
-        files to maintain consistent filesystem metadata.
+            ROI-level results DataFrame when ``self.searchlight=False``.
+            Searchlight output mapping when ``self.searchlight=True``.
         """
-        
         out_files = {}
         results = []
         null = []
 
-        overwrite = bool(getattr(self, "overwrite", self.gen_settings.get("overwrite", False)))
+        overwrite = bool(
+            getattr(
+                self,
+                "overwrite",
+                self.gen_settings.get("overwrite", False),
+            )
+        )
 
-        # ROI mode has one subject-level results file, so it can be checked up front.
+        # Existing ROI-level outputs
+        existing_results = pd.DataFrame()
+        completed_rois = set()
+
         if not self.searchlight:
-            res_file = self.generate_filename(desc="results", ext="csv")
+            res_file = self.generate_filename(
+                desc="results",
+                ext="csv",
+            )
+
             if os.path.exists(res_file) and not overwrite:
-                logger.warning(f"Results file '{res_file}' already exists; skipping ROI decoding.")
-                return pd.read_csv(res_file)
+                logger.info(
+                    "Loading existing ROI results from '%s'",
+                    res_file,
+                )
+
+                # ensure representation doesn't change; not using str causes "015" -> "15"
+                existing_results = pd.read_csv(
+                    res_file,
+                    dtype={
+                        "subject": str,
+                        "roi": str,
+                        "source": str,
+                        "method": str,
+                        "analysis": str,
+                    },
+                )
+
+                required = {
+                    "roi",
+                    hemi_key,
+                    "source",
+                    "method",
+                    "analysis"
+                }
+
+                missing = required - set(existing_results.columns)
+
+                if missing:
+                    logger.warning(
+                        "Existing results file is missing columns required "
+                        "for incremental ROI matching: %s. Existing rows will "
+                        "be preserved, but no ROIs will be assumed complete.",
+                        sorted(missing),
+                    )
+                else:
+                    for _, row in existing_results.iterrows():
+                        completed_rois.add(
+                            (
+                                str(row["roi"]),
+                                str(row[hemi_key]),
+                                str(row["source"]),
+                                str(row["method"]),
+                                str(row["analysis"]),
+                            )
+                        )
+
+                    logger.info(
+                        "Found %d completed ROI entries",
+                        len(completed_rois),
+                    )
 
         roi_dict, is_labels = self.define_mask_inputs()
 
         for r_key, r_val in roi_dict.items():
-            logger.info(f"Processing '{r_key}' (labels|file={r_val})")
+            logger.info(
+                "Processing '%s' (labels|file=%s)",
+                r_key,
+                r_val,
+            )
 
             roi_name = r_key if is_labels else None
-            _, roi_masks = self.prepare_rois(r_val, roi_name=roi_name)
+
+            _, roi_masks = self.prepare_rois(
+                r_val,
+                roi_name=roi_name,
+            )
 
             for h_key, h_val in roi_masks.items():
-                logger.info(f"hemi-key={h_key} | roi-key={h_val[0]}..")
+                roi_label = str(h_val[0])
+                hemi_label = str(h_key)
+                source = str(self.gen_settings["source"])
+                method = str(self.gen_settings["method"])
+
+                logger.info(
+                    "hemi-key=%s | roi-key=%s",
+                    hemi_label,
+                    roi_label,
+                )
+
+                # Incremental ROI skipping
+                roi_key = (
+                    roi_label,
+                    hemi_label,
+                    source,
+                    method,
+                    str(self.analysis_name)
+                )
+
+                if (
+                    not self.searchlight
+                    and not overwrite
+                    and roi_key in completed_rois
+                ):
+                    logger.info(
+                        "ROI already present in existing results; skipping: "
+                        "roi=%s | %s=%s",
+                        roi_label,
+                        hemi_key,
+                        hemi_label,
+                    )
+                    continue
 
                 model_src_dir = opj(
                     self.save_dir,
-                    f"model-{self.gen_settings['method']}",
-                    f"source-{self.gen_settings['source']}",
+                    f"model-{method}",
+                    f"source-{source}",
                 )
 
-                roi_dir = opj(model_src_dir, f"roi-{h_val[0]}")
+                roi_dir = opj(
+                    model_src_dir,
+                    f"roi-{roi_label}",
+                )
 
-                # Searchlight mode has one output directory per ROI/mask.
-                # Check completion here, because roi_dir depends on h_val.
+                # Searchlight completion check
                 if self.searchlight:
-                    sl_dir = opj(roi_dir, self.dec_settings['searchlight'].get("basepath", "searchlight"))
-                    all_exist, sl_files = _searchlight_outputs_exist(sl_dir, hemi_key=h_key)
-                    if all_exist and not overwrite:
-                        logger.warning(
-                            "Searchlight outputs already exist for ROI '%s'; skipping: %s",
-                            h_val[0],
-                            sl_dir,
-                        )
-                        out_files[h_val[0]] = sl_files
-                        continue
-                    else:
-                        logger.info(f"Searchlight outputs not found or overwrite=True for ROI '{h_val[0]}'; running searchlight decoding.")
-
-                fname = None
-                if self.save_imgs:
-                    resampled_dir = opj(self.save_dir, "rois")
-                    os.makedirs(resampled_dir, exist_ok=True)
-                    fname = opj(
-                        resampled_dir,
-                        f"{self.subject}_roi-{h_val[0]}_hemi-{h_key}_desc-valid_mask.nii.gz",
+                    sl_dir = opj(
+                        roi_dir,
+                        self.dec_settings["searchlight"].get(
+                            "basepath",
+                            "searchlight",
+                        ),
                     )
 
+                    all_exist, sl_files = _searchlight_outputs_exist(
+                        sl_dir,
+                        hemi_key=h_key,
+                    )
+
+                    if all_exist and not overwrite:
+                        logger.warning(
+                            "Searchlight outputs already exist for ROI "
+                            "'%s'; skipping: %s",
+                            roi_label,
+                            sl_dir,
+                        )
+
+                        out_files[roi_label] = sl_files
+                        continue
+
+                    logger.info(
+                        "Searchlight outputs missing or overwrite=True "
+                        "for ROI '%s'; running decoding.",
+                        roi_label,
+                    )
+
+                # Optional resampled mask output
+                fname = None
+
+                if self.save_imgs:
+                    resampled_dir = opj(
+                        self.save_dir,
+                        "rois",
+                    )
+
+                    os.makedirs(
+                        resampled_dir,
+                        exist_ok=True,
+                    )
+
+                    fname = opj(
+                        resampled_dir,
+                        (
+                            f"{self.subject}"
+                            f"_roi-{roi_label}"
+                            f"_hemi-{hemi_label}"
+                            f"_desc-valid_mask.nii.gz"
+                        ),
+                    )
+
+                # Decode
                 ddict, extracted = self.decode_single_mask(
                     self.betas,
                     h_val[1],
@@ -1006,7 +1110,7 @@ class ClassifySubject(data.PrepareBetas):
                 if ddict is None:
                     continue
 
-                # Store
+                # ROI results
                 if not self.searchlight:
                     results_dict = {
                         "subject": str(self.bids_id),
@@ -1014,15 +1118,12 @@ class ClassifySubject(data.PrepareBetas):
                         "null_mean": ddict["mean_permuted"],
                         "delta": ddict["delta"],
                         "p_value": ddict["p"],
-                        hemi_key: str(h_key),
-                        "roi": str(h_val[0]),
-                        "source": str(self.gen_settings["source"]),
-                        "method": str(self.gen_settings["method"]),
+                        hemi_key: hemi_label,
+                        "roi": roi_label,
+                        "source": source,
+                        "method": method,
                         **extracted.roi_metrics,
                     }
-                    
-                    if hemi_key == "hemi":
-                        results_dict[hemi_key] = str(h_key)
 
                     results_dict = self._extend_results_dict(
                         results_dict,
@@ -1033,56 +1134,157 @@ class ClassifySubject(data.PrepareBetas):
 
                     results.append(results_dict)
 
-                    # Store null perms in tidy form (one row per permutation)
                     null.extend(
                         {
                             "subject": str(self.bids_id),
-                            "roi": str(h_val[0]),
+                            "roi": roi_label,
+                            hemi_key: hemi_label,
                             "perm": i,
                             "acc": float(a),
-                            "source": str(self.gen_settings["source"]),
-                            "method": str(self.gen_settings["method"]),                        
-                            **({hemi_key: str(h_key)} if hemi_key == "hemi" else {}),
+                            "source": source,
+                            "method": method,
                         }
-                        for i, a in enumerate(ddict["permuted"])
+                        for i, a in enumerate(
+                            ddict["permuted"]
+                        )
                     )
+
                 else:
-                    out_files[h_val[0]] = ddict
-        
-        # copy config file
+                    out_files[roi_label] = ddict
+
+        # Save config
         cfg_file = self.generate_filename(
             desc="config",
-            ext="yml"
-        )        
-        
-        # Writing the data to a YAML file
-        dump_yaml(self.cfg, cfg_file)
-        shutil.copymode(self.config_file, cfg_file)
+            ext="yml",
+        )
 
+        dump_yaml(
+            self.cfg,
+            cfg_file,
+        )
+
+        shutil.copymode(
+            self.config_file,
+            cfg_file,
+        )
+
+        # Save ROI-level outputs
         if not self.searchlight:
-            # write null-distributions
-            null_df = pd.DataFrame(null)
-            null_file = self.generate_filename(
-                desc="null_distribution",
-                ext="csv"
+            new_results = pd.DataFrame(results)
+
+            if not existing_results.empty:
+                res_df = pd.concat(
+                    [
+                        existing_results,
+                        new_results,
+                    ],
+                    ignore_index=True,
+                )
+            else:
+                res_df = new_results
+
+            # Optional safety de-duplication.
+            dedup_cols = [
+                "subject",
+                "roi",
+                hemi_key,
+                "source",
+                "method",
+            ]
+
+            available_dedup_cols = [
+                col
+                for col in dedup_cols
+                if col in res_df.columns
+            ]
+
+            if available_dedup_cols:
+                res_df = res_df.drop_duplicates(
+                    subset=available_dedup_cols,
+                    keep="last",
+                )
+
+            logger.info(
+                "Writing results to: '%s'",
+                res_file,
             )
 
-            logger.info(f"Writing null-distributions to '{null_file}'")
-            null_df.to_csv(null_file, index=False)
-            shutil.copymode(self.config_file, null_file)
+            res_df.to_csv(
+                res_file,
+                index=False,
+            )
 
-            # write results to dataframe and save
-            res_df = pd.DataFrame(results)
-            logger.info(f"Writing results to: '{res_file}'")
-            res_df.to_csv(res_file, index=False)
-            shutil.copymode(self.config_file, res_file)
+            shutil.copymode(
+                self.config_file,
+                res_file,
+            )
 
-            # return results
+            # Null distributions
+            null_file = self.generate_filename(
+                desc="null_distribution",
+                ext="csv",
+            )
+
+            new_null = pd.DataFrame(null)
+
+            if (
+                os.path.exists(null_file)
+                and not overwrite
+            ):
+                existing_null = pd.read_csv(
+                    null_file
+                )
+
+                null_df = pd.concat(
+                    [
+                        existing_null,
+                        new_null,
+                    ],
+                    ignore_index=True,
+                )
+
+                null_dedup_cols = [
+                    "subject",
+                    "roi",
+                    hemi_key,
+                    "source",
+                    "method",
+                    "perm",
+                ]
+
+                available_null_dedup = [
+                    col
+                    for col in null_dedup_cols
+                    if col in null_df.columns
+                ]
+
+                if available_null_dedup:
+                    null_df = null_df.drop_duplicates(
+                        subset=available_null_dedup,
+                        keep="last",
+                    )
+
+            else:
+                null_df = new_null
+
+            logger.info(
+                "Writing null-distributions to '%s'",
+                null_file,
+            )
+
+            null_df.to_csv(
+                null_file,
+                index=False,
+            )
+
+            shutil.copymode(
+                self.config_file,
+                null_file,
+            )
+
             return res_df
 
-        else:
-            # return results
-            return out_files
+        return out_files
 
 
     def generate_filename(self, desc=None, ext="csv"):
