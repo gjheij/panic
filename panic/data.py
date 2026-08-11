@@ -4,9 +4,7 @@
 
 import re
 import os
-import json
 import numpy as np
-import pandas as pd
 from nilearn import (
     image,
     maskers
@@ -1409,32 +1407,163 @@ class MaskAndFilterBetas:
         roi_in_fov = image.math_img(
             "roi & sup",
             roi=self.mask_resampled_to_betas,
-            sup=support_img
+            sup=support_img,
         )
 
-        vox_before = int((self.mask_resampled_to_betas.get_fdata() > 0.5).sum())
-        vox_after = int(roi_in_fov.get_fdata().sum())
-        logger.info(f"{vox_after}/{vox_before} voxels inside beta FOV")
+        resampled_mask_data = (
+            self.mask_resampled_to_betas.get_fdata() > 0.5
+        )
+        roi_mask_data = roi_in_fov.get_fdata() > 0.5
+
+        vox_before = int(resampled_mask_data.sum())
+        vox_after = int(roi_mask_data.sum())
+
+        logger.info(
+            "%d/%d voxels inside beta FOV",
+            vox_after,
+            vox_before,
+        )
 
         if vox_after == 0:
-            raise EmptyMaskError(f"Invalid mask after filtering: voxel count in mask = {vox_after}")
-            
-        roi_mask_data = roi_in_fov.get_fdata() > 0.5
-        roi_linidx = np.flatnonzero(roi_mask_data.ravel())
+            raise EmptyMaskError(
+                "Invalid mask after filtering: "
+                f"voxel count in mask = {vox_after}"
+            )
 
-        if output_file is not None:
-            logger.info(f"Saving resampled mask: {output_file}")
-            nib.save(roi_in_fov, output_file)
-
-        logger.info(f"Extract betas with resampled/validated mask")
-
-        masker = maskers.NiftiMasker(
-            mask_img=self.mask_resampled_to_betas,
-            dtype="float32",
-            **masker_kws
+        roi_linidx = np.flatnonzero(
+            roi_mask_data.ravel()
         )
 
-        return masker.fit_transform(
+        # Spatial QC for this ROI.
+        self.roi_metrics = self._compute_roi_metrics(
+            mask_img=self.mask,
+            resampled_mask=self.mask_resampled_to_betas,
+            valid_mask=roi_mask_data,
+        )
+
+        if output_file is not None:
+            logger.info(
+                "Saving resampled mask: %s",
+                output_file,
+            )
+            nib.save(roi_in_fov, output_file)
+
+        logger.info(
+            "ROI QC: native=%d | resampled=%d | valid=%d [frac=%.2f] | "
+            "volume=%.2f mm³ | expected=%.2f | coverage=%.3f",
+            self.roi_metrics["n_voxels_native"],
+            self.roi_metrics["n_voxels_resampled"],
+            self.roi_metrics["n_voxels"],
+            self.roi_metrics["valid_voxel_fraction"],
+            self.roi_metrics["roi_volume_mm3"],
+            self.roi_metrics["expected_voxels"],
+            self.roi_metrics["volume_coverage_ratio"],
+        )
+
+        logger.info(
+            "Extract betas with resampled/validated mask"
+        )
+
+        masker = maskers.NiftiMasker(
+            mask_img=roi_in_fov,
+            dtype="float32",
+            **masker_kws,
+        )
+
+        X = masker.fit_transform(
             self.betas,
-            **fit_kws
-        ), roi_linidx
+            **fit_kws,
+        )
+
+        # Strong consistency check.
+        if X.shape[1] != len(roi_linidx):
+            raise RuntimeError(
+                "Masker feature count does not match ROI voxel indices: "
+                f"{X.shape[1]} != {len(roi_linidx)}."
+            )
+
+        return X, roi_linidx
+
+    @staticmethod
+    def _compute_roi_metrics(
+        mask_img,
+        resampled_mask,
+        valid_mask=None,
+    ):
+        """Compute spatial QC metrics for an ROI on the beta-image grid.
+
+        Parameters
+        ----------
+        mask_img : nibabel.spatialimages.SpatialImage
+            Original ROI mask in its native spatial grid.
+
+        resampled_mask : nibabel.spatialimages.SpatialImage
+            ROI mask after resampling to the beta-image grid.
+
+        valid_mask : array-like of bool, optional
+            Boolean mask identifying the final voxels retained for decoding
+            after FOV, variance, or other validity filtering.
+
+        Returns
+        -------
+        dict
+            ROI spatial QC metrics containing native ROI volume, beta-grid voxel
+            volume, expected number of beta voxels based on physical volume,
+            number of voxels after resampling, number of final decoding voxels,
+            and the ratio between observed and expected voxel counts.
+        """
+        native_data = np.asarray(mask_img.get_fdata())
+
+        native_voxel_volume = float(
+            abs(np.linalg.det(mask_img.affine[:3, :3]))
+        )
+
+        beta_voxel_volume = float(
+            abs(np.linalg.det(resampled_mask.affine[:3, :3]))
+        )
+
+        n_native_voxels = int(
+            np.count_nonzero(native_data)
+        )
+
+        roi_volume_mm3 = (
+            n_native_voxels * native_voxel_volume
+        )
+
+        resampled_data = np.asarray(
+            resampled_mask.get_fdata()
+        )
+
+        n_voxels_resampled = int(
+            np.count_nonzero(resampled_data)
+        )
+
+        if valid_mask is None:
+            n_voxels = n_voxels_resampled
+        else:
+            n_voxels = int(
+                np.count_nonzero(valid_mask)
+            )
+
+        expected_voxels = (
+            roi_volume_mm3 / beta_voxel_volume
+            if beta_voxel_volume > 0
+            else np.nan
+        )
+
+        coverage_ratio = (
+            n_voxels / expected_voxels
+            if expected_voxels > 0
+            else np.nan
+        )
+
+        return {
+            "n_voxels": n_voxels,
+            "n_voxels_resampled": n_voxels_resampled,
+            "n_voxels_native": n_native_voxels,
+            "roi_volume_mm3": roi_volume_mm3,
+            "voxel_volume_mm3": beta_voxel_volume,
+            "expected_voxels": expected_voxels,
+            "volume_coverage_ratio": coverage_ratio,
+            "valid_voxel_fraction": n_voxels / n_voxels_resampled
+        }

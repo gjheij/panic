@@ -192,8 +192,15 @@ def get_analysis_plugin(
         Decoding settings dictionary. Expected optional structure::
 
             analysis:
-              name: decoding
+              type: sklearn_decoding
               args: {}
+
+        To save in a different parent folder, use:
+
+            analysis:
+              type: sklearn_decoding,
+              name: SVM_CSm_v_CSpu
+              args: {}              
 
     label_dict : mapping, optional
         Mapping from condition names to integer labels. When provided,
@@ -226,8 +233,8 @@ def get_analysis_plugin(
     KeyError
         If the requested plugin name is not registered.
     """
-    analysis = cfg.get("analysis", {"name": "decoding", "args": {}})
-    name = analysis.get("name", "decoding")
+    analysis = cfg.get("analysis", {"type": "decoding", "args": {}})
+    name = analysis.get("type", "decoding")
 
     if name not in PLUGIN_REGISTRY:
         available = ", ".join(sorted(PLUGIN_REGISTRY))

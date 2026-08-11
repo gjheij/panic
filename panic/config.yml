@@ -39,8 +39,8 @@ roi_settings:                   # kwargs passed to data.PrepareROIs()
 
 general_settings:
   project_dir: "/mnt/d/fMRI/HRA"
-  save_dir: "/mnt/d/fMRI/Development/HRA/derivatives/panic"
-  # save_dir: /tmp/test_panic
+  # save_dir: "/mnt/d/fMRI/Development/HRA/derivatives/panic"
+  save_dir: /tmp/test_panic
   tmp_dir: "~/.joblib_cache"    # stores temp memmaps
   method: LSA                   # or LSS, if you have GLMsingle: use 'lss', 'lsa'
   source: stglm                 # or 'stglm', 'glmsingle'
@@ -52,7 +52,7 @@ general_settings:
 fitted_derivative: false
 
 decoding_settings:
-  n_permutations: 1000           # permutations for ROI-decoding/searchlight
+  n_permutations: 5           # permutations for ROI-decoding/searchlight
   variance_threshold: 1e-12     # avoid flat time series
   permute_both_sets: true       # false: only permute training labels
   permute_within_groups: false  # true: LOSO/LORO set up; see 'outer_cv'
@@ -68,13 +68,13 @@ decoding_settings:
 
   # this field pertains to panic.plugins.PLUGIN_REGISTRY
   # analysis:
-  #   name: vanilla_nearest_centroid
+  #   type: vanilla_nearest_centroid
   #   permutations: true
   #   higher_is_better: true
   #   args: {}
 
   # analysis:
-  #   name: n_region_nearest_centroid
+  #   type: n_region_nearest_centroid
   #   permutations: true
   #   higher_is_better: true
   #   args:
@@ -82,7 +82,7 @@ decoding_settings:
   #     linkage: ward
 
   # analysis:
-  #   name: fixed_n_region_generative
+  #   type: fixed_n_region_generative
   #   permutations: true
   #   higher_is_better: true
   #   args:
@@ -100,20 +100,21 @@ decoding_settings:
   #     run_seed_stride: 1000
 
   analysis:
-    name: scikit_decoding
+    type: scikit_decoding
+    name: SVM_CSm_v_CSpu
     permutations: true
     higher_is_better: true
     args: {}
 
   # analysis:
-  #   name: dimensionality
+  #   type: dimensionality
   #   permutations: false
   #   higher_is_better: true
   #   args:
   #     metric: participation_ratio
 
   # analysis:
-  #   name: cs_us_similarity
+  #   type: cs_us_similarity
   #   output_kind: timeseries
   #   args:
   #     cs_label: CSpu
@@ -121,7 +122,7 @@ decoding_settings:
   #     metric: cosine
 
   # analysis:
-  #   name: rsa
+  #   type: rsa
   #   permutations: false
   #   higher_is_better: true
   #   args:

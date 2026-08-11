@@ -205,7 +205,7 @@ def run_decoding_with_permutation(
 
         logger.info(f"Running plugin: {plugin} with args: {plugin_kwargs}")
         analysis_cfg = cfg.get("analysis", {})
-        score_name = analysis_cfg.get("name", "decoding")
+        score_name = analysis_cfg.get("type", "decoding")
         do_permutations = bool(analysis_cfg.get("permutations", True))
         higher_is_better = bool(analysis_cfg.get("higher_is_better", True))
 
@@ -466,10 +466,16 @@ class ClassifySubject(data.PrepareBetas):
 
         # set output directory based on analysis name
         # e.g., 'decoding'/'cs_us_similarity'/'dimensionality'
+        
+        analysis = self.dec_settings["analysis"]
+
+        # name can be different
+        self.analysis_name = analysis.get("name") or analysis.get("type")
+
         self.save_dir = opj(
             self.gen_settings["save_dir"],
-            self.dec_settings["analysis"].get("name", "decoding"),
-            self.subject
+            self.analysis_name,
+            self.subject,
         )
 
         if not os.path.exists(self.save_dir):
@@ -760,7 +766,7 @@ class ClassifySubject(data.PrepareBetas):
                 )
             except (EmptyMaskError, NoFeaturesSelectedError, ValueError) as e:
                 logger.warning(f"Skipping ROI: {e}")
-                return None
+                return None, None
 
             # outer folds
             folds = create_outer_folds(
@@ -789,14 +795,15 @@ class ClassifySubject(data.PrepareBetas):
             except (NoFeaturesSelectedError, ValueError) as e:
                 # expected-ish failures for tiny ROIs / strict selection / degenerate folds
                 logger.warning(f"Skipping ROI: {e}")
-                return None
+                return None, extract
             except Exception:
                 # unexpected failure: log full traceback but still skip mask
                 logger.exception("Decoding failed unexpectedly; skipping ROI")
-                return None
+                return None, extract
         else:
             # Searchlight (same same, but different)
             try:
+                extract = None
                 ddict = permutation_searchlight(
                     betas,
                     mask,
@@ -810,12 +817,12 @@ class ClassifySubject(data.PrepareBetas):
             except (NoFeaturesSelectedError, ValueError) as e:
                 # expected-ish failures for tiny ROIs / strict selection / degenerate folds
                 logger.warning(f"Skipping ROI: {e}")
-                return None
+                return ddict, None
             except Exception:
                 logger.exception("Searchlight failed unexpectedly; skipping mask")
-                return None            
+                return ddict, None            
 
-        return ddict
+        return ddict, extract
     
 
     def define_mask_inputs(self):
@@ -984,7 +991,7 @@ class ClassifySubject(data.PrepareBetas):
                         f"{self.subject}_roi-{h_val[0]}_hemi-{h_key}_desc-valid_mask.nii.gz",
                     )
 
-                ddict = self.decode_single_mask(
+                ddict, extracted = self.decode_single_mask(
                     self.betas,
                     h_val[1],
                     trial_list=self.trial_list,
@@ -1010,11 +1017,19 @@ class ClassifySubject(data.PrepareBetas):
                         hemi_key: str(h_key),
                         "roi": str(h_val[0]),
                         "source": str(self.gen_settings["source"]),
-                        "method": str(self.gen_settings["method"])
+                        "method": str(self.gen_settings["method"]),
+                        **extracted.roi_metrics,
                     }
                     
                     if hemi_key == "hemi":
                         results_dict[hemi_key] = str(h_key)
+
+                    results_dict = self._extend_results_dict(
+                        results_dict,
+                        extracted=extracted,
+                        ddict=ddict,
+                        groups=self.groups,
+                    )
 
                     results.append(results_dict)
 
@@ -1069,6 +1084,7 @@ class ClassifySubject(data.PrepareBetas):
             # return results
             return out_files
 
+
     def generate_filename(self, desc=None, ext="csv"):
         base_name = f"{self.subject}_model-{self.gen_settings['method']}_source-{self.gen_settings['source']}"
 
@@ -1076,6 +1092,7 @@ class ClassifySubject(data.PrepareBetas):
             base_name += f"_desc-{desc}"
 
         return opj(self.save_dir, f"{base_name}.{ext}")
+
     
     @classmethod
     def extract_betas_from_rois(
@@ -1088,6 +1105,179 @@ class ClassifySubject(data.PrepareBetas):
             *args,
             **kwargs
         )
+
+
+    def _extend_results_dict(
+        self,
+        results_dict,
+        extracted,
+        ddict,
+        groups=None,
+    ):
+        """Extend a decoding result row with sample, model, CV, and QC metadata.
+
+        Parameters
+        ----------
+        results_dict : dict
+            Base result dictionary containing subject, ROI, decoding statistics,
+            and ROI spatial QC information.
+
+        extracted : object
+            ROI extraction result. Expected to expose ``X`` and ``labels``.
+            ``X`` must have shape ``(n_samples, n_features)``.
+
+        ddict : dict
+            Dictionary returned by the decoding/permutation procedure. Optional
+            metadata such as the number of permutations is included when present.
+
+        groups : array-like, optional
+            Group identifiers aligned with the decoded samples, such as run
+            identifiers.
+
+        Returns
+        -------
+        dict
+            The input dictionary extended with sample counts, class counts,
+            cross-validation settings, estimator information, and group metadata.
+
+        Notes
+        -----
+        Only scalar values suitable for tabular storage are added. Large objects
+        such as feature matrices, fitted estimators, masks, permutation arrays,
+        and full configuration dictionaries are deliberately excluded.
+        """
+        labels = np.asarray(extracted.labels)
+        outer_cfg = self.cfg["decoding_settings"].get("outer_cv", {})
+        inner_cfg = self.cfg["decoding_settings"].get("inner_cv", {})
+        estimator_cfg = self.cfg["decoding_settings"].get("estimator", {})
+
+        outer_args = outer_cfg.get("args", {})
+        inner_args = inner_cfg.get("args", {})
+
+        # --------------------------------------------------------------
+        # Sample / feature information
+        # --------------------------------------------------------------
+        results_dict.update({
+            "analysis": str(self.analysis_name),
+            "n_samples": int(extracted.X.shape[0]),
+            "n_features": int(extracted.X.shape[1]),
+            "n_classes": int(np.unique(labels).size),
+        })
+
+        # Store included labels and class counts.
+        classes, counts = np.unique(labels, return_counts=True)
+
+        label_mapper = self.cfg["label_dict"]
+        if label_mapper:
+            # Reverse mapping: encoded label -> original class name.
+            inverse_mapper = {
+                value: key
+                for key, value in label_mapper.items()
+            }
+
+            class_names = [
+                inverse_mapper.get(label, str(label))
+                for label in classes
+            ]
+
+            results_dict["class_names"] = ",".join(
+                map(str, class_names)
+            )
+
+            for label, class_name, count in zip(
+                classes,
+                class_names,
+                counts,
+            ):
+                results_dict[f"n_{class_name}"] = int(count)
+
+        else:
+            results_dict["class_names"] = ",".join(
+                map(str, classes)
+            )
+
+            for label, count in zip(classes, counts):
+                results_dict[f"n_class_{label}"] = int(count)
+
+        # --------------------------------------------------------------
+        # Permutation information
+        if "n_perms" in ddict:
+            results_dict["n_perms"] = int(ddict["n_perms"])
+
+        if "n_run" in ddict:
+            results_dict["n_run"] = int(ddict["n_run"])
+
+        # --------------------------------------------------------------
+        # Outer cross-validation
+        outer_mode = outer_cfg.get("mode", "sklearn")
+
+        results_dict.update({
+            "outer_cv_mode": outer_mode,
+            "outer_cv_name": outer_cfg.get("name"),
+            "outer_fold_interval": outer_args.get("fold_interval"),
+        })
+
+        # --------------------------------------------------------------
+        # Inner cross-validation
+        results_dict.update({
+            "inner_cv_name": inner_cfg.get("name"),
+            "inner_n_splits": inner_args.get("n_splits"),
+        })
+
+        # --------------------------------------------------------------
+        # Estimator / scoring
+        results_dict.update({
+            "estimator": estimator_cfg.get("name"),
+            "scoring": self.cfg["decoding_settings"].get(
+                "scoring",
+                "balanced_accuracy",
+            ),
+        })
+
+        # --------------------------------------------------------------
+        # Group information
+        if groups is not None and self.cfg.get("permute_within_groups", False):
+            groups = np.asarray(groups)
+
+            results_dict.update({
+                "group_aware": True,
+                "n_groups": int(np.unique(groups).size),
+            })
+        else:
+            results_dict.update({
+                "group_aware": False,
+                "n_groups": 0,
+            })
+
+        # --------------------------------------------------------------
+        # Convenient ROI QC flags
+        metrics = extracted.roi_metrics
+
+        n_voxels = metrics.get("n_voxels")
+        coverage = metrics.get("volume_coverage_ratio")
+        valid_fraction = metrics.get("valid_voxel_fraction")
+
+        results_dict.update({
+            "tiny_roi": (
+                bool(n_voxels < 5)
+                if n_voxels is not None
+                else None
+            ),
+            "low_volume_coverage": (
+                bool(coverage < 0.5)
+                if coverage is not None and np.isfinite(coverage)
+                else None
+            ),
+            "low_valid_voxel_fraction": (
+                bool(valid_fraction < 0.8)
+                if valid_fraction is not None
+                and np.isfinite(valid_fraction)
+                else None
+            ),
+        })
+
+        return results_dict
+
 
     def prepare_rois(
             self,
