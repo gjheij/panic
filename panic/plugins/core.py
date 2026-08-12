@@ -189,18 +189,50 @@ def get_analysis_plugin(
     Parameters
     ----------
     cfg : mapping
-        Decoding settings dictionary. Expected optional structure::
+        Decoding settings dictionary. The ``analysis`` section defines the
+        analysis plugin and optional analysis-specific arguments. For example::
 
             analysis:
-              type: sklearn_decoding
-              args: {}
+            type: scikit_decoding
+            args: {}
 
-        To save in a different parent folder, use:
+        ``type`` identifies the analysis plugin. Exact names registered in
+        ``PLUGIN_REGISTRY`` are supported, as are ``scikit_*`` analysis types,
+        which are dispatched to the generic scikit-learn decoding plugin. For
+        example::
 
             analysis:
-              type: sklearn_decoding,
-              name: SVM_CSm_v_CSpu
-              args: {}              
+            type: scikit_svm
+            args: {}
+
+        An optional ``name`` may be provided to assign a descriptive identifier
+        to the analysis::
+
+            analysis:
+            type: scikit_svm
+            name: SVM_CSm_v_CSpu
+            args: {}
+
+        ``name`` does not determine which plugin is executed. It is used to
+        identify the analysis in output paths and result metadata, allowing the
+        same analysis name to be used with different plugin types if desired.
+
+        For example::
+
+            analysis:
+            type: vanilla_nearest_centroid
+            name: SVM_CSm_v_CSpu
+            args: {}
+
+        and::
+
+            analysis:
+            type: scikit_svm
+            name: SVM_CSm_v_CSpu
+            args: {}
+
+        represent distinct analysis types while sharing the same descriptive
+        analysis name.     
 
     label_dict : mapping, optional
         Mapping from condition names to integer labels. When provided,
@@ -233,14 +265,29 @@ def get_analysis_plugin(
     KeyError
         If the requested plugin name is not registered.
     """
-    analysis = cfg.get("analysis", {"type": "decoding", "args": {}})
-    name = analysis.get("type", "decoding")
+    analysis = cfg.get(
+        "analysis",
+        {
+            "type": "scikit_decoding",
+            "args": {},
+        },
+    )
 
-    if name not in PLUGIN_REGISTRY:
+    name = analysis.get("type", "scikit_decoding")
+
+    # Exact match first.
+    if name in PLUGIN_REGISTRY:
+        plugin = PLUGIN_REGISTRY[name]
+
+    # Prefix-based fallback for scikit-learn analyses.
+    elif name.startswith("scikit_"):
+        plugin = decoding_plugin
+
+    else:
         available = ", ".join(sorted(PLUGIN_REGISTRY))
         raise KeyError(
             f"Unknown analysis plugin {name!r}. "
-            f"Available plugins: {available}"
+            f"Available plugins: {available}, scikit_*"
         )
 
     plugin_kwargs = analysis.get("args", {}).copy()
@@ -251,7 +298,7 @@ def get_analysis_plugin(
             label_dict,
         )
 
-    return PLUGIN_REGISTRY[name], plugin_kwargs
+    return plugin, plugin_kwargs
 
 
 def resolve_label_references(plugin_kwargs, label_dict):
