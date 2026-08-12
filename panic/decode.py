@@ -16,7 +16,8 @@ from panic.pipeline import create_outer_folds
 from panic.utils import (
     tqdm_disabled,
     load_yaml,
-    dump_yaml
+    dump_yaml,
+    make_analysis_id
 )
 from panic.logger import get_logger, tqdm_joblib
 from panic.searchlight import permutation_searchlight
@@ -203,9 +204,10 @@ def run_decoding_with_permutation(
             label_dict=label_mapper
         )
 
-        logger.info(f"Running plugin: {plugin} with args: {plugin_kwargs}")
         analysis_cfg = cfg.get("analysis", {})
         score_name = analysis_cfg.get("type", "decoding")
+
+        logger.info(f"Running plugin [{score_name}]: {plugin} with args: {plugin_kwargs}")
         do_permutations = bool(analysis_cfg.get("permutations", True))
         higher_is_better = bool(analysis_cfg.get("higher_is_better", True))
 
@@ -471,6 +473,17 @@ class ClassifySubject(data.PrepareBetas):
 
         # name can be different
         self.analysis_name = analysis.get("name") or analysis.get("type")
+        self.analysis_type = analysis.get("type")
+
+        # create unique hash based on settings
+        self.analysis_id = make_analysis_id(
+            analysis_name=self.analysis_name,
+            analysis_type=self.analysis_type,
+            source=self.gen_settings["source"],
+            method=self.gen_settings["method"],
+            standardize=self.gen_settings.get("standardize"),
+        )
+        logger.info(f"Analysis ID: {self.analysis_id}")
 
         self.save_dir = opj(
             self.gen_settings["save_dir"],
@@ -939,15 +952,16 @@ class ClassifySubject(data.PrepareBetas):
                         "source": str,
                         "method": str,
                         "analysis": str,
+                        "analysis_type": str,
+                        "analysis_id": str
                     },
                 )
 
                 required = {
+                    "subject",
+                    "analysis_id",
                     "roi",
-                    hemi_key,
-                    "source",
-                    "method",
-                    "analysis"
+                    hemi_key
                 }
 
                 missing = required - set(existing_results.columns)
@@ -963,11 +977,10 @@ class ClassifySubject(data.PrepareBetas):
                     for _, row in existing_results.iterrows():
                         completed_rois.add(
                             (
+                                str(row["subject"]),
+                                str(row["analysis_id"]),
                                 str(row["roi"]),
                                 str(row[hemi_key]),
-                                str(row["source"]),
-                                str(row["method"]),
-                                str(row["analysis"]),
                             )
                         )
 
@@ -998,34 +1011,34 @@ class ClassifySubject(data.PrepareBetas):
                 source = str(self.gen_settings["source"])
                 method = str(self.gen_settings["method"])
 
-                logger.info(
-                    "hemi-key=%s | roi-key=%s",
-                    hemi_label,
-                    roi_label,
-                )
-
                 # Incremental ROI skipping
-                roi_key = (
+                current_key = (
+                    str(self.bids_id),
+                    self.analysis_id,
                     roi_label,
                     hemi_label,
-                    source,
-                    method,
-                    str(self.analysis_name)
                 )
 
                 if (
                     not self.searchlight
                     and not overwrite
-                    and roi_key in completed_rois
+                    and current_key in completed_rois
                 ):
-                    logger.info(
+                    logger.warning(
                         "ROI already present in existing results; skipping: "
-                        "roi=%s | %s=%s",
+                        "roi=%s | %s=%s [entry=%s]",
                         roi_label,
                         hemi_key,
                         hemi_label,
+                        current_key
                     )
                     continue
+
+                logger.info(
+                    "hemi-key=%s | roi-key=%s",
+                    hemi_label,
+                    roi_label,
+                )
 
                 model_src_dir = opj(
                     self.save_dir,
@@ -1136,17 +1149,30 @@ class ClassifySubject(data.PrepareBetas):
 
                     null.extend(
                         {
-                            "subject": str(self.bids_id),
+                            "subject": str(self.subject),
+                            "analysis": str(self.analysis_name),
+                            "analysis_type": str(self.dec_settings["analysis"]["type"]),
+                            "analysis_id": str(self.analysis_id),
                             "roi": roi_label,
                             hemi_key: hemi_label,
                             "perm": i,
                             "acc": float(a),
                             "source": source,
                             "method": method,
+                            "n_samples": int(extracted.X.shape[0]),
+                            "n_features": int(extracted.X.shape[1]),
+                            "outer_cv_mode": self.dec_settings.get(
+                                "outer_cv", {}
+                            ).get("mode", "sklearn"),
+                            "outer_cv_name": self.dec_settings.get(
+                                "outer_cv", {}
+                            ).get("name"),
+                            "scoring": self.dec_settings.get(
+                                "scoring",
+                                "balanced_accuracy",
+                            ),
                         }
-                        for i, a in enumerate(
-                            ddict["permuted"]
-                        )
+                        for i, a in enumerate(ddict["permuted"])
                     )
 
                 else:
@@ -1154,10 +1180,12 @@ class ClassifySubject(data.PrepareBetas):
 
         # Save config
         cfg_file = self.generate_filename(
+            id=self.analysis_id,
             desc="config",
             ext="yml",
         )
 
+        self.cfg["analysis_id"] = self.analysis_id
         dump_yaml(
             self.cfg,
             cfg_file,
@@ -1165,6 +1193,11 @@ class ClassifySubject(data.PrepareBetas):
 
         shutil.copymode(
             self.config_file,
+            cfg_file,
+        )
+
+        logger.info(
+            "Writing config to: '%s'",
             cfg_file,
         )
 
@@ -1182,27 +1215,6 @@ class ClassifySubject(data.PrepareBetas):
                 )
             else:
                 res_df = new_results
-
-            # Optional safety de-duplication.
-            dedup_cols = [
-                "subject",
-                "roi",
-                hemi_key,
-                "source",
-                "method",
-            ]
-
-            available_dedup_cols = [
-                col
-                for col in dedup_cols
-                if col in res_df.columns
-            ]
-
-            if available_dedup_cols:
-                res_df = res_df.drop_duplicates(
-                    subset=available_dedup_cols,
-                    keep="last",
-                )
 
             logger.info(
                 "Writing results to: '%s'",
@@ -1243,27 +1255,6 @@ class ClassifySubject(data.PrepareBetas):
                     ignore_index=True,
                 )
 
-                null_dedup_cols = [
-                    "subject",
-                    "roi",
-                    hemi_key,
-                    "source",
-                    "method",
-                    "perm",
-                ]
-
-                available_null_dedup = [
-                    col
-                    for col in null_dedup_cols
-                    if col in null_df.columns
-                ]
-
-                if available_null_dedup:
-                    null_df = null_df.drop_duplicates(
-                        subset=available_null_dedup,
-                        keep="last",
-                    )
-
             else:
                 null_df = new_null
 
@@ -1287,13 +1278,69 @@ class ClassifySubject(data.PrepareBetas):
         return out_files
 
 
-    def generate_filename(self, desc=None, ext="csv"):
-        base_name = f"{self.subject}_model-{self.gen_settings['method']}_source-{self.gen_settings['source']}"
+    def generate_filename(
+        self,
+        *,
+        desc=None,
+        ext="csv",
+        **entities,
+    ):
+        """Generate an output filename from arbitrary analysis entities.
+
+        Parameters
+        ----------
+        desc : str, optional
+            Description appended as the ``desc`` entity.
+
+        ext : str, default="csv"
+            File extension, with or without a leading period.
+
+        **entities
+            Arbitrary key-value entities to include in the filename, for example
+            ``analysis``, ``model``, ``source``, ``method``, ``roi``, or ``hemi``.
+
+            Entities with a value of ``None`` are omitted. Values are added in
+            insertion order.
+
+        Returns
+        -------
+        str
+            Full path inside ``self.save_dir``.
+
+        Examples
+        --------
+        >>> self.generate_filename(
+        ...     analysis="SVM_CSm_v_CSpu",
+        ...     model="LSA",
+        ...     source="stglm",
+        ...     desc="results",
+        ... )
+        '.../sub-015_analysis-SVM_CSm_v_CSpu_model-LSA_source-stglm_desc-results.csv'
+
+        >>> self.generate_filename(
+        ...     analysis_type="classification",
+        ...     analysis_name="SVM_CSm_v_CSpu",
+        ...     roi="bl",
+        ...     hemi="left",
+        ...     desc="results",
+        ... )
+        '.../sub-015_analysis_type-classification_analysis_name-SVM_CSm_v_CSpu_roi-bl_hemi-left_desc-results.csv'
+        """
+        parts = [str(self.subject)]
+
+        for key, value in entities.items():
+            if value is not None:
+                parts.append(f"{key}-{value}")
 
         if desc is not None:
-            base_name += f"_desc-{desc}"
+            parts.append(f"desc-{desc}")
 
-        return opj(self.save_dir, f"{base_name}.{ext}")
+        ext = str(ext).lstrip(".")
+
+        return opj(
+            self.save_dir,
+            f"{'_'.join(parts)}.{ext}",
+        )
 
     
     @classmethod
@@ -1356,11 +1403,11 @@ class ClassifySubject(data.PrepareBetas):
         outer_args = outer_cfg.get("args", {})
         inner_args = inner_cfg.get("args", {})
 
-        # --------------------------------------------------------------
         # Sample / feature information
-        # --------------------------------------------------------------
         results_dict.update({
             "analysis": str(self.analysis_name),
+            "analysis_type": str(self.analysis_type),
+            "analysis_id": str(self.analysis_id),
             "n_samples": int(extracted.X.shape[0]),
             "n_features": int(extracted.X.shape[1]),
             "n_classes": int(np.unique(labels).size),

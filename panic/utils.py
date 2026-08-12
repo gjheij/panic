@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import sys
 import yaml
+import json
+import hashlib
 import numpy as np
 import nibabel as nib
 from joblib import load
@@ -121,3 +123,65 @@ def load_mask(
         return mask_array, affine
 
     return mask_array
+
+
+def make_analysis_id(
+    *,
+    analysis_name,
+    analysis_type,
+    source,
+    method,
+    standardize,
+    length=12,
+):
+    """Create a deterministic identifier for a PANIC analysis.
+
+    The identifier captures the high-level analysis identity and permutation
+    strategy, while deliberately ignoring lower-level estimator, feature
+    selection, and cross-validation configuration.
+
+    Parameters
+    ----------
+    analysis_name : str
+        Human-readable analysis name.
+
+    analysis_type : str
+        Analysis/plugin type.
+
+    source : str
+        Source of the beta estimates.
+
+    method : str
+        Beta-estimation method, such as ``"LSA"`` or ``"LSS"``.
+
+    standardize : str, bool, or None
+        Standardization strategy applied to the beta estimates.
+
+    dec_settings : mapping
+        Decoding configuration containing permutation settings.
+
+    length : int, default=12
+        Number of hexadecimal SHA-256 characters retained.
+
+    Returns
+    -------
+    str
+        Deterministic analysis identifier.
+    """
+    payload = {
+        "analysis_name": str(analysis_name),
+        "analysis_type": str(analysis_type),
+        "source": str(source),
+        "method": str(method),
+        "standardize": standardize
+    }
+
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    return hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()[:length]
