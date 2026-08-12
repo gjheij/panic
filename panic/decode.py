@@ -1013,7 +1013,7 @@ class ClassifySubject(data.PrepareBetas):
 
                 # Incremental ROI skipping
                 current_key = (
-                    str(self.bids_id),
+                    str(self.subject),
                     self.analysis_id,
                     roi_label,
                     hemi_label,
@@ -1126,7 +1126,7 @@ class ClassifySubject(data.PrepareBetas):
                 # ROI results
                 if not self.searchlight:
                     results_dict = {
-                        "subject": str(self.bids_id),
+                        "subject": str(self.subject),
                         "observed_acc": ddict["observed"],
                         "null_mean": ddict["mean_permuted"],
                         "delta": ddict["delta"],
