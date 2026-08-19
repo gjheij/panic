@@ -17,7 +17,7 @@ from panic import data
 from panic.logger import get_logger, tqdm_joblib
 from panic.pipeline import create_outer_folds
 from panic.plugins import core
-from panic.utils import tqdm_disabled
+from panic.utils import tqdm_disabled, load_feature_matrix
 
 logger = get_logger(__name__)
 opj = os.path.join
@@ -283,6 +283,10 @@ def _one_center(
     if len(cols) < 2:
         return (cx, cy, cz), np.nan, np.nan, np.nan, np.nan, int(len(cols)), 0, 0, 0
 
+    # read data
+    X_center = load_feature_matrix(X_mm_path, cols=cols)
+
+    # read settings
     analysis_cfg = cfg.get("analysis", {})
     do_permutations = bool(analysis_cfg.get("permutations", True))
     higher_is_better = bool(analysis_cfg.get("higher_is_better", True))
@@ -291,11 +295,11 @@ def _one_center(
     output_kind = cfg.get("analysis", {}).get("output_kind", "scalar")
 
     result = plugin(
-        X_mm_path,
+        X_center,
         labels,
         cfg=cfg,
         folds=folds,
-        cols=cols,
+        cols=None,
         permute=False,
         return_artifacts=(output_kind == "timeseries"),
         **plugin_kwargs,
@@ -320,11 +324,11 @@ def _one_center(
         for s in seeds:
             v = float(
                 plugin(
-                    X_mm_path,
+                    X_center,
                     labels,
                     cfg=cfg,
                     folds=folds,
-                    cols=cols,
+                    cols=None,
                     rng=np.random.default_rng(int(s)),
                     permute=True,
                     **plugin_kwargs,
@@ -557,12 +561,15 @@ def permutation_searchlight(
     with tempfile.TemporaryDirectory(dir=tmpdir, prefix="panic_") as tmpd:
         X_path = dump(
             X,
-            os.path.join(tmpd, f"Xsl_full_{uuid.uuid4().hex}.joblib"),
-            compress=0
+            os.path.join(
+                tmpd,
+                f"Xsl_full_{uuid.uuid4().hex}.joblib",
+            ),
+            compress=0,
         )[0]
 
-        X_mm = load(X_path, mmap_mode="r")
-        logger.info(f"X={X_mm.shape} (n_samples, n_features)")
+        # Don't mmap X in the parent just to get its shape
+        logger.info(f"X={X.shape} (n_samples, n_features)")
 
         zooms = mf.mask_resampled_to_betas.header.get_zooms()
         offs  = _neighbors_ball_mm(zooms, radius_mm)
@@ -606,7 +613,7 @@ def permutation_searchlight(
         def _run(ix):
             center_ijk = tuple(map(int, centers[ix]))
             cols = _cols_for_center(center_ijk, offs, col_index_vol, vol_shape)
-
+            
             return _one_center(
                 center_ijk,
                 cols,
@@ -624,7 +631,7 @@ def permutation_searchlight(
                 save_dir=save_dir,
                 **kwargs,
             )
-        
+                
         if n_jobs == 1:
             out = []
             for i in tqdm(
@@ -633,21 +640,26 @@ def permutation_searchlight(
                 disable=tqdm_disabled(),
             ):
                 out.append(_run(i))
-        else:
-            with tqdm_joblib(
-                tqdm(
-                    total=len(centers),
-                    disable=tqdm_disabled()
-                ),
-            ):
-                out = Parallel(
-                    n_jobs=n_jobs,
-                    backend=par_cfg.get("backend", "loky"),
-                    prefer=par_cfg.get("prefer", "processes"),
-                    batch_size=par_cfg.get("batch_size", 16),
-                    verbose=par_cfg.get("verbose", 0)
-                )([delayed(_run)(i) for i in range(len(centers))])
 
+        else:
+            with Parallel(
+                n_jobs=n_jobs,
+                backend=par_cfg.get("backend", "loky"),
+                prefer=par_cfg.get("prefer", "processes"),
+                batch_size=par_cfg.get("batch_size", 16),
+                verbose=par_cfg.get("verbose", 0),
+            ) as parallel:
+
+                with tqdm_joblib(
+                    tqdm(
+                        total=len(centers),
+                        disable=tqdm_disabled(),
+                    )
+                ):
+                    out = parallel(
+                        delayed(_run)(i)
+                        for i in range(len(centers))
+                    )
 
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
