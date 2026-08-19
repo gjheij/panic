@@ -5,6 +5,7 @@
 import re
 import os
 import numpy as np
+import pandas as pd
 from nilearn import (
     image,
     maskers
@@ -787,38 +788,71 @@ class PrepareROIs:
 
 class PrepareBetas(BetaLoaderMixin):
     """
-    Prepare trialwise beta images for decoding analyses.
+    Prepare trialwise beta images and associated event metadata for decoding.
 
     The :class:`PrepareBetas` class handles loading, sanitizing, and merging
     trialwise beta images across multiple preprocessing pipelines
-    (e.g., **GLMsingle**, **stGLM**, **Bach**, or **HALFpipe**).  
-    It standardizes voxel data, removes invalid values, and produces
-    a clean 4D image with associated trial labels and optional run group
-    identifiers.
+    (e.g., **GLMsingle**, **stGLM**, **Bach**, or **HALFpipe**).
+
+    It standardizes voxel data, removes invalid values, and produces a clean
+    4D beta image together with its trial labels, optional event metadata,
+    and optional run/group identifiers.
 
     The class supports two main initialization modes:
 
-    1. **Direct mode** – when a single pre-merged NIfTI image and trial list
-       are provided via ``beta_file`` and ``trial_list``.
-    2. **Automatic mode** – when only configuration arguments are passed;
-       it will invoke :meth:`load_and_merge_betas` to locate and merge
-       source files automatically.
+    1. **Direct mode** – a pre-merged NIfTI image is supplied via
+       ``beta_file``. Trial information can then be supplied either directly
+       through ``trial_list`` or through an ``events_file``.
+
+       When ``events_file`` is provided, it is loaded into ``events_df`` and
+       must contain at least the columns ``onset``, ``trial_type``, and
+       ``label``. If ``trial_list`` is not explicitly provided,
+       ``events_df["trial_type"]`` is used as the trial list.
+
+       If the events table also contains ``run_id``, that column is exposed
+       as ``groups``.
+
+    2. **Automatic mode** – when ``beta_file`` is omitted, configuration
+       arguments are forwarded to :meth:`load_and_merge_betas`, which
+       discovers, loads, merges, sanitizes, and aligns the source beta images
+       and their metadata automatically.
 
     **Typical Workflow**
 
         .. code-block:: python
 
+            # Direct mode with an explicit trial list
             prep = PrepareBetas(
                 beta_file="sub-01_model-lsa_desc-merged_betas.nii.gz",
                 trial_list=["CS-", "CS+", "CS-", "CS+"],
-                standardize="zscore"
+                standardize="zscore",
             )
 
             betas_img = prep.betas
             trials = prep.trial_list
-            print(prep.do_standardization)  # False (if z-scored)
 
-        or automatically:
+    Direct mode can instead use an events table:
+
+        .. code-block:: python
+
+            prep = PrepareBetas(
+                beta_file="sub-01_model-lsa_desc-merged_betas.nii.gz",
+                events_file="sub-01_desc-trial_order.tsv",
+                standardize="zscore",
+            )
+
+            betas_img = prep.betas
+            trials = prep.trial_list
+            events = prep.events_df
+            groups = prep.groups
+
+    In this case, if ``trial_list`` was not supplied explicitly:
+
+        .. code-block:: python
+
+            prep.trial_list == prep.events_df["trial_type"].to_numpy()
+
+    Automatic loading remains available:
 
         .. code-block:: python
 
@@ -826,54 +860,98 @@ class PrepareBetas(BetaLoaderMixin):
                 subject="sub-01",
                 beta_dir="/data/derivatives/stglm",
                 model="lsa",
-                save_imgs=True
+                save_imgs=True,
             )
 
-            betas_img, trials, is_std, groups = prep.betas, prep.trial_list, prep.do_standardization, prep.groups
+            betas_img = prep.betas
+            trials = prep.trial_list
+            groups = prep.groups
+            events = prep.events_df
 
     :param str | None beta_file:
-        Path to a single merged 4D beta image. If provided, ``trial_list`` must
-        also be given. If omitted, the class automatically loads betas from disk
-        using :meth:`load_and_merge_betas`.
+        Path to a pre-merged 3D or 4D beta NIfTI image. When provided,
+        trial metadata must be supplied either via ``trial_list`` or
+        ``events_file``. When omitted, beta images and metadata are obtained
+        automatically with :meth:`load_and_merge_betas`.
+
     :param list | numpy.ndarray | None trial_list:
-        List of condition or event names (one per beta volume).  
-        Required when ``beta_file`` is specified.
+        Trial or condition names corresponding one-to-one with the beta
+        volumes. When ``beta_file`` is provided, this takes precedence over
+        deriving trial labels from ``events_file``. If omitted and an
+        ``events_file`` is provided, the trial list is derived from its
+        ``trial_type`` column.
+
+    :param str | None events_file:
+        Path to a TSV or CSV events table corresponding to the beta volumes.
+        The table must contain at least ``onset``, ``trial_type``, and
+        ``label`` columns.
+
+        The canonical event table generated by the automatic beta loader
+        contains:
+
+        - ``onset`` — event onset
+        - ``duration`` — event duration
+        - ``run_id`` — run identifier
+        - ``trial_type`` — trial/condition name
+        - ``label`` — mapped analysis label
+
+        If ``trial_list`` is omitted, ``trial_type`` is used to construct
+        ``self.trial_list``. If ``run_id`` is present, it is used to
+        construct ``self.groups``.
+
     :param kwargs:
-        Additional parameters forwarded to :meth:`sanitize_img` or
-        :meth:`load_and_merge_betas`.
+        Additional parameters forwarded to :meth:`sanitize_img` in direct
+        mode or :meth:`load_and_merge_betas` in automatic mode.
 
     **Attributes**
-        - ``betas`` : nibabel.Nifti1Image  
-          The cleaned and optionally merged beta image.
-        - ``trial_list`` : list[str]  
-          The list of trial identifiers corresponding to beta volumes.
-        - ``do_standardization`` : bool  
-          Whether downstream scaling (e.g., `StandardScaler`) is still needed.
-        - ``groups`` : list[int] | None  
-          Optional run identifiers if parsed from filenames.
+        - ``betas`` : nibabel.Nifti1Image
+          Cleaned and optionally merged beta image.
+
+        - ``trial_list`` : list | numpy.ndarray
+          Trial identifiers corresponding one-to-one with beta volumes.
+
+        - ``events_df`` : pandas.DataFrame | None
+          Event metadata associated with the beta volumes. In direct mode
+          this is loaded from ``events_file`` when supplied. In automatic
+          mode it is returned by :meth:`load_and_merge_betas`.
+
+        - ``do_standardization`` : bool
+          Whether downstream scaling (e.g., ``StandardScaler``) is still
+          required.
+
+        - ``groups`` : numpy.ndarray | list | None
+          Optional run/group identifiers corresponding to the beta volumes.
 
     **Main Methods**
-        - :meth:`sanitize_img` — replace invalid voxels, clip, and optionally z-score.
-        - :meth:`load_and_merge_betas` — load and concatenate trialwise betas,
-          auto-detecting file structure based on source type.
-        - :meth:`return_trials` — return the list of trials for convenience.
+        - :meth:`sanitize_img` — replace invalid voxels, clip values, and
+          optionally standardize beta values.
+        - :meth:`load_and_merge_betas` — discover, load, concatenate, and
+          align trialwise beta images and metadata.
+        - :meth:`return_trials` — return the trial list.
 
     **Notes**
-        - Compatible with trialwise beta extraction pipelines including:
-          * **GLMsingle** (`model-typeb`, `model-typed`)
-          * **stGLM** (JSON sidecars with TrialList)
-          * **HALFpipe** (condition-wise 4D betas + label mapper)
-          * **Bach** (optionally includes temporal derivative images)
-        - Produces standardized, analysis-ready input for decoding and ROI analyses.
+        - Explicit ``trial_list`` takes precedence over the ``trial_type``
+          column of ``events_file``.
+        - When ``events_file`` is supplied, its number of rows must match the
+          number of beta volumes.
+        - The final ``trial_list`` must always contain exactly one entry per
+          beta volume.
+        - ``groups`` are automatically populated from ``run_id`` when that
+          column is available in ``events_file``.
+        - Supported automatic beta sources include GLMsingle, stGLM,
+          HALFpipe, and Bach.
     """
 
     def __init__(
-            self,
-            beta_file: str=None,
-            trial_list: list=None,
-            **kwargs
-        ):
-                
+        self,
+        beta_file: str = None,
+        trial_list: list = None,
+        events_file: str = None,
+        **kwargs,
+    ):
+
+        # --------------------------------------------------------------
+        # Direct mode: use an already merged beta image
         if isinstance(beta_file, str):
             logger.info("Beta-file: '%s'", beta_file)
 
@@ -882,16 +960,125 @@ class PrepareBetas(BetaLoaderMixin):
                 **kwargs,
             )
 
+            self.events_df = None
+            self.groups = None
+
+            # ----------------------------------------------------------
+            # Load externally supplied event metadata
+            if events_file is not None:
+                if not isinstance(events_file, str):
+                    raise TypeError(
+                        "`events_file` must be a path string, "
+                        f"not {type(events_file).__name__}."
+                    )
+
+                if not os.path.isfile(events_file):
+                    raise FileNotFoundError(
+                        f"Events file '{events_file}' does not exist."
+                    )
+
+                logger.info("Events-file: '%s'", events_file)
+
+                if events_file.lower().endswith(".tsv"):
+                    sep = "\t"
+                elif events_file.lower().endswith(".csv"):
+                    sep = ","
+                else:
+                    raise ValueError(
+                        "`events_file` must be a TSV or CSV file, "
+                        f"not '{events_file}'."
+                    )
+
+                try:
+                    self.events_df = pd.read_csv(
+                        events_file,
+                        sep=sep,
+                    )
+                except (OSError, pd.errors.ParserError) as exc:
+                    raise ValueError(
+                        f"Could not read events file '{events_file}': {exc}"
+                    ) from exc
+
+                required_columns = {
+                    "onset",
+                    "trial_type",
+                    "label",
+                }
+
+                missing_columns = (
+                    required_columns
+                    - set(self.events_df.columns)
+                )
+
+                if missing_columns:
+                    raise ValueError(
+                        f"Events file '{events_file}' is missing required "
+                        f"column(s): {sorted(missing_columns)}. "
+                        "Expected at least: "
+                        f"{sorted(required_columns)}."
+                    )
+
+                # Use event ordering as trial ordering unless an explicit
+                # trial_list was supplied.
+                if trial_list is None:
+                    trial_list = (
+                        self.events_df["trial_type"]
+                        .to_numpy()
+                    )
+
+                # Recover run/group information when available.
+                if "run_id" in self.events_df.columns:
+                    self.groups = (
+                        self.events_df["run_id"]
+                        .to_numpy()
+                    )
+
+            # ----------------------------------------------------------
+            # A trial list is mandatory in direct mode, either explicitly
+            # or indirectly through events_file["trial_type"].
             if not isinstance(trial_list, (list, np.ndarray)):
                 raise TypeError(
-                    "`trial_list` must be a list or numpy array when "
-                    "`beta_file` is provided."
+                    "When `beta_file` is provided, either `trial_list` "
+                    "must be a list/numpy array or `events_file` must "
+                    "provide a `trial_type` column."
                 )
 
             self.trial_list = trial_list
-            self.groups = None
-            self.events_df = None
 
+            # ----------------------------------------------------------
+            # Validate one-to-one beta / trial / event correspondence
+            n_betas = (
+                self.betas.shape[-1]
+                if self.betas.ndim == 4
+                else 1
+            )
+
+            if len(self.trial_list) != n_betas:
+                raise ValueError(
+                    f"Number of trials ({len(self.trial_list)}) does not "
+                    f"match number of beta volumes ({n_betas})."
+                )
+
+            if (
+                self.events_df is not None
+                and len(self.events_df) != n_betas
+            ):
+                raise ValueError(
+                    f"Number of events ({len(self.events_df)}) does not "
+                    f"match number of beta volumes ({n_betas})."
+                )
+
+            if (
+                self.groups is not None
+                and len(self.groups) != n_betas
+            ):
+                raise ValueError(
+                    f"Number of groups ({len(self.groups)}) does not "
+                    f"match number of beta volumes ({n_betas})."
+                )
+
+        # --------------------------------------------------------------
+        # Automatic mode
         else:
             (
                 self.betas,

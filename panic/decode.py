@@ -627,17 +627,33 @@ class ClassifySubject(data.PrepareBetas):
             ``self.gen_settings["source"]``.
         """
 
-        beta_dir = opj(
-            self.gen_settings["project_dir"],
-            "derivatives",
-            self.gen_settings["source"]
+        beta_input = (
+            {"beta_file": self.gen_settings["beta_file"]}
+            if "beta_file" in self.gen_settings
+            else {
+                "beta_dir": opj(
+                    self.gen_settings["project_dir"],
+                    "derivatives",
+                    self.gen_settings["source"],
+                )
+            }
         )
 
-        assert os.path.exists(beta_dir), FileNotFoundError(f"Beta directory '{beta_dir}' does not exist")
+        optional_inputs = {
+            key: self.gen_settings[key]
+            for key in ("trial_list", "events_file")
+            if key in self.gen_settings
+        }
+
+        if "beta_dir" in beta_input:
+            assert os.path.exists(beta_input["beta_dir"]), FileNotFoundError(
+                f"Beta directory '{beta_input['beta_dir']}' does not exist"
+            )
 
         ddict = {
             "subject": self.subject,
-            "beta_dir": beta_dir,
+            **beta_input,
+            **optional_inputs,
             "derivative": self.cfg.get("fitted_derivative", False),
             "model": self.gen_settings.get("method", "lsa"),
             "standardize": self.gen_settings.get("standardize", False),
@@ -830,10 +846,10 @@ class ClassifySubject(data.PrepareBetas):
             except (NoFeaturesSelectedError, ValueError) as e:
                 # expected-ish failures for tiny ROIs / strict selection / degenerate folds
                 logger.warning(f"Skipping ROI: {e}")
-                return ddict, None
+                return None, None
             except Exception:
                 logger.exception("Searchlight failed unexpectedly; skipping mask")
-                return ddict, None            
+                return None, None            
 
         return ddict, extract
     
