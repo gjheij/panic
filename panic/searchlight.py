@@ -654,7 +654,6 @@ def permutation_searchlight(
                 label="Searchlight",
                 logger=logger,
                 every=update_interval,
-                return_as="generator_unordered"
             )
 
             with Parallel(
@@ -663,6 +662,7 @@ def permutation_searchlight(
                 prefer=par_cfg.get("prefer", "processes"),
                 batch_size=par_cfg.get("batch_size", 16),
                 verbose=par_cfg.get("verbose", 0),
+                return_as="generator_unordered"
             ) as parallel:
 
                 with tqdm_joblib(
