@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 from panic.pipeline import (
     sklearn_pipeline_score,
-    load_feature_matrix,
     cv_mean_function_score
 )
 
+from panic.utils import load_feature_matrix
 
 from .spatially_informed import (
     vanilla_nearest_centroid_score,
