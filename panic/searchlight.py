@@ -3,7 +3,6 @@
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 
 import json
-import time
 import os
 import tempfile
 import uuid
@@ -617,13 +616,8 @@ def permutation_searchlight(
 
         def _run(ix):
             center_ijk = tuple(map(int, centers[ix]))
-            cols = _cols_for_center(
-                center_ijk,
-                offs,
-                col_index_vol,
-                vol_shape,
-            )
-
+            cols = _cols_for_center(center_ijk, offs, col_index_vol, vol_shape)
+            
             return _one_center(
                 center_ijk,
                 cols,
@@ -641,77 +635,47 @@ def permutation_searchlight(
                 save_dir=save_dir,
                 **kwargs,
             )
+                
+        if n_jobs == 1:
+            out = []
+            for i in tqdm(
+                range(len(centers)),
+                total=len(centers),
+                disable=tqdm_disabled(),
+            ):
+                out.append(_run(i))
 
-        # DEBUG: run only the tail serially to identify a hanging center
-        debug_start = 219500
-
-        out = []
-
-        for i in range(debug_start, len(centers)):
-            center_ijk = tuple(map(int, centers[i]))
-
-            logger.info(
-                "Testing center %d/%d | ijk=%s",
-                i,
-                len(centers),
-                center_ijk,
+        else:
+            update_interval = int(
+                par_cfg.get("update_interval", 0)
+            )
+            progress = LoggedProgress(
+                total=len(centers),
+                label="Searchlight",
+                logger=logger,
+                every=update_interval,
+                return_as="generator_unordered"
             )
 
-            t0 = time.monotonic()
+            with Parallel(
+                n_jobs=n_jobs,
+                backend=par_cfg.get("backend", "loky"),
+                prefer=par_cfg.get("prefer", "processes"),
+                batch_size=par_cfg.get("batch_size", 16),
+                verbose=par_cfg.get("verbose", 0),
+            ) as parallel:
 
-            result = _run(i)
-
-            elapsed = time.monotonic() - t0
-
-            logger.info(
-                "Center %d/%d finished | ijk=%s | elapsed=%.2fs",
-                i,
-                len(centers),
-                center_ijk,
-                elapsed,
-            )
-
-            out.append(result)
-
-        # if n_jobs == 1:
-        #     out = []
-        #     for i in tqdm(
-        #         range(len(centers)),
-        #         total=len(centers),
-        #         disable=tqdm_disabled(),
-        #     ):
-        #         out.append(_run(i))
-
-        # else:
-        #     update_interval = int(
-        #         par_cfg.get("update_interval", 0)
-        #     )
-        #     progress = LoggedProgress(
-        #         total=len(centers),
-        #         label="Searchlight",
-        #         logger=logger,
-        #         every=update_interval
-        #     )
-
-        #     with Parallel(
-        #         n_jobs=n_jobs,
-        #         backend=par_cfg.get("backend", "loky"),
-        #         prefer=par_cfg.get("prefer", "processes"),
-        #         batch_size=par_cfg.get("batch_size", 16),
-        #         verbose=par_cfg.get("verbose", 0),
-        #     ) as parallel:
-
-        #         with tqdm_joblib(
-        #             tqdm(
-        #                 total=len(centers),
-        #                 disable=tqdm_disabled(),
-        #             ),
-        #             log_progress=progress,
-        #         ):
-        #             out = parallel(
-        #                 delayed(_run)(i)
-        #                 for i in range(len(centers))
-        #             )
+                with tqdm_joblib(
+                    tqdm(
+                        total=len(centers),
+                        disable=tqdm_disabled(),
+                    ),
+                    log_progress=progress,
+                ):
+                    out = parallel(
+                        delayed(_run)(i)
+                        for i in range(len(centers))
+                    )
 
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
