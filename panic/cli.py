@@ -203,18 +203,28 @@ def action_run(args):
         )
 
         os.makedirs(save_dir, exist_ok=True)
-        
-        # define log file | will be overwritten
-        log_file = os.path.join(save_dir, "log.log")
+
+        # use separate log files for ROI and searchlight runs
+        mode = "searchlight" if args.searchlight else "roi"
+
+        log_file = os.path.join(
+            save_dir,
+            f"{subj}_desc-{mode}_log.log",
+        )
 
         log_level = logging.DEBUG if args.debug else logging.INFO
-        init_logging(level=log_level, logfile=log_file)
+
+        init_logging(
+            level=log_level,
+            logfile=log_file,
+            filemode="w",
+        )
 
         decoder = ClassifySubject(
             subj,
             str(cfg_to_use),
             save_imgs=args.save_imgs,
-            searchlight=args.searchlight
+            searchlight=args.searchlight,
         )
 
         decoder._fit()
