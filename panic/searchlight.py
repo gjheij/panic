@@ -370,6 +370,59 @@ def _one_center(
     )
 
 
+def _run_searchlight_center(
+        ix,
+        centers,
+        offsets,
+        col_index_vol,
+        vol_shape,
+        X_path,
+        labels,
+        folds,
+        cfg,
+        groups,
+        n_perms,
+        center_seeds,
+        plugin,
+        plugin_kwargs,
+        locked_params,
+        save_dir,
+        kwargs,
+    ):
+    """Run one searchlight center from a module-level, picklable worker.
+
+    This wrapper is intentionally defined at module scope so it can be used by
+    both Joblib's ``loky`` backend and the standard ``multiprocessing`` backend.
+    The latter cannot pickle functions defined locally inside
+    :func:`permutation_searchlight`.
+    """
+    center_ijk = tuple(map(int, centers[ix]))
+    cols = _cols_for_center(
+        center_ijk,
+        offsets,
+        col_index_vol,
+        vol_shape,
+    )
+
+    return _one_center(
+        center_ijk,
+        cols,
+        X_path,
+        labels,
+        folds,
+        cfg,
+        groups=groups,
+        n_perms=n_perms,
+        seed=int(center_seeds[ix]),
+        plugin=plugin,
+        plugin_kwargs=plugin_kwargs,
+        locked=locked_params,
+        searchlight=True,
+        save_dir=save_dir,
+        **kwargs,
+    )
+
+
 def permutation_searchlight(
         betas_img,            # 4D betas (nifti)
         mask_img,             # binary ROI/brain mask (nifti)
@@ -614,28 +667,25 @@ def permutation_searchlight(
         logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
         logger.info("Start searchlight analysis")
 
-        def _run(ix):
-            center_ijk = tuple(map(int, centers[ix]))
-            cols = _cols_for_center(center_ijk, offs, col_index_vol, vol_shape)
-            
-            return _one_center(
-                center_ijk,
-                cols,
-                X_path,
-                y,
-                folds,
-                cfg,
-                groups=groups,
-                n_perms=n_perms,
-                seed=int(center_seeds[ix]),
-                plugin=plugin,
-                plugin_kwargs=plugin_kwargs,
-                locked=locked_params,
-                searchlight=True,
-                save_dir=save_dir,
-                **kwargs,
-            )
-                
+        worker_kwargs = {
+            "centers": centers,
+            "offsets": offs,
+            "col_index_vol": col_index_vol,
+            "vol_shape": vol_shape,
+            "X_path": X_path,
+            "labels": y,
+            "folds": folds,
+            "cfg": cfg,
+            "groups": groups,
+            "n_perms": n_perms,
+            "center_seeds": center_seeds,
+            "plugin": plugin,
+            "plugin_kwargs": plugin_kwargs,
+            "locked_params": locked_params,
+            "save_dir": save_dir,
+            "kwargs": kwargs,
+        }
+
         if n_jobs == 1:
             out = []
             for i in tqdm(
@@ -643,7 +693,12 @@ def permutation_searchlight(
                 total=len(centers),
                 disable=tqdm_disabled(),
             ):
-                out.append(_run(i))
+                out.append(
+                    _run_searchlight_center(
+                        i,
+                        **worker_kwargs,
+                    )
+                )
 
         else:
             update_interval = int(
@@ -653,13 +708,12 @@ def permutation_searchlight(
                 total=len(centers),
                 label="Searchlight",
                 logger=logger,
-                every=update_interval
+                every=update_interval,
             )
 
             with Parallel(
                 n_jobs=n_jobs,
                 backend=par_cfg.get("backend", "loky"),
-                # prefer=par_cfg.get("prefer", "processes"),
                 batch_size=par_cfg.get("batch_size", 16),
                 verbose=par_cfg.get("verbose", 0),
             ) as parallel:
@@ -672,7 +726,10 @@ def permutation_searchlight(
                     log_progress=progress,
                 ):
                     out = parallel(
-                        delayed(_run)(i)
+                        delayed(_run_searchlight_center)(
+                            i,
+                            **worker_kwargs,
+                        )
                         for i in range(len(centers))
                     )
 
