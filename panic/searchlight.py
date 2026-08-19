@@ -646,58 +646,35 @@ def permutation_searchlight(
                 out.append(_run(i))
 
         else:
-            chunk_size = int(
-                par_cfg.get("chunk_size", 20000)
-            )
-
             update_interval = int(
                 par_cfg.get("update_interval", 0)
             )
-
             progress = LoggedProgress(
                 total=len(centers),
                 label="Searchlight",
                 logger=logger,
-                every=update_interval,
+                every=update_interval
             )
 
-            out = []
+            with Parallel(
+                n_jobs=n_jobs,
+                backend=par_cfg.get("backend", "loky"),
+                # prefer=par_cfg.get("prefer", "processes"),
+                batch_size=par_cfg.get("batch_size", 16),
+                verbose=par_cfg.get("verbose", 0),
+            ) as parallel:
 
-            for start in range(0, len(centers), chunk_size):
-
-                stop = min(
-                    start + chunk_size,
-                    len(centers),
-                )
-
-                logger.info(
-                    "Searchlight chunk: %d:%d / %d",
-                    start,
-                    stop,
-                    len(centers),
-                )
-
-                with Parallel(
-                    n_jobs=n_jobs,
-                    backend=par_cfg.get("backend", "loky"),
-                    prefer=par_cfg.get("prefer", "processes"),
-                    batch_size=par_cfg.get("batch_size", 1),
-                    verbose=par_cfg.get("verbose", 0),
-                ) as parallel:
-
-                    with tqdm_joblib(
-                        tqdm(
-                            total=stop - start,
-                            disable=tqdm_disabled(),
-                        ),
-                        log_progress=progress,
-                    ):
-                        chunk_out = parallel(
-                            delayed(_run)(i)
-                            for i in range(start, stop)
-                        )
-
-                out.extend(chunk_out)
+                with tqdm_joblib(
+                    tqdm(
+                        total=len(centers),
+                        disable=tqdm_disabled(),
+                    ),
+                    log_progress=progress,
+                ):
+                    out = parallel(
+                        delayed(_run)(i)
+                        for i in range(len(centers))
+                    )
 
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
