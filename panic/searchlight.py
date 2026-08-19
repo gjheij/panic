@@ -646,40 +646,59 @@ def permutation_searchlight(
                 out.append(_run(i))
 
         else:
+            update_interval = ichunk_size = int(
+                par_cfg.get("chunk_size", 20000)
+            )
+
             update_interval = int(
                 par_cfg.get("update_interval", 0)
             )
 
-            debug_start = 219500
-            debug_total = len(centers) - debug_start
-
             progress = LoggedProgress(
-                total=debug_total,
-                label="Searchlight tail",
+                total=len(centers),
+                label="Searchlight",
                 logger=logger,
                 every=update_interval,
             )
 
-            with Parallel(
-                n_jobs=n_jobs,
-                backend=par_cfg.get("backend", "loky"),
-                prefer=par_cfg.get("prefer", "processes"),
-                batch_size=1,
-                verbose=par_cfg.get("verbose", 0),
-            ) as parallel:
+            out = []
 
-                with tqdm_joblib(
-                    tqdm(
-                        total=debug_total,
-                        disable=tqdm_disabled(),
-                    ),
-                    log_progress=progress,
-                ):
-                    out = parallel(
-                        delayed(_run)(i)
-                        for i in range(debug_start, len(centers))
-                    )
-                    
+            for start in range(0, len(centers), chunk_size):
+
+                stop = min(
+                    start + chunk_size,
+                    len(centers),
+                )
+
+                logger.info(
+                    "Searchlight chunk: %d:%d / %d",
+                    start,
+                    stop,
+                    len(centers),
+                )
+
+                with Parallel(
+                    n_jobs=n_jobs,
+                    backend=par_cfg.get("backend", "loky"),
+                    prefer=par_cfg.get("prefer", "processes"),
+                    batch_size=par_cfg.get("batch_size", 1),
+                    verbose=par_cfg.get("verbose", 0),
+                ) as parallel:
+
+                    with tqdm_joblib(
+                        tqdm(
+                            total=stop - start,
+                            disable=tqdm_disabled(),
+                        ),
+                        log_progress=progress,
+                    ):
+                        chunk_out = parallel(
+                            delayed(_run)(i)
+                            for i in range(start, stop)
+                        )
+
+                out.extend(chunk_out)
+
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
         obs_map         = np.full(vol_shape, np.nan, dtype=np.float32)
