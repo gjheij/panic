@@ -293,7 +293,7 @@ def _one_center(
     result = plugin(
         X_mm_path,
         labels,
-        cfg,
+        cfg=cfg,
         folds=folds,
         cols=cols,
         permute=False,
