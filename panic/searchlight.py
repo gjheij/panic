@@ -646,7 +646,7 @@ def permutation_searchlight(
                 out.append(_run(i))
 
         else:
-            update_interval = ichunk_size = int(
+            chunk_size = int(
                 par_cfg.get("chunk_size", 20000)
             )
 
