@@ -14,10 +14,14 @@ from statsmodels.stats.multitest import fdrcorrection
 from tqdm import tqdm
 
 from panic import data
-from panic.logger import (
-    get_logger,
-    tqdm_joblib,
-    LoggedProgress
+from panic.logger import get_logger
+from panic.monitor import (
+    SearchlightMonitor,
+    install_faulthandler,
+    maybe_log_worker_resources,
+    worker_heartbeat,
+    worker_mark_completed,
+    worker_task_started,
 )
 from panic.pipeline import create_outer_folds
 from panic.plugins import core
@@ -177,6 +181,8 @@ def _one_center(
         *,
         plugin,
         plugin_kwargs,
+        monitor_runtime_dir=None,
+        monitor_ix=None,
         **kwargs,
     ):
     """
@@ -288,7 +294,20 @@ def _one_center(
         return (cx, cy, cz), np.nan, np.nan, np.nan, np.nan, int(len(cols)), 0, 0, 0
 
     # read data
+    worker_heartbeat(
+        monitor_runtime_dir,
+        monitor_ix if monitor_ix is not None else -1,
+        "BEFORE_LOAD",
+        ncols=int(len(cols)),
+    )
     X_center = load_feature_matrix(X_mm_path, cols=cols)
+    worker_heartbeat(
+        monitor_runtime_dir,
+        monitor_ix if monitor_ix is not None else -1,
+        "AFTER_LOAD",
+        ncols=int(len(cols)),
+        shape=list(X_center.shape),
+    )
 
     # read settings
     analysis_cfg = cfg.get("analysis", {})
@@ -311,6 +330,12 @@ def _one_center(
     )
 
     obs, artifacts = core.unpack_plugin_result(result)
+    worker_heartbeat(
+        monitor_runtime_dir,
+        monitor_ix if monitor_ix is not None else -1,
+        "AFTER_OBS",
+        ncols=int(len(cols)),
+    )
 
     if output_kind == "timeseries":
         ts = artifacts.get("cs_us_similarity", None)
@@ -325,7 +350,15 @@ def _one_center(
         center_rng = np.random.default_rng(int(seed))
         seeds = center_rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
-        for s in seeds:
+        for perm_ix, s in enumerate(seeds):
+            if perm_ix == 0 or perm_ix == len(seeds) - 1:
+                worker_heartbeat(
+                    monitor_runtime_dir,
+                    monitor_ix if monitor_ix is not None else -1,
+                    f"BEFORE_PERM_{perm_ix}",
+                    ncols=int(len(cols)),
+                )
+
             v = float(
                 plugin(
                     X_center,
@@ -388,6 +421,8 @@ def _run_searchlight_center(
         locked_params,
         save_dir,
         kwargs,
+        monitor_runtime_dir=None,
+        monitor_resource_every=1000,
     ):
     """Run one searchlight center from a module-level, picklable worker.
 
@@ -396,31 +431,81 @@ def _run_searchlight_center(
     The latter cannot pickle functions defined locally inside
     :func:`permutation_searchlight`.
     """
+    install_faulthandler()
+    task_count = worker_task_started()
     center_ijk = tuple(map(int, centers[ix]))
-    cols = _cols_for_center(
-        center_ijk,
-        offsets,
-        col_index_vol,
-        vol_shape,
+    worker_heartbeat(
+        monitor_runtime_dir,
+        ix,
+        "START",
+        center_ijk=list(center_ijk),
+        task_count=int(task_count),
     )
 
-    return _one_center(
-        center_ijk,
-        cols,
-        X_path,
-        labels,
-        folds,
-        cfg,
-        groups=groups,
-        n_perms=n_perms,
-        seed=int(center_seeds[ix]),
-        plugin=plugin,
-        plugin_kwargs=plugin_kwargs,
-        locked=locked_params,
-        searchlight=True,
-        save_dir=save_dir,
-        **kwargs,
-    )
+    try:
+        cols = _cols_for_center(
+            center_ijk,
+            offsets,
+            col_index_vol,
+            vol_shape,
+        )
+        worker_heartbeat(
+            monitor_runtime_dir,
+            ix,
+            "COLS_READY",
+            center_ijk=list(center_ijk),
+            ncols=int(len(cols)),
+            task_count=int(task_count),
+        )
+
+        result = _one_center(
+            center_ijk,
+            cols,
+            X_path,
+            labels,
+            folds,
+            cfg,
+            groups=groups,
+            n_perms=n_perms,
+            seed=int(center_seeds[ix]),
+            plugin=plugin,
+            plugin_kwargs=plugin_kwargs,
+            locked=locked_params,
+            searchlight=True,
+            save_dir=save_dir,
+            monitor_runtime_dir=monitor_runtime_dir,
+            monitor_ix=ix,
+            **kwargs,
+        )
+
+        worker_heartbeat(
+            monitor_runtime_dir,
+            ix,
+            "DONE",
+            center_ijk=list(center_ijk),
+            ncols=int(len(cols)),
+            task_count=int(task_count),
+        )
+        maybe_log_worker_resources(
+            logger,
+            task_count=task_count,
+            every=int(monitor_resource_every),
+            x_path=X_path,
+        )
+        worker_mark_completed(monitor_runtime_dir, ix)
+        return int(ix), result
+
+    except BaseException as exc:
+        worker_heartbeat(
+            monitor_runtime_dir,
+            ix,
+            "ERROR",
+            center_ijk=list(center_ijk),
+            task_count=int(task_count),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
 
 
 def permutation_searchlight(
@@ -667,6 +752,21 @@ def permutation_searchlight(
         logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
         logger.info("Start searchlight analysis")
 
+        monitor_root = par_cfg.get("monitor_runtime_dir")
+        if not monitor_root:
+            monitor_root = (
+                os.environ.get("SLURM_TMPDIR")
+                or os.environ.get("TMPDIR")
+                or tmpd
+            )
+        monitor_runtime_dir = opj(
+            os.path.expanduser(monitor_root),
+            f"panic_searchlight_monitor_{os.getpid()}",
+        )
+        monitor_snapshot_dir = opj(save_dir, "searchlight_monitor")
+        monitor_interval = float(par_cfg.get("monitor_interval", 60))
+        monitor_resource_every = int(par_cfg.get("monitor_resource_every", 1000))
+
         worker_kwargs = {
             "centers": centers,
             "offsets": offs,
@@ -684,54 +784,98 @@ def permutation_searchlight(
             "locked_params": locked_params,
             "save_dir": save_dir,
             "kwargs": kwargs,
+            "monitor_runtime_dir": monitor_runtime_dir,
+            "monitor_resource_every": monitor_resource_every,
         }
 
+        update_interval = int(par_cfg.get("update_interval", 0))
+        monitor_log_every = update_interval if update_interval > 0 else 5000
+        out = [None] * len(centers)
+
         if n_jobs == 1:
-            out = []
             for i in tqdm(
                 range(len(centers)),
                 total=len(centers),
                 disable=tqdm_disabled(),
             ):
-                out.append(
-                    _run_searchlight_center(
-                        i,
-                        **worker_kwargs,
-                    )
+                result_ix, result = _run_searchlight_center(
+                    i,
+                    **worker_kwargs,
                 )
+                out[result_ix] = result
 
         else:
-            update_interval = int(
-                par_cfg.get("update_interval", 0)
-            )
-            progress = LoggedProgress(
-                total=len(centers),
-                label="Searchlight",
+            # Deliberately consume results directly rather than monkey-patching
+            # joblib's BatchCompletionCallBack. This makes exact task identity
+            # observable and removes the tqdm/joblib callback from the diagnostic
+            # path. Results are restored to submission order via ``result_ix``.
+            monitor = SearchlightMonitor(
+                len(centers),
+                runtime_dir=monitor_runtime_dir,
+                snapshot_dir=monitor_snapshot_dir,
                 logger=logger,
-                every=update_interval,
+                interval=monitor_interval,
+                log_every=monitor_log_every,
             )
 
-            with Parallel(
-                n_jobs=n_jobs,
-                backend=par_cfg.get("backend", "loky"),
-                batch_size=par_cfg.get("batch_size", 16),
-                verbose=par_cfg.get("verbose", 0),
-            ) as parallel:
+            backend_name = par_cfg.get("backend", "loky")
 
-                with tqdm_joblib(
-                    tqdm(
-                        total=len(centers),
-                        disable=tqdm_disabled(),
-                    ),
-                    log_progress=progress,
-                ):
-                    out = parallel(
-                        delayed(_run_searchlight_center)(
-                            i,
-                            **worker_kwargs,
+            with monitor:
+                parallel_kwargs = dict(
+                    n_jobs=n_jobs,
+                    backend=backend_name,
+                    batch_size=par_cfg.get("batch_size", 16),
+                    verbose=par_cfg.get("verbose", 0),
+                    pre_dispatch=par_cfg.get("pre_dispatch", "2*n_jobs"),
+                )
+
+                # joblib's MultiprocessingBackend does not support generator
+                # return modes. Its workers still journal exact completions, so
+                # the watchdog remains informative while the parent blocks.
+                if backend_name == "multiprocessing":
+                    with Parallel(**parallel_kwargs) as parallel:
+                        result_pairs = parallel(
+                            delayed(_run_searchlight_center)(
+                                i,
+                                **worker_kwargs,
+                            )
+                            for i in range(len(centers))
                         )
-                        for i in range(len(centers))
-                    )
+
+                    for result_ix, result in result_pairs:
+                        out[result_ix] = result
+                        monitor.mark_completed(result_ix)
+
+                else:
+                    with Parallel(
+                        return_as="generator_unordered",
+                        **parallel_kwargs,
+                    ) as parallel:
+                        result_gen = parallel(
+                            delayed(_run_searchlight_center)(
+                                i,
+                                **worker_kwargs,
+                            )
+                            for i in range(len(centers))
+                        )
+
+                        with tqdm(
+                            total=len(centers),
+                            disable=tqdm_disabled(),
+                        ) as pbar:
+                            for result_ix, result in result_gen:
+                                out[result_ix] = result
+                                monitor.mark_completed(result_ix)
+                                pbar.update(1)
+
+            missing = np.flatnonzero(
+                np.fromiter((row is None for row in out), dtype=np.bool_, count=len(out))
+            )
+            if missing.size:
+                raise RuntimeError(
+                    "Parallel searchlight ended without results for center indices: "
+                    f"{missing[:100].tolist()}"
+                )
 
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
