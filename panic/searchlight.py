@@ -662,8 +662,15 @@ def permutation_searchlight(
                 prefer=par_cfg.get("prefer", "processes"),
                 batch_size=par_cfg.get("batch_size", 16),
                 verbose=par_cfg.get("verbose", 0),
-                return_as="generator_unordered"
+                return_as="generator_unordered",
             ) as parallel:
+
+                result_stream = parallel(
+                    delayed(_run)(i)
+                    for i in range(len(centers))
+                )
+
+                out = []
 
                 with tqdm_joblib(
                     tqdm(
@@ -672,10 +679,8 @@ def permutation_searchlight(
                     ),
                     log_progress=progress,
                 ):
-                    out = parallel(
-                        delayed(_run)(i)
-                        for i in range(len(centers))
-                    )
+                    for result in result_stream:
+                        out.append(result)
 
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
