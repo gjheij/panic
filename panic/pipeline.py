@@ -9,15 +9,13 @@ import nibabel as nib
 from joblib import dump
 from sklearn.utils.validation import has_fit_parameter
 from sklearn.model_selection._search import BaseSearchCV
-from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.base import BaseEstimator, TransformerMixin
 
 from panic.logger import get_logger
 from panic import (
     factory,
     errors
 )
-
-from panic.utils import load_feature_matrix
 
 from sklearn.feature_selection import (
     VarianceThreshold
@@ -797,6 +795,47 @@ def create_outer_folds(cfg, labels, groups=None):
         a group-aware splitter is selected without providing ``groups``,
         ``fold_interval`` is invalid, a generated fold contains no test
         samples, or ``outer_cv.mode`` is unknown.
+
+    Notes
+    -----
+    The outer CV folds are constructed once from the original labels and are
+    kept fixed for the observed analysis and all permutation realizations.
+
+    This is particularly important for ``outer_cv.mode == "nth_trial"``.
+    That splitter assigns test samples by taking every k-th trial separately
+    within each original class. The resulting train/test assignments therefore
+    represent the fixed Bach-style CV design.
+
+    Permutation inference changes only the association between samples and
+    class labels; it does not reconstruct the CV folds from the permuted
+    labels. Reconstructing folds for every permutation would simultaneously
+    alter both the labels and the train/test partition and would therefore
+    evaluate a different CV design from the observed statistic.
+
+    The intended scheme is::
+
+        original labels y
+            |
+            +----> create_outer_folds(y) ----> fixed folds F
+            |                                   |
+            |                                   +--> observed:
+            |                                   |      CV(X, y, F)
+            |                                   |
+            +----> permutation 1: y_perm_1 -----+--> CV(X, y_perm_1, F)
+            |
+            +----> permutation 2: y_perm_2 -----+--> CV(X, y_perm_2, F)
+            |
+            ...
+            |
+            +----> permutation P: y_perm_P -----+--> CV(X, y_perm_P, F)
+
+    Each ``y_perm`` is generated once and is used consistently across all
+    folds. Thus each permutation produces one coherent cross-validated null
+    score.
+
+    When ``groups`` are supplied and ``permute_within_groups=True``, labels
+    are shuffled within those exchangeability blocks before the fixed folds
+    are evaluated.        
     """
     labs = np.asarray(labels)
 
@@ -1159,108 +1198,175 @@ def recon_weights(roi, lin_roi, weights_path, output_file=None):
 
 
 def cv_mean_function_score(
-        X,
-        labels,
-        folds,
-        score_fn: FoldScoreFunction,
-        *,
-        groups=None,
-        permute: bool = False,
-        permute_both_sets: bool = True,
-        permute_within_groups: bool = True,
-        rng: Optional[np.random.Generator] = None,
-        **score_kwargs: Any,
-    ) -> float:
+    X,
+    labels,
+    folds,
+    score_fn: FoldScoreFunction,
+    *,
+    groups=None,
+    permute: bool = False,
+    permute_within_groups: bool = True,
+    rng: Optional[np.random.Generator] = None,
+    **score_kwargs: Any,
+) -> float:
     """
-    Compute mean cross-validated score using an arbitrary fold-scoring function.
+    Compute the mean cross-validated score for one observed or permuted dataset.
 
-    The supplied ``score_fn`` is responsible only for fitting/evaluating one
-    train/test split. This function handles folds and optional label
-    permutation independently of the underlying model implementation.
+    Labels are permuted once per call and the resulting label vector is used
+    consistently across all fixed CV folds.
+
+    Before fitting, every training fold is checked to ensure that it still
+    contains all classes represented in the original label vector. This is
+    mainly a safeguard for permutation analyses, where a rare shuffle could
+    otherwise produce a single-class training set and cause the classifier to
+    fail during fitting.
+
+    Scheme
+    ------
+
+    Observed::
+
+        original y
+            |
+            +---- fixed fold 1 ----> score_1
+            |
+            +---- fixed fold 2 ----> score_2
+            |
+            ...
+            |
+            +---- fixed fold K ----> score_K
+                                      |
+                                      v
+                                  mean score
+
+
+    Permutation::
+
+        original y
+            |
+            | permute ONCE
+            v
+         y_perm
+            |
+            | validate all training folds
+            |
+            +---- fixed fold 1 ----> score_1
+            |
+            +---- fixed fold 2 ----> score_2
+            |
+            ...
+            |
+            +---- fixed fold K ----> score_K
+                                      |
+                                      v
+                               permutation score
+
+    A complete permutation test repeats this function with independent random
+    seeds, producing one cross-validated null score per permutation.
 
     Parameters
     ----------
     X : array-like
-        Feature matrix with shape ``(n_samples, n_features)``.
+        Feature matrix of shape ``(n_samples, n_features)``.
+
     labels : array-like of shape (n_samples,)
-        Labels aligned to rows of ``X``.
+        Original labels aligned with rows of ``X``.
+
     folds : iterable of tuple(ndarray, ndarray)
-        Cross-validation splits as ``(train_idx, test_idx)`` pairs.
-    score_fn : callable
-        Function with signature::
+        Fixed outer-CV splits represented as ``(train_idx, test_idx)``.
 
-            score_fn(
-                X,
-                labels,
-                train_idx,
-                test_idx,
-                **score_kwargs,
-            ) -> float
+    score_fn : FoldScoreFunction
+        Function that fits and evaluates one train/test fold.
 
-        The function should fit and evaluate one fold and return a scalar
-        score.
     groups : array-like, optional
-        Group labels used for within-group permutations.
+        Exchangeability-group labels. When
+        ``permute_within_groups=True``, labels are shuffled only within these
+        groups.
+
     permute : bool, default=False
-        If True, evaluate folds using permuted labels.
-    permute_both_sets : bool, default=True
-        If True, permute both training and test labels. Otherwise, only
-        training labels are permuted.
+        If True, construct one permutation of ``labels`` before evaluating the
+        fixed folds.
+
     permute_within_groups : bool, default=True
-        Restrict permutations to group boundaries when ``groups`` is given.
+        Restrict permutation to groups when ``groups`` is provided.
+
     rng : numpy.random.Generator, optional
-        Random generator used for permutations.
+        Random-number generator used for permutation and downstream stochastic
+        model operations.
+
     **score_kwargs
-        Additional arguments forwarded unchanged to ``score_fn``.
+        Additional arguments forwarded to ``score_fn``.
 
     Returns
     -------
     float
-        Mean score across folds.
+        Mean score across valid CV folds.
+
+    Raises
+    ------
+    ValueError
+        If a training fold does not contain all classes represented in the
+        original label vector.
+
+    errors.NoFeaturesSelectedError
+        If all folds produce NaN scores.
     """
     X = np.asarray(X)
     y = np.asarray(labels)
-    groups = None if groups is None else np.asarray(groups)
 
-    if permute and rng is None:
-        rng = np.random.default_rng()
+    groups = (
+        None
+        if groups is None
+        else np.asarray(groups)
+    )
 
+    original_classes = np.unique(y)
+
+    # ---------------------------------------------------------------
+    # One coherent label vector for this complete CV realization.
+    if permute:
+        if rng is None:
+            rng = np.random.default_rng()
+
+        if permute_within_groups and groups is not None:
+            y_eval = _permute_within_groups(
+                y,
+                groups,
+                rng,
+            )
+        else:
+            y_eval = rng.permutation(y)
+
+    else:
+        y_eval = y
+
+    # ---------------------------------------------------------------
+    # Validate training folds before fitting.
+    #
+    # This is especially useful for permutation testing: a pathological
+    # shuffle should fail here with a clear error rather than inside SVC,
+    # LogisticRegression, etc.
+    for fold_i, (train_idx, test_idx) in enumerate(folds):
+        train_classes = np.unique(y_eval[train_idx])
+
+        if not np.array_equal(
+            np.sort(train_classes),
+            np.sort(original_classes),
+        ):
+            raise ValueError(
+                f"CV fold {fold_i} does not contain all classes in its "
+                f"training set. Expected {original_classes.tolist()}, "
+                f"found {train_classes.tolist()}."
+            )
+
+    # ---------------------------------------------------------------
+    # Cross-validation.
     fold_scores = []
 
     for train_idx, test_idx in folds:
-        fold_labels = y.copy()
-
-        if permute:
-            y_train = y[train_idx]
-            y_test = y[test_idx]
-
-            if permute_within_groups and groups is not None:
-                y_train = _permute_within_groups(
-                    y_train,
-                    groups[train_idx],
-                    rng,
-                )
-
-                if permute_both_sets:
-                    y_test = _permute_within_groups(
-                        y_test,
-                        groups[test_idx],
-                        rng,
-                    )
-            else:
-                y_train = rng.permutation(y_train)
-
-                if permute_both_sets:
-                    y_test = rng.permutation(y_test)
-
-            fold_labels[train_idx] = y_train
-
-            if permute_both_sets:
-                fold_labels[test_idx] = y_test
-
         score = score_fn(
             X,
-            fold_labels,
+            y_eval,
             train_idx,
             test_idx,
             groups=groups,
