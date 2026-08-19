@@ -31,188 +31,367 @@ opj = os.path.join
 
 
 def run_decoding_with_permutation(
-        X,
-        labels,
-        folds,
-        cfg,
-        label_mapper=None,
-        seed=0,
-        tmpdir=None,
-        groups=None,
-        **kwargs
-    ):
+    X,
+    labels,
+    folds,
+    cfg,
+    label_mapper=None,
+    seed=0,
+    tmpdir=None,
+    groups=None,
+    **kwargs,
+):
     """
-    Run decoding with permutation testing on ROI-level data.
+    Run ROI-level decoding with fixed-fold permutation testing.
 
-    This function performs cross-validated decoding on a feature matrix ``X``
-    to compute the **observed accuracy** and a **null distribution** of accuracies
-    obtained by label permutation. The implementation mirrors
-    :func:`utils._cv_mean_score` and is optimized for reproducibility and parallelization.
+    This function computes an observed cross-validated decoding score and an
+    empirical null distribution obtained by repeatedly permuting the labels.
+
+    The outer cross-validation folds are supplied by the caller and remain
+    fixed for the observed analysis and every permutation realization. Each
+    permutation uses one permuted label vector consistently across all folds;
+    this behavior is implemented by the downstream
+    ``cv_mean_function_score(..., permute=True)``.
+
+    Scheme
+    ------
+
+    Outer folds are constructed once before calling this function::
+
+        original labels y
+               |
+               +----> create_outer_folds(y)
+                            |
+                            v
+                       fixed folds F
+
+
+    Observed analysis::
+
+        X + original y + fixed folds F
+                       |
+                       v
+                  CV fold 1
+                  CV fold 2
+                     ...
+                  CV fold K
+                       |
+                       v
+                mean observed score
+
+
+    Permutation analysis::
+
+        permutation seed 1
+               |
+               v
+        permute y ONCE
+               |
+               v
+            y_perm_1
+               |
+               +---- fixed fold 1
+               +---- fixed fold 2
+               +---- ...
+               +---- fixed fold K
+                         |
+                         v
+                   null score 1
+
+
+        permutation seed 2
+               |
+               v
+            y_perm_2
+               |
+               v
+         same fixed folds
+               |
+               v
+          null score 2
+
+               ...
+
+        permutation seed P
+               |
+               v
+          null score P
+
+               |
+               v
+       empirical null distribution
+
+
+    If ``groups`` are supplied and ``cfg["permute_within_groups"]`` is True,
+    labels are shuffled only within those exchangeability blocks.
+
+    Parallelization
+    ---------------
+    The full feature matrix is dumped once to an uncompressed joblib file
+    inside a temporary working directory. Worker processes load that matrix
+    using memory mapping rather than receiving independent full copies.
+
+    The intended resource lifetime is::
+
+        TemporaryDirectory
+        |
+        +-- X.joblib
+        |
+        +-- observed analysis
+        |
+        +-- Parallel context
+        |      |
+        |      +-- permutation workers
+        |      +-- permutation workers
+        |      +-- ...
+        |
+        +-- aggregate null distribution
+        |
+        +-- cleanup
+
+    ``Parallel`` is explicitly used as a context manager so its backend
+    lifetime is nested inside the lifetime of the temporary directory.
 
     Parameters
     ----------
     X : numpy.ndarray, shape (n_samples, n_features)
-        Feature matrix. Typically contains beta values or trialwise features.
-    labels : array_like, shape (n_samples,)
-        Class labels corresponding to each row of ``X``.
-    folds : list of tuple
-        List of outer CV splits as tuples ``(train_idx, test_idx)``.
+        ROI-level feature matrix.
+
+    labels : array-like, shape (n_samples,)
+        Class labels aligned with rows of ``X``.
+
+    folds : list of tuple(ndarray, ndarray)
+        Fixed outer cross-validation splits represented as
+        ``(train_idx, test_idx)``.
+
     cfg : dict
-        Decoding configuration dictionary used by :func:`utils._cv_mean_score`.
-        Should contain entries for ``"estimator"``, ``"cv"``, and optionally
-        ``"permute_within_groups"``.
-    n_perms : int, optional
-        Maximum number of label permutations to compute for the null distribution.
-        Default is 1000.
-    label_mapper : dict
-        Mapping from trial labels (strings) to integer class labels,
-        e.g. ``{'CS-': 0, 'CS+': 1}``.        
-    n_jobs : int, optional
-        Number of parallel workers for permutation testing. Default is 1 (serial execution).
-    seed : int, optional
-        Master random seed for permutation reproducibility.
-    tmpdir : str, optional
-        Directory used to store temporary memory-mapped arrays
-        (default: ``~/.joblib_cache``).
-    groups : array_like, optional
-        Optional group vector (e.g., run or session IDs) for group-aware CV
-        and within-group permutations.
-    **kwargs :
-        Additional keyword arguments passed to :func:`utils._cv_mean_score`
-        (e.g., ``save_dir`` for saving fold-specific models).
+        Decoding configuration. Relevant entries include:
+
+        - ``analysis``
+        - ``parallel``
+        - ``n_permutations``
+        - ``permute_within_groups``
+
+    label_mapper : dict, optional
+        Mapping from condition names to encoded labels, for example
+        ``{"CS-": 0, "CS+": 1}``.
+
+    seed : int, default=0
+        Master random seed used to generate independent permutation seeds.
+
+    tmpdir : str or path-like, optional
+        Parent directory for temporary joblib files. If omitted, ``TMPDIR``
+        is used when available, otherwise ``~/.joblib_cache``.
+
+    groups : array-like, optional
+        Exchangeability-group labels aligned with samples. Used only when
+        ``cfg["permute_within_groups"]`` is enabled.
+
+    **kwargs
+        Additional arguments forwarded to the selected analysis plugin.
 
     Returns
     -------
     dict
-        Dictionary containing observed and permuted decoding results:
+        Dictionary containing:
 
-        * ``"observed"`` – Observed mean CV score (float)
-        * ``"permuted"`` – Array of permutation scores (shape ``[n_run]``)
-        * ``"mean_permuted"`` – Mean permutation score (float)
-        * ``"delta"`` – Observed − null mean difference (float)
-        * ``"p"`` – Empirical one-tailed p-value
-        * ``"n_run"`` – Number of permutations executed
-        * ``"n_perms"`` – Number of requested permutations
+        ``analysis``
+            Analysis/plugin name.
 
-    Workflow
-    ---------
-    1. Dumps the input feature matrix ``X`` to a temporary uncompressed
-    ``joblib`` file for memory-mapped access.
-    2. Computes the **observed** mean cross-validated score using
-    :func:`utils._cv_mean_score`.
-    3. Generates ``n_perms`` random seeds from a reproducible master RNG.
-    4. Recomputes CV scores under label permutation, either serially or
-    in parallel via :class:`joblib.Parallel`.
-    5. Aggregates permutation scores and computes empirical p-value:
-    ::
+        ``observed``
+            Observed mean cross-validated score.
 
-        p = (sum(perm >= obs) + 1) / (n_run + 1)
+        ``permuted``
+            Array of permutation scores.
 
-    Statistical Outputs
-    -------------------
-    - **Observed** – Mean CV accuracy for the true (non-permuted) labels.
-    - **Permuted** – Null distribution of accuracies from permuted labels.
-    - **Mean permuted** – Average null accuracy (expected under the null).
-    - **Δ (delta)** – Observed − null mean difference (effect size).
-    - **p-value** – Empirical one-tailed significance level.
-    - **n_run** – Number of permutations executed. In the ROI decoder this is
-      normally equal to ``n_perms`` because all requested permutations are run.
+        ``mean_permuted``
+            Mean of the empirical null distribution.
 
-    Null-Distribution Behavior
-    --------------------------
-    - The ROI decoder uses a fixed-count permutation procedure: every requested
-      permutation is evaluated and retained.
-    - This makes the null mean, empirical p-value, and saved permutation table
-      directly interpretable because they are based on the same number of
-      permutations for every ROI.
-    - Searchlight decoding follows the same fixed-count null-mean principle in
-      Bach-style mode, but usually with far fewer permutations and group-level
-      inference downstream.
+        ``delta``
+            Observed score minus null mean.
 
-    Example
-    -------
-    .. code-block:: python
+        ``p``
+            Empirical one-tailed permutation p-value.
 
-        result = run_decoding_with_permutation(
-            X=X,
-            labels=y,
-            folds=folds,
-            cfg=cfg,
-            groups=runs,
-            seed=42,
-            save_dir="results/sub-01"
-        )
+        ``n_run``
+            Number of completed permutations.
 
-        print(result["observed"], result["p"], result["n_run"])
-        # 0.73, 0.012, 840
+        ``n_perms``
+            Number of requested permutations.
+
+        ``permutations``
+            Whether permutation inference was enabled.
+
+        ``higher_is_better``
+            Direction used when computing the empirical p-value.
 
     Notes
     -----
-    - The function uses ``np.random.default_rng`` for reproducible random streams.
-    - All permutations share the same CV folds as the observed analysis.
-    - Empirical p-values use the standard ``(+1)/(+1)`` finite-sample correction.
-    - When ``n_jobs > 1``, batches are processed in parallel via Joblib's ``loky`` backend.
-    - Ideal for ROI- or whole-brain decoding when voxelwise searchlight is unnecessary.
+    The empirical p-value uses the finite-sample correction::
+
+        p = (n_extreme + 1) / (n_permutations + 1)
+
+    For metrics where larger values indicate stronger effects,
+    ``n_extreme = sum(permuted >= observed)``.
+
+    For metrics where smaller values indicate stronger effects,
+    ``n_extreme = sum(permuted <= observed)``.
+
+    The feature matrix remains memory-mapped at ROI level because every
+    permutation uses the full ROI matrix. This differs from searchlight
+    decoding, where a small ``X_center`` subset should be materialized once
+    per searchlight center and reused across its permutations.
     """
 
-    if tmpdir is None:
-        tmpdir = os.environ.get("TMPDIR", "~/.joblib_cache")
+    # ---------------------------------------------------------------
+    # Basic normalization
+    X = np.asarray(X)
+    labels = np.asarray(labels)
+    folds = list(folds)
 
-    tmpdir = os.path.expanduser(tmpdir)
-    os.makedirs(tmpdir, exist_ok=True)
-    
-    # read settings for parallellization
-    par_cfg = cfg.get("parallel", {})
-
-    # compress=0 keeps it as a plain .npy-like file for fast mmap
-    with tempfile.TemporaryDirectory(dir=tmpdir, prefix="panic_") as tmpd:
-        X_path = dump(
-            X,
-            os.path.join(tmpd, f"X_mm_{uuid.uuid4().hex}.joblib"),
-            compress=0
-        )[0]
-
-        labels = np.asarray(labels)
-        labels_path = dump(
-            labels,
-            os.path.join(tmpd, f"labels_{uuid.uuid4().hex}.joblib"),
-            compress=0
-        )[0]
-
-        X_mm = load(X_path, mmap_mode="r")
-        logger.info(f"X={X_mm.shape} (n_samples, n_features)")
-
-        # config takes precedence over the presence of groups
-        if not cfg.get("permute_within_groups", False):
-            if groups is not None:
-                logger.info("Groups (or runs) were detected, but permute_within_groups=False, so ignoring groups..")
-
-            groups = None
-        
-        # log them
-        if groups is not None:
-            logger.info(f"Groups = {groups}")
-
-        groups = None if groups is None else np.asarray(groups)
-
-        # observed
-        if "save_dir" in kwargs:
-            logger.info(f"Storing fold information in {kwargs['save_dir']}")
-
-        plugin, plugin_kwargs = core.get_analysis_plugin(
-            cfg,
-            label_dict=label_mapper
+    if X.shape[0] != labels.shape[0]:
+        raise ValueError(
+            "Feature matrix and labels contain different numbers of samples: "
+            f"X.shape[0]={X.shape[0]} != len(labels)={len(labels)}."
         )
 
-        analysis_cfg = cfg.get("analysis", {})
-        score_name = analysis_cfg.get("type", "decoding")
+    if not folds:
+        raise ValueError("No outer cross-validation folds were provided.")
 
-        logger.info(f"Running plugin [{score_name}]: {plugin} with args: {plugin_kwargs}")
-        do_permutations = bool(analysis_cfg.get("permutations", True))
-        higher_is_better = bool(analysis_cfg.get("higher_is_better", True))
+    # ---------------------------------------------------------------
+    # Temporary-directory configuration
+    if tmpdir is None:
+        tmpdir = os.environ.get("TMPDIR")
+
+    if not tmpdir:
+        tmpdir = os.path.join(
+            os.path.expanduser("~"),
+            ".joblib_cache",
+        )
+
+    tmpdir = os.path.abspath(
+        os.path.expanduser(tmpdir)
+    )
+
+    os.makedirs(
+        tmpdir,
+        exist_ok=True,
+    )
+
+    logger.info(
+        "Using decoding temporary directory: %s",
+        tmpdir,
+    )
+
+    # ---------------------------------------------------------------
+    # Parallel settings
+    par_cfg = cfg.get("parallel", {})
+
+    n_jobs = int(
+        par_cfg.get("n_jobs", 1)
+    )
+
+    # ---------------------------------------------------------------
+    # Group / permutation policy
+    #
+    # Configuration takes precedence over the mere presence of groups.
+    permute_within_groups = bool(
+        cfg.get("permute_within_groups", False)
+    )
+
+    if not permute_within_groups:
+        if groups is not None:
+            logger.info(
+                "Groups were provided, but "
+                "permute_within_groups=False; ignoring groups."
+            )
+
+        groups = None
+
+    elif groups is not None:
+        groups = np.asarray(groups)
+
+        if groups.ndim != 1:
+            groups = groups.ravel()
+
+        if len(groups) != len(labels):
+            raise ValueError(
+                "Number of group labels must match number of samples: "
+                f"{len(groups)} != {len(labels)}."
+            )
+
+        logger.info(
+            "Using %d permutation groups",
+            np.unique(groups).size,
+        )
+
+    # ---------------------------------------------------------------
+    # Plugin / analysis configuration
+    plugin, plugin_kwargs = core.get_analysis_plugin(
+        cfg,
+        label_dict=label_mapper,
+    )
+
+    analysis_cfg = cfg.get("analysis", {})
+
+    score_name = analysis_cfg.get(
+        "type",
+        "decoding",
+    )
+
+    do_permutations = bool(
+        analysis_cfg.get(
+            "permutations",
+            True,
+        )
+    )
+
+    higher_is_better = bool(
+        analysis_cfg.get(
+            "higher_is_better",
+            True,
+        )
+    )
+
+    logger.info(
+        "Running plugin [%s]: %s with args: %s",
+        score_name,
+        plugin,
+        plugin_kwargs,
+    )
+
+    # ---------------------------------------------------------------
+    # Temporary memory-mapped feature matrix
+    with tempfile.TemporaryDirectory(
+        dir=tmpdir,
+        prefix="panic_",
+    ) as tmpd:
+
+        X_path = dump(
+            X,
+            os.path.join(
+                tmpd,
+                f"X_mm_{uuid.uuid4().hex}.joblib",
+            ),
+            compress=0,
+        )[0]
+
+        # No need to reopen X with mmap in the parent merely to inspect shape.
+        logger.info(
+            "X=%s (n_samples, n_features)",
+            X.shape,
+        )
+
+        # -----------------------------------------------------------
+        # Observed analysis
+        if "save_dir" in kwargs:
+            logger.info(
+                "Storing fold information in %s",
+                kwargs["save_dir"],
+            )
 
         try:
-            result  = plugin(
+            result = plugin(
                 X_path,
                 labels,
                 cfg=cfg,
@@ -224,100 +403,240 @@ def run_decoding_with_permutation(
                 **kwargs,
             )
 
-            observed_acc, artifacts = core.unpack_plugin_result(result)
+            observed_score, artifacts = (
+                core.unpack_plugin_result(result)
+            )
 
-        except NoFeaturesSelectedError as e:
-            logger.warning(f"Observed analysis failed (no features): {e}. Skipping ROI.")
+        except NoFeaturesSelectedError as exc:
+            logger.warning(
+                "Observed analysis failed because no features "
+                "were available: %s. Skipping ROI.",
+                exc,
+            )
             return None
 
-        logger.info("%s observed after %d folds: %.4f", score_name, len(folds), observed_acc)
+        logger.info(
+            "%s observed after %d folds: %.4f",
+            score_name,
+            len(folds),
+            observed_score,
+        )
 
-        # save plugin-specific artifacts
+        # -----------------------------------------------------------
+        # Save plugin-specific observed artifacts
         if "save_dir" in kwargs:
             core.save_analysis_artifacts(
                 kwargs["save_dir"],
                 artifacts,
                 roi_linidx=kwargs.get("roi_linidx"),
             )
-        
-        # check if we should do permutations
-        n_perms = int(cfg.get("n_permutations", 1000))
-        n_jobs = par_cfg.get("n_jobs", 1)
 
+        # -----------------------------------------------------------
+        # Permutation settings
+        n_perms = int(
+            cfg.get(
+                "n_permutations",
+                1000,
+            )
+        )
+
+        if n_perms < 0:
+            raise ValueError(
+                "`n_permutations` must be >= 0."
+            )
+
+        # -----------------------------------------------------------
+        # Permutation worker
+        #
+        # One call corresponds to ONE complete permutation realization:
+        #
+        #     seed
+        #       -> plugin(... permute=True ...)
+        #       -> one y_perm
+        #       -> all fixed CV folds
+        #       -> one null score
+        def _one_perm(perm_seed):
+            result = plugin(
+                X_path,
+                labels,
+                cfg=cfg,
+                folds=folds,
+                groups=groups,
+                permute=True,
+                rng=np.random.default_rng(
+                    int(perm_seed)
+                ),
+                return_artifacts=False,
+                **plugin_kwargs,
+                **kwargs,
+            )
+
+            score, _ = core.unpack_plugin_result(
+                result
+            )
+
+            return float(score)
+
+        # -----------------------------------------------------------
+        # Run null distribution
         if do_permutations and n_perms > 0:
-            rng = np.random.default_rng(seed)
-            seeds = rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
-            def _one_perm(seed):
-                return plugin(
-                    X_path,
-                    labels,
-                    cfg=cfg,
-                    folds=folds,
-                    groups=groups,
-                    permute=True,
-                    rng=np.random.default_rng(int(seed)),
-                    **plugin_kwargs,
-                    **kwargs,
-                )
+            master_rng = np.random.default_rng(
+                seed
+            )
 
-            logger.info("Starting permutation testing: n_perms=%d, n_jobs=%d", n_perms, n_jobs)
+            seeds = master_rng.integers(
+                0,
+                2**32 - 1,
+                size=n_perms,
+                dtype=np.uint32,
+            )
 
+            logger.info(
+                "Starting permutation testing: "
+                "n_perms=%d | n_jobs=%d",
+                n_perms,
+                n_jobs,
+            )
+
+            # -------------------------------------------------------
+            # Serial
             if n_jobs == 1:
+
                 permuted_acc = [
                     _one_perm(s)
-                    for s in tqdm(seeds, total=n_perms, disable=tqdm_disabled())
+                    for s in tqdm(
+                        seeds,
+                        total=n_perms,
+                        disable=tqdm_disabled(),
+                    )
                 ]
+
+            # -------------------------------------------------------
+            # Parallel
             else:
-                with tqdm_joblib(tqdm(total=n_perms, disable=tqdm_disabled())):
-                    permuted_acc = Parallel(
-                        n_jobs=n_jobs,
-                        backend=par_cfg.get("backend", "loky"),
-                        prefer=par_cfg.get("prefer", "processes"),
-                        batch_size=par_cfg.get("batch_size", 16),
-                        verbose=par_cfg.get("verbose", 0),
-                    )([delayed(_one_perm)(s) for s in seeds])
+
+                with Parallel(
+                    n_jobs=n_jobs,
+                    backend=par_cfg.get(
+                        "backend",
+                        "loky",
+                    ),
+                    prefer=par_cfg.get(
+                        "prefer",
+                        "processes",
+                    ),
+                    batch_size=par_cfg.get(
+                        "batch_size",
+                        16,
+                    ),
+                    verbose=par_cfg.get(
+                        "verbose",
+                        0,
+                    ),
+                ) as parallel:
+
+                    with tqdm_joblib(
+                        tqdm(
+                            total=n_perms,
+                            disable=tqdm_disabled(),
+                        )
+                    ):
+                        permuted_acc = parallel(
+                            delayed(_one_perm)(s)
+                            for s in seeds
+                        )
+
         else:
             permuted_acc = []
 
-        permuted = np.asarray(permuted_acc, dtype=float)
-        n_run = len(permuted)
+        # -----------------------------------------------------------
+        # Aggregate null distribution
+        permuted = np.asarray(
+            permuted_acc,
+            dtype=float,
+        )
 
-        mean_permuted = float(np.nanmean(permuted)) if n_run else float("nan")
-        delta = float(observed_acc - mean_permuted) if n_run else float("nan")
+        n_run = int(
+            len(permuted)
+        )
 
         if n_run:
+            mean_permuted = float(
+                np.nanmean(permuted)
+            )
+
+            delta = float(
+                observed_score
+                - mean_permuted
+            )
+
             if higher_is_better:
-                p_val = (np.sum(permuted >= observed_acc) + 1) / (n_run + 1)
+                n_extreme = int(
+                    np.sum(
+                        permuted >= observed_score
+                    )
+                )
             else:
-                p_val = (np.sum(permuted <= observed_acc) + 1) / (n_run + 1)
+                n_extreme = int(
+                    np.sum(
+                        permuted <= observed_score
+                    )
+                )
+
+            p_val = float(
+                (n_extreme + 1)
+                / (n_run + 1)
+            )
+
         else:
+            mean_permuted = float("nan")
+            delta = float("nan")
             p_val = float("nan")
 
+        # -----------------------------------------------------------
+        # Logging
         logger.info(
-            "%s complete. Observed=%.4f | Null=%.4f | Δ=%.4f | p=%s | n_run=%d",
+            "%s complete. "
+            "Observed=%.4f | "
+            "Null=%.4f | "
+            "Delta=%.4f | "
+            "p=%s | "
+            "n_run=%d",
             score_name,
-            observed_acc,
+            observed_score,
             mean_permuted,
             delta,
-            f"{p_val:.4f}" if np.isfinite(p_val) else "nan",
+            (
+                f"{p_val:.4f}"
+                if np.isfinite(p_val)
+                else "nan"
+            ),
             n_run,
         )
 
-        ddict = {
+        # -----------------------------------------------------------
+        # Return
+        return {
             "analysis": score_name,
-            "observed": float(observed_acc),
+            "observed": float(observed_score),
             "permuted": permuted,
             "mean_permuted": mean_permuted,
             "delta": delta,
-            "p": float(p_val),
-            "n_run": int(n_run),
-            "n_perms": int(n_perms) if do_permutations else 0,
-            "permutations": bool(do_permutations),
-            "higher_is_better": bool(higher_is_better),
+            "p": p_val,
+            "n_run": n_run,
+            "n_perms": (
+                int(n_perms)
+                if do_permutations
+                else 0
+            ),
+            "permutations": bool(
+                do_permutations
+            ),
+            "higher_is_better": bool(
+                higher_is_better
+            ),
         }
-
-        return ddict
 
 
 def _searchlight_outputs_exist(sl_dir, hemi_key=None):
