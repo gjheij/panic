@@ -649,9 +649,13 @@ def permutation_searchlight(
             update_interval = int(
                 par_cfg.get("update_interval", 0)
             )
+
+            debug_start = 219500
+            debug_total = len(centers) - debug_start
+
             progress = LoggedProgress(
-                total=len(centers),
-                label="Searchlight",
+                total=debug_total,
+                label="Searchlight tail",
                 logger=logger,
                 every=update_interval,
             )
@@ -660,28 +664,22 @@ def permutation_searchlight(
                 n_jobs=n_jobs,
                 backend=par_cfg.get("backend", "loky"),
                 prefer=par_cfg.get("prefer", "processes"),
-                batch_size=par_cfg.get("batch_size", 16),
+                batch_size=1,
                 verbose=par_cfg.get("verbose", 0),
-                return_as="generator_unordered",
             ) as parallel:
-
-                result_stream = parallel(
-                    delayed(_run)(i)
-                    for i in range(len(centers))
-                )
-
-                out = []
 
                 with tqdm_joblib(
                     tqdm(
-                        total=len(centers),
+                        total=debug_total,
                         disable=tqdm_disabled(),
                     ),
                     log_progress=progress,
                 ):
-                    for result in result_stream:
-                        out.append(result)
-
+                    out = parallel(
+                        delayed(_run)(i)
+                        for i in range(debug_start, len(centers))
+                    )
+                    
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
         obs_map         = np.full(vol_shape, np.nan, dtype=np.float32)
