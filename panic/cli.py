@@ -188,12 +188,10 @@ def action_run(args):
 
     for subj in subjects:
 
-        # make directory
         gen_settings = loaded_cfg["general_settings"]
         dec_settings = loaded_cfg["decoding_settings"]
         analysis = dec_settings["analysis"]
 
-        # name can be different
         analysis_name = analysis.get("name") or analysis.get("type")
 
         save_dir = opj(
@@ -204,12 +202,14 @@ def action_run(args):
 
         os.makedirs(save_dir, exist_ok=True)
 
-        # use separate log files for ROI and searchlight runs
+        # Build run-specific log name
         mode = "searchlight" if args.searchlight else "roi"
+        source = gen_settings["source"]
+        method = gen_settings["method"]
 
         log_file = os.path.join(
             save_dir,
-            f"{subj}_desc-{mode}_log.log",
+            f"{subj}_model-{method}_source-{source}_desc-{mode}.log",
         )
 
         log_level = logging.DEBUG if args.debug else logging.INFO
