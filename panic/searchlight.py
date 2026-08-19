@@ -8,13 +8,17 @@ import tempfile
 import uuid
 
 import numpy as np
-from joblib import Parallel, delayed, dump, load
+from joblib import Parallel, delayed, dump
 from nilearn import image
 from statsmodels.stats.multitest import fdrcorrection
 from tqdm import tqdm
 
 from panic import data
-from panic.logger import get_logger, tqdm_joblib
+from panic.logger import (
+    get_logger,
+    tqdm_joblib,
+    LoggedProgress
+)
 from panic.pipeline import create_outer_folds
 from panic.plugins import core
 from panic.utils import tqdm_disabled, load_feature_matrix
@@ -642,6 +646,16 @@ def permutation_searchlight(
                 out.append(_run(i))
 
         else:
+            update_interval = int(
+                par_cfg.get("update_interval", 0)
+            )
+            progress = LoggedProgress(
+                total=len(centers),
+                label="Searchlight",
+                logger=logger,
+                every=update_interval
+            )
+
             with Parallel(
                 n_jobs=n_jobs,
                 backend=par_cfg.get("backend", "loky"),
@@ -654,7 +668,8 @@ def permutation_searchlight(
                     tqdm(
                         total=len(centers),
                         disable=tqdm_disabled(),
-                    )
+                    ),
+                    log_progress=progress,
                 ):
                     out = parallel(
                         delayed(_run)(i)

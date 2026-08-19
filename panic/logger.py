@@ -2,8 +2,8 @@
 # emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: nil -*-
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 
-import os
 import sys
+import time
 import joblib
 import logging
 import contextvars
@@ -152,23 +152,58 @@ def get_logger(
     return logger
 
 
-class _LoggedProgress:
-    """Log progress at readable intervals while tqdm handles terminal output."""
+class LoggedProgress:
+    """
+    Log progress after approximately every N completed items.
 
-    def __init__(self, total, label="Searchlight", every=None, logger=None):
+    Parameters
+    ----------
+    total : int
+        Total number of work items.
+
+    label : str, default="Searchlight"
+        Label included in progress messages.
+
+    every : int, optional
+        Number of completed items between progress messages.
+        Values <= 0 disable logged progress.
+
+    logger : logging.Logger, optional
+        Logger used for progress messages.
+    """
+
+    def __init__(
+        self,
+        total,
+        label="Searchlight",
+        every=None,
+        logger=None,
+    ):
         self.total = max(0, int(total))
         self.label = str(label)
         self.done = 0
         self.logger = logger or logging.getLogger(__name__)
+        self.start_time = time.monotonic()
 
         if every is None:
-            self.every = max(1, int(np.ceil(self.total / 20))) if self.total else 1
+            self.every = (
+                max(1, int(np.ceil(self.total / 20)))
+                if self.total
+                else 1
+            )
         else:
             self.every = int(every)
 
-        # every <= 0 disables logfile progress
-        self.enabled = self.every > 0 and self.total > 0
-        self.next_log = self.every if self.enabled else None
+        self.enabled = (
+            self.every > 0
+            and self.total > 0
+        )
+
+        self.next_log = (
+            self.every
+            if self.enabled
+            else None
+        )
 
     def update(self, n=1):
         if not self.enabled:
@@ -177,13 +212,42 @@ class _LoggedProgress:
         self.done += int(n)
         shown = min(self.done, self.total)
 
-        if shown >= self.next_log or shown >= self.total:
+        if (
+            shown >= self.next_log
+            or shown >= self.total
+        ):
+            elapsed = (
+                time.monotonic()
+                - self.start_time
+            )
+
+            rate = (
+                shown / elapsed
+                if elapsed > 0
+                else float("nan")
+            )
+
+            remaining = self.total - shown
+
+            eta_seconds = (
+                remaining / rate
+                if rate > 0
+                else float("nan")
+            )
+
             self.logger.info(
-                "%s progress: %d/%d (%.1f%%)",
+                "%s progress: "
+                "%d/%d (%.1f%%) | "
+                "%.2f centers/s | "
+                "elapsed %.1f min | "
+                "ETA %.1f min",
                 self.label,
                 shown,
                 self.total,
-                100.0 * shown / max(1, self.total),
+                100.0 * shown / self.total,
+                rate,
+                elapsed / 60.0,
+                eta_seconds / 60.0,
             )
 
             while self.next_log <= shown:
