@@ -285,49 +285,49 @@ class SearchlightMonitor:
                 newly_completed = True
             n_completed = self._n_completed
 
-            if (
-                newly_completed
-                and self._next_progress_log is not None
-                and (
-                    n_completed >= self._next_progress_log
-                    or n_completed >= self.total
-                )
-            ):
-                elapsed = time.monotonic() - self._progress_start
+        if (
+            newly_completed
+            and self._next_progress_log is not None
+            and (
+                n_completed >= self._next_progress_log
+                or n_completed >= self.total
+            )
+        ):
+            elapsed = time.monotonic() - self._progress_start
 
-                rate = (
-                    n_completed / elapsed
-                    if elapsed > 0
-                    else float("nan")
-                )
+            rate = (
+                n_completed / elapsed
+                if elapsed > 0
+                else float("nan")
+            )
 
-                remaining = self.total - n_completed
+            remaining = self.total - n_completed
 
-                eta_seconds = (
-                    remaining / rate
-                    if rate > 0
-                    else float("nan")
-                )
+            eta_seconds = (
+                remaining / rate
+                if rate > 0
+                else float("nan")
+            )
 
-                self.logger.info(
-                    "%s progress: "
-                    "%d/%d (%.1f%%) | "
-                    "%.2f centers/s | "
-                    "elapsed %.1f min | "
-                    "ETA %.1f min",
-                    self.label,
-                    n_completed,
-                    self.total,
-                    100.0 * n_completed / self.total,
-                    rate,
-                    elapsed / 60.0,
-                    eta_seconds / 60.0,
-                )
+            self.logger.info(
+                "%s progress: "
+                "%d/%d (%.1f%%) | "
+                "%.2f centers/s | "
+                "elapsed %.1f min | "
+                "ETA %.1f min",
+                self.label,
+                n_completed,
+                self.total,
+                100.0 * n_completed / self.total,
+                rate,
+                elapsed / 60.0,
+                eta_seconds / 60.0,
+            )
 
-                self.dump_snapshot(reason="progress")
+            self.dump_snapshot(reason="progress")
 
-                while self._next_progress_log <= n_completed:
-                    self._next_progress_log += self.log_every
+            while self._next_progress_log <= n_completed:
+                self._next_progress_log += self.log_every
 
         return n_completed
 
