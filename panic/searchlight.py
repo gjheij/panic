@@ -781,7 +781,7 @@ def permutation_searchlight(
             f"panic_searchlight_monitor_{os.getpid()}",
         )
         monitor_snapshot_dir = opj(save_dir, "searchlight_monitor")
-        monitor_interval = float(par_cfg.get("monitor_interval", 60))
+        monitor_interval = float(par_cfg.get("monitor_interval", 15))
         monitor_resource_every = int(par_cfg.get("monitor_resource_every", 1000))
 
         worker_kwargs = {
@@ -833,6 +833,8 @@ def permutation_searchlight(
                 logger=logger,
                 interval=monitor_interval,
                 log_every=monitor_log_every,
+                stuck_thresholds=(30, 120, 600),
+                signal_stuck_workers=True,
             )
 
             backend_name = par_cfg.get("backend", "loky")

@@ -151,6 +151,56 @@ def process_resource_snapshot(x_path: Optional[str] = None) -> Dict[str, Any]:
     return out
 
 
+
+def capture_process_state(pid: int) -> Dict[str, Any]:
+    """Capture lightweight Linux /proc diagnostics for another process.
+
+    This is parent-side instrumentation intended for workers whose heartbeat has
+    gone stale. Failures are recorded rather than raised.
+    """
+    pid = int(pid)
+    out: Dict[str, Any] = {"pid": pid}
+    proc_dir = Path(f"/proc/{pid}")
+    if not proc_dir.exists():
+        out["exists"] = False
+        return out
+    out["exists"] = True
+    try:
+        with open(proc_dir / "wchan", "r", encoding="utf-8", errors="replace") as fobj:
+            out["wchan"] = fobj.read().strip()
+    except OSError as exc:
+        out["wchan_error"] = repr(exc)
+    try:
+        status: Dict[str, str] = {}
+        with open(proc_dir / "status", "r", encoding="utf-8", errors="replace") as fobj:
+            for line in fobj:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    status[key.strip()] = value.strip()
+        for key in ("State", "VmRSS", "VmSize", "Threads", "voluntary_ctxt_switches", "nonvoluntary_ctxt_switches"):
+            if key in status:
+                out[key] = status[key]
+    except OSError as exc:
+        out["status_error"] = repr(exc)
+    try:
+        with open(proc_dir / "stat", "r", encoding="utf-8", errors="replace") as fobj:
+            fields = fobj.read().split()
+        out["utime_ticks"] = int(fields[13])
+        out["stime_ticks"] = int(fields[14])
+        out["starttime_ticks"] = int(fields[21])
+    except (OSError, ValueError, IndexError) as exc:
+        out["stat_error"] = repr(exc)
+    try:
+        out["fd_count"] = len(os.listdir(proc_dir / "fd"))
+    except OSError as exc:
+        out["fd_count_error"] = repr(exc)
+    try:
+        with open(proc_dir / "maps", "r", encoding="utf-8", errors="replace") as fobj:
+            out["map_count"] = sum(1 for _ in fobj)
+    except OSError as exc:
+        out["map_count_error"] = repr(exc)
+    return out
+
 def maybe_log_worker_resources(
     logger,
     task_count: int,
@@ -181,6 +231,8 @@ class SearchlightMonitor:
         logger,
         interval: float = 60.0,
         log_every: int = 5000,
+        stuck_thresholds: tuple[float, ...] = (30.0, 120.0, 600.0),
+        signal_stuck_workers: bool = False,
     ) -> None:
         self.total = int(total)
         self.runtime_dir = Path(runtime_dir)
@@ -188,6 +240,8 @@ class SearchlightMonitor:
         self.logger = logger
         self.interval = max(float(interval), 1.0)
         self.log_every = max(int(log_every), 0)
+        self.stuck_thresholds = tuple(sorted({max(float(v), 1.0) for v in stuck_thresholds if float(v) > 0}))
+        self.signal_stuck_workers = bool(signal_stuck_workers)
 
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +252,7 @@ class SearchlightMonitor:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._completion_offsets: Dict[str, int] = {}
+        self._stuck_dumped: Dict[int, Dict[str, Any]] = {}
 
     def start(self) -> "SearchlightMonitor":
         install_faulthandler()
@@ -272,6 +327,66 @@ class SearchlightMonitor:
                 continue
         return heartbeats
 
+    def _heartbeat_age(self, heartbeat: Dict[str, Any], now: Optional[float] = None) -> float:
+        if now is None:
+            now = time.time()
+        try:
+            heartbeat_time = float(heartbeat.get("time", now))
+        except (TypeError, ValueError):
+            heartbeat_time = now
+        return max(0.0, now - heartbeat_time)
+
+    def _stuck_threshold_for(self, heartbeat: Dict[str, Any], age_s: float) -> Optional[float]:
+        try:
+            pid = int(heartbeat["pid"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        stage = str(heartbeat.get("stage", ""))
+        if stage in {"DONE", "ERROR"}:
+            return None
+        identity = (heartbeat.get("ix"), stage, heartbeat.get("time"))
+        state = self._stuck_dumped.get(pid)
+        if state is None or state.get("identity") != identity:
+            state = {"identity": identity, "thresholds": set(), "signal_sent": False}
+            self._stuck_dumped[pid] = state
+        emitted = state["thresholds"]
+        for threshold in self.stuck_thresholds:
+            if age_s >= threshold and threshold not in emitted:
+                emitted.add(threshold)
+                return threshold
+        return None
+
+    def _diagnose_stuck_workers(self, heartbeats: list[Dict[str, Any]], now: Optional[float] = None) -> list[Dict[str, Any]]:
+        if now is None:
+            now = time.time()
+        diagnostics: list[Dict[str, Any]] = []
+        for heartbeat in heartbeats:
+            age_s = self._heartbeat_age(heartbeat, now=now)
+            threshold = self._stuck_threshold_for(heartbeat, age_s)
+            if threshold is None:
+                continue
+            try:
+                pid = int(heartbeat["pid"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            proc = capture_process_state(pid)
+            diag = {"time": now, "threshold_s": threshold, "age_s": round(age_s, 3), "pid": pid, "ix": heartbeat.get("ix"), "stage": heartbeat.get("stage"), "heartbeat": heartbeat, "proc": proc}
+            state = self._stuck_dumped.get(pid)
+            if self.signal_stuck_workers and state is not None and not state.get("signal_sent", False) and proc.get("exists", False) and hasattr(signal, "SIGUSR1"):
+                try:
+                    os.kill(pid, signal.SIGUSR1)
+                    diag["sigusr1_sent"] = True
+                    state["signal_sent"] = True
+                except (ProcessLookupError, PermissionError, OSError) as exc:
+                    diag["sigusr1_error"] = repr(exc)
+            diagnostics.append(diag)
+            self.logger.warning("SEARCHLIGHT_STUCK_WORKER pid=%s ix=%s stage=%s age_s=%.1f threshold_s=%.0f proc=%s%s", pid, heartbeat.get("ix"), heartbeat.get("stage"), age_s, threshold, proc, " SIGUSR1_SENT" if diag.get("sigusr1_sent") else "")
+            try:
+                _atomic_json(self.snapshot_dir / f"stuck_worker_{pid}.json", diag)
+            except OSError:
+                pass
+        return diagnostics
+
     def dump_snapshot(self, reason: str = "watchdog") -> None:
         outstanding = self.outstanding()
         npy_tmp = self.snapshot_dir / ".searchlight_outstanding.tmp.npy"
@@ -286,8 +401,10 @@ class SearchlightMonitor:
             pass
 
         heartbeats = self._read_heartbeats()
+        now = time.time()
+        stuck_diagnostics = self._diagnose_stuck_workers(heartbeats, now=now) if reason == "watchdog" else []
         payload = {
-            "time": time.time(),
+            "time": now,
             "reason": reason,
             "parent_pid": os.getpid(),
             "total": self.total,
@@ -295,6 +412,7 @@ class SearchlightMonitor:
             "outstanding_count": int(outstanding.size),
             "outstanding_first": outstanding[:100].tolist(),
             "workers": heartbeats,
+            "stuck_diagnostics": stuck_diagnostics,
         }
         try:
             _atomic_json(self.snapshot_dir / "searchlight_monitor.json", payload)
@@ -313,7 +431,7 @@ class SearchlightMonitor:
                         "pid": hb.get("pid"),
                         "ix": hb.get("ix"),
                         "stage": hb.get("stage"),
-                        "age_s": round(max(0.0, time.time() - hb.get("time", time.time())), 1),
+                        "age_s": round(self._heartbeat_age(hb, now=now), 1),
                     }
                     for hb in heartbeats
                 ],
