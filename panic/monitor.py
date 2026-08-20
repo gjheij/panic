@@ -212,7 +212,7 @@ def maybe_log_worker_resources(
         return
 
     snap = process_resource_snapshot(x_path=x_path)
-    logger.warning(
+    logger.debug(
         "SEARCHLIGHT_WORKER_RESOURCE task_count=%d snapshot=%s",
         task_count,
         snap,
@@ -380,7 +380,7 @@ class SearchlightMonitor:
                 except (ProcessLookupError, PermissionError, OSError) as exc:
                     diag["sigusr1_error"] = repr(exc)
             diagnostics.append(diag)
-            self.logger.warning("SEARCHLIGHT_STUCK_WORKER pid=%s ix=%s stage=%s age_s=%.1f threshold_s=%.0f proc=%s%s", pid, heartbeat.get("ix"), heartbeat.get("stage"), age_s, threshold, proc, " SIGUSR1_SENT" if diag.get("sigusr1_sent") else "")
+            self.logger.debug("SEARCHLIGHT_STUCK_WORKER pid=%s ix=%s stage=%s age_s=%.1f threshold_s=%.0f proc=%s%s", pid, heartbeat.get("ix"), heartbeat.get("stage"), age_s, threshold, proc, " SIGUSR1_SENT" if diag.get("sigusr1_sent") else "")
             try:
                 _atomic_json(self.snapshot_dir / f"stuck_worker_{pid}.json", diag)
             except OSError:
@@ -420,7 +420,7 @@ class SearchlightMonitor:
             pass
 
         if reason == "watchdog":
-            self.logger.warning(
+            self.logger.debug(
                 "SEARCHLIGHT_WATCHDOG completed=%d/%d outstanding=%d first=%s workers=%s",
                 payload["completed"],
                 self.total,
