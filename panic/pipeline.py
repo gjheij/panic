@@ -17,12 +17,16 @@ from panic import (
     errors
 )
 
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.feature_selection import (
     VarianceThreshold
 )
 from sklearn.pipeline import Pipeline
 
 from typing import Any, Callable, Optional
+
+import warnings
+
 FoldScoreFunction = Callable[..., float]
 
 
@@ -302,17 +306,101 @@ def _permute_within_groups(y, g, rng):
 
 
 def sklearn_pipeline_score(
-        X,
-        labels,
-        train_idx,
-        test_idx,
-        *,
-        cfg,
-        groups=None,
-        rng=None,
-        **kwargs,
-    ) -> float:
-    """Fit and score one train/test split using a configured sklearn pipeline."""
+    X,
+    labels,
+    train_idx,
+    test_idx,
+    *,
+    cfg,
+    groups=None,
+    rng=None,
+    **kwargs,
+) -> float:
+    """Fit and score a configured sklearn pipeline on one CV split.
+
+    Construct the sklearn estimator pipeline from the decoding
+    configuration, fit it on the samples specified by ``train_idx``,
+    and evaluate it on the held-out samples specified by ``test_idx``.
+
+    This function represents a single outer cross-validation fold. The
+    configured pipeline may itself contain an inner model-selection step,
+    such as ``GridSearchCV``. In that case, hyperparameter optimization is
+    performed using only the outer training data.
+
+    If grouping information is provided and the estimator supports
+    ``groups`` during fitting, the groups corresponding to the training
+    samples are passed to ``fit``. This allows group-aware inner
+    cross-validation without exposing information from the outer test set.
+
+    A random state is derived from ``rng`` when provided and passed to the
+    pipeline factory, allowing stochastic pipeline components to remain
+    reproducible across observed and permutation analyses.
+
+    Convergence warnings raised by estimators fitted internally by a
+    ``BaseSearchCV`` object are suppressed. Individual hyperparameter
+    candidates may occasionally reach their configured iteration limit,
+    particularly for permuted data, without invalidating the surrounding
+    model-selection procedure. Convergence warnings from estimators fitted
+    outside a search object are not suppressed.
+
+    If preprocessing or feature selection leaves no usable features,
+    ``NoFeaturesSelectedError`` is converted to ``NaN``. This allows the
+    calling cross-validation routine to identify folds for which no valid
+    score could be obtained and handle them collectively.
+
+    Parameters
+    ----------
+    X : array-like of shape (n_samples, n_features)
+        Feature matrix containing all samples available to the current
+        analysis.
+
+    labels : array-like of shape (n_samples,)
+        Target labels corresponding to the rows of ``X``.
+
+    train_idx : array-like of int
+        Indices selecting the samples used to fit the pipeline.
+
+    test_idx : array-like of int
+        Indices selecting the held-out samples used for scoring.
+
+    cfg : dict
+        Decoding configuration used to construct the sklearn pipeline,
+        scorer, estimator, feature-selection steps, and optional
+        hyperparameter search.
+
+    groups : array-like of shape (n_samples,), optional
+        Group labels used by group-aware fitting or inner
+        cross-validation. Only the groups corresponding to ``train_idx``
+        are passed to the estimator.
+
+    rng : numpy.random.Generator, optional
+        Random-number generator used to derive the random state supplied
+        to the pipeline. If ``None``, no random state is generated here.
+
+    **kwargs
+        Additional keyword arguments forwarded to
+        ``pipeline_from_config``.
+
+    Returns
+    -------
+    float
+        Score of the fitted pipeline on the outer test set. Returns
+        ``NaN`` when no features remain after preprocessing or feature
+        selection.
+
+    Notes
+    -----
+    The outer test samples are never used during pipeline fitting or
+    hyperparameter selection. When ``clf`` is a ``BaseSearchCV`` object,
+    its internal cross-validation operates exclusively on ``X_train`` and
+    ``y_train``.
+
+    Suppression of ``ConvergenceWarning`` is intentionally restricted to
+    estimators fitted inside ``BaseSearchCV``. A finite estimator
+    ``max_iter`` can therefore be retained as a safeguard against
+    pathological candidate fits while avoiding excessive warnings from
+    individual inner-CV fits.
+    """
     random_state = (
         int(rng.integers(2**31 - 1))
         if rng is not None
@@ -332,9 +420,9 @@ def sklearn_pipeline_score(
     )
 
     X_train = X[train_idx]
-    X_test  = X[test_idx]
+    X_test = X[test_idx]
     y_train = labels[train_idx]
-    y_test  = labels[test_idx]
+    y_test = labels[test_idx]
 
     groups_train = (
         None
@@ -348,16 +436,46 @@ def sklearn_pipeline_score(
     )
 
     try:
-        if groups_train is not None and supports_groups:
-            clf.fit(
-                X_train,
-                y_train,
-                groups=groups_train,
-            )
-        else:
-            clf.fit(X_train, y_train)
+        # Suppress convergence warnings only for inner search candidates.
+        # Plain/final estimators still emit ConvergenceWarning normally.
+        if isinstance(clf, BaseSearchCV):
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    category=ConvergenceWarning,
+                )
 
-        return float(clf.score(X_test, y_test))
+                if groups_train is not None and supports_groups:
+                    clf.fit(
+                        X_train,
+                        y_train,
+                        groups=groups_train,
+                    )
+                else:
+                    clf.fit(
+                        X_train,
+                        y_train,
+                    )
+
+        else:
+            if groups_train is not None and supports_groups:
+                clf.fit(
+                    X_train,
+                    y_train,
+                    groups=groups_train,
+                )
+            else:
+                clf.fit(
+                    X_train,
+                    y_train,
+                )
+
+        return float(
+            clf.score(
+                X_test,
+                y_test,
+            )
+        )
 
     except errors.NoFeaturesSelectedError:
         return float("nan")
@@ -1375,6 +1493,13 @@ def cv_mean_function_score(
         )
 
         fold_scores.append(float(score))
+
+    fold_scores = np.asarray(fold_scores, dtype=float)
+
+    if not np.any(np.isfinite(fold_scores)):
+        raise errors.NoFeaturesSelectedError(
+            "All folds produced NaN scores; cannot compute mean score."
+        )
 
     mean_score = float(np.nanmean(fold_scores))
 
