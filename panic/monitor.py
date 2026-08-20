@@ -231,6 +231,7 @@ class SearchlightMonitor:
         logger,
         interval: float = 60.0,
         log_every: int = 5000,
+        label: str = "Searchlight",
         stuck_thresholds: tuple[float, ...] = (30.0, 120.0, 600.0),
         signal_stuck_workers: bool = False,
     ) -> None:
@@ -253,6 +254,15 @@ class SearchlightMonitor:
         self._thread: Optional[threading.Thread] = None
         self._completion_offsets: Dict[str, int] = {}
         self._stuck_dumped: Dict[int, Dict[str, Any]] = {}
+        self.label = str(label)
+
+        self._progress_start = time.monotonic()
+
+        self._next_progress_log = (
+            self.log_every
+            if self.log_every > 0
+            else None
+        )
 
     def start(self) -> "SearchlightMonitor":
         install_faulthandler()
@@ -275,14 +285,49 @@ class SearchlightMonitor:
                 newly_completed = True
             n_completed = self._n_completed
 
-        if newly_completed and self.log_every and n_completed % self.log_every == 0:
-            self.logger.info(
-                "Searchlight exact progress: %d/%d (%.1f%%)",
-                n_completed,
-                self.total,
-                100.0 * n_completed / self.total,
-            )
-            self.dump_snapshot(reason="progress")
+            if (
+                newly_completed
+                and self._next_progress_log is not None
+                and (
+                    n_completed >= self._next_progress_log
+                    or n_completed >= self.total
+                )
+            ):
+                elapsed = time.monotonic() - self._progress_start
+
+                rate = (
+                    n_completed / elapsed
+                    if elapsed > 0
+                    else float("nan")
+                )
+
+                remaining = self.total - n_completed
+
+                eta_seconds = (
+                    remaining / rate
+                    if rate > 0
+                    else float("nan")
+                )
+
+                self.logger.info(
+                    "%s progress: "
+                    "%d/%d (%.1f%%) | "
+                    "%.2f centers/s | "
+                    "elapsed %.1f min | "
+                    "ETA %.1f min",
+                    self.label,
+                    n_completed,
+                    self.total,
+                    100.0 * n_completed / self.total,
+                    rate,
+                    elapsed / 60.0,
+                    eta_seconds / 60.0,
+                )
+
+                self.dump_snapshot(reason="progress")
+
+                while self._next_progress_log <= n_completed:
+                    self._next_progress_log += self.log_every
 
         return n_completed
 
@@ -380,7 +425,7 @@ class SearchlightMonitor:
                 except (ProcessLookupError, PermissionError, OSError) as exc:
                     diag["sigusr1_error"] = repr(exc)
             diagnostics.append(diag)
-            self.logger.debug("SEARCHLIGHT_STUCK_WORKER pid=%s ix=%s stage=%s age_s=%.1f threshold_s=%.0f proc=%s%s", pid, heartbeat.get("ix"), heartbeat.get("stage"), age_s, threshold, proc, " SIGUSR1_SENT" if diag.get("sigusr1_sent") else "")
+            self.logger.warning("SEARCHLIGHT_STUCK_WORKER pid=%s ix=%s stage=%s age_s=%.1f threshold_s=%.0f proc=%s%s", pid, heartbeat.get("ix"), heartbeat.get("stage"), age_s, threshold, proc, " SIGUSR1_SENT" if diag.get("sigusr1_sent") else "")
             try:
                 _atomic_json(self.snapshot_dir / f"stuck_worker_{pid}.json", diag)
             except OSError:
