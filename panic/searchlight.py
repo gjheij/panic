@@ -351,13 +351,17 @@ def _one_center(
         seeds = center_rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
         for perm_ix, s in enumerate(seeds):
-            if perm_ix == 0 or perm_ix == len(seeds) - 1:
-                worker_heartbeat(
-                    monitor_runtime_dir,
-                    monitor_ix if monitor_ix is not None else -1,
-                    f"BEFORE_PERM_{perm_ix}",
-                    ncols=int(len(cols)),
-                )
+            perm_seed = int(s)
+            worker_heartbeat(
+                monitor_runtime_dir,
+                monitor_ix if monitor_ix is not None else -1,
+                f"BEFORE_PERM_{perm_ix}",
+                ncols=int(len(cols)),
+                center_seed=int(seed),
+                perm_ix=int(perm_ix),
+                perm_seed=perm_seed,
+                n_perms=int(n_perms),
+            )
 
             v = float(
                 plugin(
@@ -366,11 +370,23 @@ def _one_center(
                     cfg=cfg,
                     folds=folds,
                     cols=None,
-                    rng=np.random.default_rng(int(s)),
+                    rng=np.random.default_rng(perm_seed),
                     permute=True,
                     **plugin_kwargs,
                     **kwargs,
                 )
+            )
+
+            worker_heartbeat(
+                monitor_runtime_dir,
+                monitor_ix if monitor_ix is not None else -1,
+                f"AFTER_PERM_{perm_ix}",
+                ncols=int(len(cols)),
+                center_seed=int(seed),
+                perm_ix=int(perm_ix),
+                perm_seed=perm_seed,
+                score=float(v),
+                n_perms=int(n_perms),
             )
 
             null_sum += v
@@ -439,6 +455,7 @@ def _run_searchlight_center(
         ix,
         "START",
         center_ijk=list(center_ijk),
+        center_seed=int(center_seeds[ix]),
         task_count=int(task_count),
     )
 
