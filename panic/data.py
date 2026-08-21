@@ -1602,6 +1602,13 @@ class MaskAndFilterBetas:
         )
         roi_mask_data = roi_in_fov.get_fdata() > 0.5
 
+        # Final binary ROI/FOV mask
+        self.fov_mask = image.new_img_like(
+            self.mask_resampled_to_betas,
+            roi_mask_data.astype(np.uint8),
+            copy_header=True,
+        )
+
         vox_before = int(resampled_mask_data.sum())
         vox_after = int(roi_mask_data.sum())
 
@@ -1621,7 +1628,6 @@ class MaskAndFilterBetas:
             roi_mask_data.ravel()
         )
 
-        # Spatial QC for this ROI.
         self.roi_metrics = self._compute_roi_metrics(
             mask_img=self.mask,
             resampled_mask=self.mask_resampled_to_betas,
@@ -1630,10 +1636,10 @@ class MaskAndFilterBetas:
 
         if output_file is not None:
             logger.info(
-                "Saving resampled mask: %s",
+                "Saving final binary FOV mask: %s",
                 output_file,
             )
-            nib.save(roi_in_fov, output_file)
+            nib.save(self.fov_mask, output_file)
 
         logger.info(
             "ROI QC: native=%d | resampled=%d | valid=%d [frac=%.2f] | "
@@ -1652,7 +1658,7 @@ class MaskAndFilterBetas:
         )
 
         masker = maskers.NiftiMasker(
-            mask_img=roi_in_fov,
+            mask_img=self.fov_mask,
             dtype="float32",
             **masker_kws,
         )

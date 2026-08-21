@@ -1145,7 +1145,7 @@ class ClassifySubject(data.PrepareBetas):
                     self.dec_settings,
                     label_mapper=label_mapper,
                     groups=groups,
-                    mask=extract.mask_resampled_to_betas,
+                    mask=extract.fov_mask,
                     trial_order_path=self.trial_order_file,
                     roi_linidx=extract.roi_linidx,
                     **kwargs

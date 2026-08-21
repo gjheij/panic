@@ -212,7 +212,7 @@ def test_searchlight_center_58116_perm9(tmp_path):
         X = mf.X.astype("float32", copy=False)
         y = np.asarray(mf.labels)
 
-        vol_shape = mf.mask_resampled_to_betas.shape[:3]
+        vol_shape = mf.fov_mask.shape[:3]
         col_index_vol = np.full(vol_shape, -1, np.int32)
         coords = np.unravel_index(
             np.asarray(mf.roi_linidx, dtype=np.int64),
@@ -256,7 +256,7 @@ def test_searchlight_center_58116_perm9(tmp_path):
             groups=groups,
         )
 
-        zooms = mf.mask_resampled_to_betas.header.get_zooms()
+        zooms = mf.fov_mask.header.get_zooms()
         offsets = _neighbors_ball_mm(
             zooms,
             radius_mm,
