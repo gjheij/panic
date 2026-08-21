@@ -9,7 +9,7 @@ import pandas as pd
 
 import tempfile, uuid
 from tqdm import tqdm
-from joblib import Parallel, delayed, dump, load
+from joblib import Parallel, delayed, dump
 
 from panic import data
 from panic.pipeline import create_outer_folds
@@ -21,7 +21,10 @@ from panic.utils import (
 )
 from panic.logger import get_logger, tqdm_joblib
 from panic.searchlight import permutation_searchlight
-from panic.errors import EmptyMaskError, NoFeaturesSelectedError
+from panic.errors import (
+    PanicAnalysisError,
+    NoFeaturesSelectedError,
+)
 from panic.plugins import core
 
 from lazyfmri.utils import FindFiles, update_kwargs
@@ -410,10 +413,10 @@ def run_decoding_with_permutation(
         except NoFeaturesSelectedError as exc:
             logger.warning(
                 "Observed analysis failed because no features "
-                "were available: %s. Skipping ROI.",
+                "were available: %s.",
                 exc,
             )
-            return None
+            raise
 
         logger.info(
             "%s observed after %d folds: %.4f",
@@ -1112,8 +1115,15 @@ class ClassifySubject(data.PrepareBetas):
                     label_mapper=label_mapper,
                     output_file=output_file
                 )
-            except (EmptyMaskError, NoFeaturesSelectedError, ValueError) as e:
-                logger.warning(f"Skipping ROI: {e}")
+            except PanicAnalysisError as e:
+                logger.warning(
+                    "ROI extraction failed [%s]: %s",
+                    type(e).__name__,
+                    e,
+                )
+                return None, None
+            except ValueError as e:
+                logger.warning("ROI extraction failed [ValueError]: %s", e)
                 return None, None
 
             # outer folds
@@ -1135,19 +1145,24 @@ class ClassifySubject(data.PrepareBetas):
                     self.dec_settings,
                     label_mapper=label_mapper,
                     groups=groups,
-                    mask=extract.mask_resampled_to_betas,
+                    mask=extract.fov_mask,
                     trial_order_path=self.trial_order_file,
                     roi_linidx=extract.roi_linidx,
                     **kwargs
                 )
-            except (NoFeaturesSelectedError, ValueError) as e:
-                # expected-ish failures for tiny ROIs / strict selection / degenerate folds
-                logger.warning(f"Skipping ROI: {e}")
-                return None, extract
-            except Exception:
-                # unexpected failure: log full traceback but still skip mask
-                logger.exception("Decoding failed unexpectedly; skipping ROI")
-                return None, extract
+            except PanicAnalysisError as e:
+                logger.warning(
+                    "ROI analysis failed [%s]: %s",
+                    type(e).__name__,
+                    e,
+                )
+                return self._failed_result(e), extract
+            except ValueError as e:
+                logger.warning("ROI analysis failed [ValueError]: %s", e)
+                return self._failed_result(e), extract
+            except Exception as e:
+                logger.exception("Decoding failed unexpectedly")
+                return self._failed_result(e), extract
         else:
             # Searchlight (same same, but different)
             try:
@@ -1162,9 +1177,15 @@ class ClassifySubject(data.PrepareBetas):
                     output_file=output_file,
                     **kwargs
                 )
-            except (NoFeaturesSelectedError, ValueError) as e:
-                # expected-ish failures for tiny ROIs / strict selection / degenerate folds
-                logger.warning(f"Skipping ROI: {e}")
+            except PanicAnalysisError as e:
+                logger.warning(
+                    "Searchlight analysis failed [%s]: %s",
+                    type(e).__name__,
+                    e,
+                )
+                return None, None
+            except ValueError as e:
+                logger.warning("Searchlight analysis failed [ValueError]: %s", e)
                 return None, None
             except Exception:
                 logger.exception("Searchlight failed unexpectedly; skipping mask")
@@ -1455,8 +1476,23 @@ class ClassifySubject(data.PrepareBetas):
                     **kwargs,
                 )
 
-                if ddict is None:
+                # Extraction failed: there is no valid ROI feature object from which
+                # to obtain n_samples, n_features, roi_metrics, etc.
+                if extracted is None and not self.searchlight:
+                    logger.warning(
+                        "ROI extraction failed; no result row will be written: "
+                        "roi=%s | %s=%s",
+                        roi_label,
+                        hemi_key,
+                        hemi_label,
+                    )
                     continue
+
+                # Extraction succeeded, but the subsequent analysis returned nothing.
+                if ddict is None and not self.searchlight:
+                    ddict = self._failed_result(
+                        PanicAnalysisError("Analysis returned no result")
+                    )
 
                 # ROI results
                 if not self.searchlight:
@@ -1559,6 +1595,7 @@ class ClassifySubject(data.PrepareBetas):
             res_df.to_csv(
                 res_file,
                 index=False,
+                na_rep="NaN",
             )
 
             shutil.copymode(
@@ -1743,6 +1780,11 @@ class ClassifySubject(data.PrepareBetas):
             "analysis": str(self.analysis_name),
             "analysis_type": str(self.analysis_type),
             "analysis_id": str(self.analysis_id),
+
+            "status": str(ddict.get("status", "ok")),
+            "error_type": ddict.get("error_type"),
+            "error": ddict.get("error"),
+
             "n_samples": int(extracted.X.shape[0]),
             "n_features": int(extracted.X.shape[1]),
             "n_classes": int(np.unique(labels).size),
@@ -1820,7 +1862,13 @@ class ClassifySubject(data.PrepareBetas):
 
         # --------------------------------------------------------------
         # Group information
-        if groups is not None and self.cfg.get("permute_within_groups", False):
+        if (
+            groups is not None
+            and self.dec_settings.get(
+                "permute_within_groups",
+                False,
+            )
+        ):
             groups = np.asarray(groups)
 
             results_dict.update({
@@ -1882,3 +1930,62 @@ class ClassifySubject(data.PrepareBetas):
         roi_masks = obj.return_masks()
 
         return obj, roi_masks
+
+
+    def _failed_result(self, error=None):
+        analysis_cfg = self.dec_settings.get(
+            "analysis",
+            {},
+        )
+
+        do_permutations = bool(
+            analysis_cfg.get(
+                "permutations",
+                True,
+            )
+        )
+
+        return {
+            "analysis": analysis_cfg.get(
+                "type",
+                "unknown",
+            ),
+            "observed": np.nan,
+            "permuted": np.array([], dtype=float),
+            "mean_permuted": np.nan,
+            "delta": np.nan,
+            "p": np.nan,
+
+            # Requested versus actually completed
+            "n_run": 0,
+            "n_perms": (
+                int(
+                    self.dec_settings.get(
+                        "n_permutations",
+                        0,
+                    )
+                )
+                if do_permutations
+                else 0
+            ),
+
+            "permutations": do_permutations,
+            "higher_is_better": bool(
+                analysis_cfg.get(
+                    "higher_is_better",
+                    True,
+                )
+            ),
+
+            "status": "failed",
+            "error_type": (
+                type(error).__name__
+                if error is not None
+                else None
+            ),
+            "error": (
+                str(error)
+                if error is not None
+                else None
+            ),
+        }
