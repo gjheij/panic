@@ -14,10 +14,14 @@ from statsmodels.stats.multitest import fdrcorrection
 from tqdm import tqdm
 
 from panic import data
-from panic.logger import (
-    get_logger,
-    tqdm_joblib,
-    LoggedProgress
+from panic.logger import get_logger
+from panic.monitor import (
+    SearchlightMonitor,
+    install_faulthandler,
+    maybe_log_worker_resources,
+    worker_heartbeat,
+    worker_mark_completed,
+    worker_task_started,
 )
 from panic.pipeline import create_outer_folds
 from panic.plugins import core
@@ -177,6 +181,8 @@ def _one_center(
         *,
         plugin,
         plugin_kwargs,
+        monitor_runtime_dir=None,
+        monitor_ix=None,
         **kwargs,
     ):
     """
@@ -288,7 +294,20 @@ def _one_center(
         return (cx, cy, cz), np.nan, np.nan, np.nan, np.nan, int(len(cols)), 0, 0, 0
 
     # read data
+    worker_heartbeat(
+        monitor_runtime_dir,
+        monitor_ix if monitor_ix is not None else -1,
+        "BEFORE_LOAD",
+        ncols=int(len(cols)),
+    )
     X_center = load_feature_matrix(X_mm_path, cols=cols)
+    worker_heartbeat(
+        monitor_runtime_dir,
+        monitor_ix if monitor_ix is not None else -1,
+        "AFTER_LOAD",
+        ncols=int(len(cols)),
+        shape=list(X_center.shape),
+    )
 
     # read settings
     analysis_cfg = cfg.get("analysis", {})
@@ -311,6 +330,12 @@ def _one_center(
     )
 
     obs, artifacts = core.unpack_plugin_result(result)
+    worker_heartbeat(
+        monitor_runtime_dir,
+        monitor_ix if monitor_ix is not None else -1,
+        "AFTER_OBS",
+        ncols=int(len(cols)),
+    )
 
     if output_kind == "timeseries":
         ts = artifacts.get("cs_us_similarity", None)
@@ -325,7 +350,19 @@ def _one_center(
         center_rng = np.random.default_rng(int(seed))
         seeds = center_rng.integers(0, 2**32 - 1, size=n_perms, dtype=np.uint32)
 
-        for s in seeds:
+        for perm_ix, s in enumerate(seeds):
+            perm_seed = int(s)
+            worker_heartbeat(
+                monitor_runtime_dir,
+                monitor_ix if monitor_ix is not None else -1,
+                f"BEFORE_PERM_{perm_ix}",
+                ncols=int(len(cols)),
+                center_seed=int(seed),
+                perm_ix=int(perm_ix),
+                perm_seed=perm_seed,
+                n_perms=int(n_perms),
+            )
+
             v = float(
                 plugin(
                     X_center,
@@ -333,11 +370,23 @@ def _one_center(
                     cfg=cfg,
                     folds=folds,
                     cols=None,
-                    rng=np.random.default_rng(int(s)),
+                    rng=np.random.default_rng(perm_seed),
                     permute=True,
                     **plugin_kwargs,
                     **kwargs,
                 )
+            )
+
+            worker_heartbeat(
+                monitor_runtime_dir,
+                monitor_ix if monitor_ix is not None else -1,
+                f"AFTER_PERM_{perm_ix}",
+                ncols=int(len(cols)),
+                center_seed=int(seed),
+                perm_ix=int(perm_ix),
+                perm_seed=perm_seed,
+                score=float(v),
+                n_perms=int(n_perms),
             )
 
             null_sum += v
@@ -368,6 +417,112 @@ def _one_center(
         stop_code,
         ts
     )
+
+
+def _run_searchlight_center(
+        ix,
+        centers,
+        offsets,
+        col_index_vol,
+        vol_shape,
+        X_path,
+        labels,
+        folds,
+        cfg,
+        groups,
+        n_perms,
+        center_seeds,
+        plugin,
+        plugin_kwargs,
+        locked_params,
+        save_dir,
+        kwargs,
+        monitor_runtime_dir=None,
+        monitor_resource_every=1000,
+    ):
+    """Run one searchlight center from a module-level, picklable worker.
+
+    This wrapper is intentionally defined at module scope so it can be used by
+    both Joblib's ``loky`` backend and the standard ``multiprocessing`` backend.
+    The latter cannot pickle functions defined locally inside
+    :func:`permutation_searchlight`.
+    """
+    install_faulthandler()
+    task_count = worker_task_started()
+    center_ijk = tuple(map(int, centers[ix]))
+    worker_heartbeat(
+        monitor_runtime_dir,
+        ix,
+        "START",
+        center_ijk=list(center_ijk),
+        center_seed=int(center_seeds[ix]),
+        task_count=int(task_count),
+    )
+
+    try:
+        cols = _cols_for_center(
+            center_ijk,
+            offsets,
+            col_index_vol,
+            vol_shape,
+        )
+        worker_heartbeat(
+            monitor_runtime_dir,
+            ix,
+            "COLS_READY",
+            center_ijk=list(center_ijk),
+            ncols=int(len(cols)),
+            task_count=int(task_count),
+        )
+
+        result = _one_center(
+            center_ijk,
+            cols,
+            X_path,
+            labels,
+            folds,
+            cfg,
+            groups=groups,
+            n_perms=n_perms,
+            seed=int(center_seeds[ix]),
+            plugin=plugin,
+            plugin_kwargs=plugin_kwargs,
+            locked=locked_params,
+            searchlight=True,
+            save_dir=save_dir,
+            monitor_runtime_dir=monitor_runtime_dir,
+            monitor_ix=ix,
+            **kwargs,
+        )
+
+        worker_heartbeat(
+            monitor_runtime_dir,
+            ix,
+            "DONE",
+            center_ijk=list(center_ijk),
+            ncols=int(len(cols)),
+            task_count=int(task_count),
+        )
+        maybe_log_worker_resources(
+            logger,
+            task_count=task_count,
+            every=int(monitor_resource_every),
+            x_path=X_path,
+        )
+        worker_mark_completed(monitor_runtime_dir, ix)
+        return int(ix), result
+
+    except BaseException as exc:
+        worker_heartbeat(
+            monitor_runtime_dir,
+            ix,
+            "ERROR",
+            center_ijk=list(center_ijk),
+            task_count=int(task_count),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
 
 
 def permutation_searchlight(
@@ -542,7 +697,7 @@ def permutation_searchlight(
 
     X = mf.X.astype("float32", copy=False)
     y = np.asarray(mf.labels)
-    vol_shape = mf.mask_resampled_to_betas.shape[:3]
+    vol_shape = mf.fov_mask.shape[:3]
     col_index_vol = np.full(vol_shape, -1, np.int32)
 
     # No guessing about flattening order: just place columns where they belong
@@ -575,7 +730,7 @@ def permutation_searchlight(
         # Don't mmap X in the parent just to get its shape
         logger.info(f"X={X.shape} (n_samples, n_features)")
 
-        zooms = mf.mask_resampled_to_betas.header.get_zooms()
+        zooms = mf.fov_mask.header.get_zooms()
         offs  = _neighbors_ball_mm(zooms, radius_mm)
 
         # 5) run per-center
@@ -614,67 +769,132 @@ def permutation_searchlight(
         logger.info(f"Centers={len(centers)} | r={radius_mm}mm | perms={n_perms} | jobs={n_jobs}")
         logger.info("Start searchlight analysis")
 
-        def _run(ix):
-            center_ijk = tuple(map(int, centers[ix]))
-            cols = _cols_for_center(center_ijk, offs, col_index_vol, vol_shape)
-            
-            return _one_center(
-                center_ijk,
-                cols,
-                X_path,
-                y,
-                folds,
-                cfg,
-                groups=groups,
-                n_perms=n_perms,
-                seed=int(center_seeds[ix]),
-                plugin=plugin,
-                plugin_kwargs=plugin_kwargs,
-                locked=locked_params,
-                searchlight=True,
-                save_dir=save_dir,
-                **kwargs,
+        monitor_root = par_cfg.get("monitor_runtime_dir")
+        if not monitor_root:
+            monitor_root = (
+                os.environ.get("SLURM_TMPDIR")
+                or os.environ.get("TMPDIR")
+                or tmpd
             )
-                
+        monitor_runtime_dir = opj(
+            os.path.expanduser(monitor_root),
+            f"panic_searchlight_monitor_{os.getpid()}",
+        )
+        monitor_snapshot_dir = opj(save_dir, "searchlight_monitor")
+        monitor_interval = float(par_cfg.get("monitor_interval", 15))
+        monitor_resource_every = int(par_cfg.get("monitor_resource_every", 1000))
+
+        worker_kwargs = {
+            "centers": centers,
+            "offsets": offs,
+            "col_index_vol": col_index_vol,
+            "vol_shape": vol_shape,
+            "X_path": X_path,
+            "labels": y,
+            "folds": folds,
+            "cfg": cfg,
+            "groups": groups,
+            "n_perms": n_perms,
+            "center_seeds": center_seeds,
+            "plugin": plugin,
+            "plugin_kwargs": plugin_kwargs,
+            "locked_params": locked_params,
+            "save_dir": save_dir,
+            "kwargs": kwargs,
+            "monitor_runtime_dir": monitor_runtime_dir,
+            "monitor_resource_every": monitor_resource_every,
+        }
+
+        update_interval = int(par_cfg.get("update_interval", 0))
+        monitor_log_every = update_interval if update_interval > 0 else 5000
+        out = [None] * len(centers)
+
         if n_jobs == 1:
-            out = []
             for i in tqdm(
                 range(len(centers)),
                 total=len(centers),
                 disable=tqdm_disabled(),
             ):
-                out.append(_run(i))
+                result_ix, result = _run_searchlight_center(
+                    i,
+                    **worker_kwargs,
+                )
+                out[result_ix] = result
 
         else:
-            update_interval = int(
-                par_cfg.get("update_interval", 0)
-            )
-            progress = LoggedProgress(
-                total=len(centers),
-                label="Searchlight",
+            # Deliberately consume results directly rather than monkey-patching
+            # joblib's BatchCompletionCallBack. This makes exact task identity
+            # observable and removes the tqdm/joblib callback from the diagnostic
+            # path. Results are restored to submission order via ``result_ix``.
+            monitor = SearchlightMonitor(
+                len(centers),
+                runtime_dir=monitor_runtime_dir,
+                snapshot_dir=monitor_snapshot_dir,
                 logger=logger,
-                every=update_interval
+                interval=monitor_interval,
+                log_every=monitor_log_every,
+                stuck_thresholds=(30, 120, 600),
+                signal_stuck_workers=True,
             )
 
-            with Parallel(
-                n_jobs=n_jobs,
-                backend=par_cfg.get("backend", "loky"),
-                prefer=par_cfg.get("prefer", "processes"),
-                batch_size=par_cfg.get("batch_size", 16),
-                verbose=par_cfg.get("verbose", 0),
-            ) as parallel:
+            backend_name = par_cfg.get("backend", "loky")
 
-                with tqdm_joblib(
-                    tqdm(
-                        total=len(centers),
-                        disable=tqdm_disabled(),
-                    ),
-                    log_progress=progress,
-                ):
-                    out = parallel(
-                        delayed(_run)(i)
-                        for i in range(len(centers))
-                    )
+            with monitor:
+                parallel_kwargs = dict(
+                    n_jobs=n_jobs,
+                    backend=backend_name,
+                    batch_size=par_cfg.get("batch_size", 16),
+                    verbose=par_cfg.get("verbose", 0),
+                    pre_dispatch=par_cfg.get("pre_dispatch", "2*n_jobs"),
+                )
+
+                # joblib's MultiprocessingBackend does not support generator
+                # return modes. Its workers still journal exact completions, so
+                # the watchdog remains informative while the parent blocks.
+                if backend_name == "multiprocessing":
+                    with Parallel(**parallel_kwargs) as parallel:
+                        result_pairs = parallel(
+                            delayed(_run_searchlight_center)(
+                                i,
+                                **worker_kwargs,
+                            )
+                            for i in range(len(centers))
+                        )
+
+                    for result_ix, result in result_pairs:
+                        out[result_ix] = result
+                        monitor.mark_completed(result_ix)
+
+                else:
+                    with Parallel(
+                        return_as="generator_unordered",
+                        **parallel_kwargs,
+                    ) as parallel:
+                        result_gen = parallel(
+                            delayed(_run_searchlight_center)(
+                                i,
+                                **worker_kwargs,
+                            )
+                            for i in range(len(centers))
+                        )
+
+                        with tqdm(
+                            total=len(centers),
+                            disable=tqdm_disabled(),
+                        ) as pbar:
+                            for result_ix, result in result_gen:
+                                out[result_ix] = result
+                                monitor.mark_completed(result_ix)
+                                pbar.update(1)
+
+            missing = np.flatnonzero(
+                np.fromiter((row is None for row in out), dtype=np.bool_, count=len(out))
+            )
+            if missing.size:
+                raise RuntimeError(
+                    "Parallel searchlight ended without results for center indices: "
+                    f"{missing[:100].tolist()}"
+                )
 
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
@@ -717,7 +937,7 @@ def permutation_searchlight(
         if hemi_key is not None and hemi_key != "uni":
             base += f"_hemi-{hemi_key}"
 
-        ref = mf.mask_resampled_to_betas  # SAME grid/affine as vol_shape
+        ref = mf.fov_mask  # SAME grid/affine as vol_shape
         out_files = save_searchlight_maps(
             base,
             ref_img=ref,
@@ -776,138 +996,179 @@ def permutation_searchlight(
 
 
 def save_searchlight_maps(
-        base_path,
-        ref_img,
-        *,
-        observed_map,
-        null_mean_map,
-        delta_map,
-        pvalue_map,
-        nfeatures_map,
-        nperms_run,
-        stopped,
-        stop_code,
-        mask_img=None,
-        fdr_alpha=0.05,
-        n_perms=None,
-    ):
+    base_path,
+    ref_img,
+    *,
+    observed_map,
+    null_mean_map,
+    delta_map,
+    pvalue_map,
+    nfeatures_map,
+    nperms_run,
+    stopped,
+    stop_code,
+    mask_img=None,
+    fdr_alpha=0.05,
+    n_perms=None,
+):
     """
-    Save and summarize searchlight decoding results to NIfTI images.
+    Save and summarize searchlight decoding results as NIfTI images.
 
-    This function writes the core searchlight maps (``observed``, ``null_mean``,
-    ``delta``, ``pvalue``, ``nfeatures``) using the spatial reference of
-    ``ref_img``. It also performs voxelwise **FDR correction** of the p-value
-    map (within an optional mask), creates visualization-friendly ``-log10(p)``
-    maps, **and** saves diagnostics of the early-stopping rule used during
-    permutations (number of permutations actually run, whether early-stop
-    triggered, and the stop reason).
+    This function writes the core searchlight maps (``observed``,
+    ``null_mean``, ``delta``, ``pvalue``, ``nfeatures``), permutation
+    diagnostics, FDR-corrected p-values, visualization-friendly
+    ``-log10(p)`` maps, and thresholded effect maps.
+
+    All input arrays are assumed to already be defined on the spatial grid
+    of ``ref_img``.
+
+    If ``mask_img`` is provided, it must also already be on exactly the same
+    voxel grid as ``ref_img``. No resampling is performed. Voxels outside
+    this mask are written as zero in the ordinary output maps and are
+    excluded from FDR correction.
 
     **Primary maps**
-        - ``observed`` — Mean cross-validated decoding accuracy (often balanced
-          accuracy) with *true* labels at each sphere center.
+        - ``observed`` — Mean cross-validated decoding score with true
+          labels at each searchlight center.
 
-        - ``null_mean`` — Mean decoding accuracy across all *permuted-label*
-          repetitions at the same center, estimating the empirical null.
+        - ``null_mean`` — Mean decoding score across permuted-label
+          repetitions at each center.
 
-        - ``delta`` — Difference ``observed - null_mean``; an effect-size-like
-          contrast indicating how much above null the observed score is.
+        - ``delta`` — Difference ``observed - null_mean``.
 
-        - ``pvalue`` — Uncorrected voxelwise p-value computed from the
-          permutation distribution (typically one-sided: P[ null ≥ observed ]).
-          Values lie in [0, 1]; smaller is stronger evidence.
+        - ``pvalue`` — Uncorrected voxelwise permutation p-value.
 
-        - ``nfeatures`` — Number of voxel features included in each sphere.
-          Useful to diagnose edge effects or masks that yield too few features.
+        - ``nfeatures`` — Number of voxel features included in each
+          searchlight sphere.
 
-    **Diagnostic maps (early-stop)**
-        - ``nperms_run`` — The **actual** number of permutations executed per
-          voxel (≤ the requested maximum, due to early stopping).
+    **Diagnostic maps**
+        - ``nperms_run`` — Actual number of permutations executed at each
+          voxel.
 
-        - ``stopped`` — Binary indicator (0/1) whether early stopping triggered
-          for that voxel.
+        - ``nperms_run_frac`` — Fraction of the requested permutations
+          executed, written when ``n_perms`` is provided.
 
-        - ``stop_code`` — Encodes the early-stop reason:
-          0 = not stopped, 1 = ``p_min > alpha`` (cannot become significant),
-          2 = ``p_max < alpha`` (already clearly significant).
+        - ``stopped`` — Binary indicator of whether early stopping occurred.
+
+        - ``stop_code`` — Early-stop reason:
+          0 = not stopped,
+          1 = ``p_min > alpha``,
+          2 = ``p_max < alpha``.
 
     **Derived maps**
-        - ``pvalue_fdr`` — Benjamini–Hochberg FDR-corrected p-values within the
-          provided mask (or across all finite voxels if no mask is given).
+        - ``pvalue_fdr`` — Benjamini-Hochberg FDR-adjusted p-values,
+          calculated only across valid voxels inside ``mask_img``. If no
+          mask is supplied, all finite p-values are used.
 
-        - ``neglogp`` — ``-log10(pvalue)`` transform of the uncorrected p-map,
-          convenient for visualization (e.g., 1.3 ≈ p=0.05, 2 ≈ 0.01, 3 ≈ 0.001).
+        - ``neglogp`` — ``-log10(pvalue)`` within the valid mask.
 
-        - ``neglogp_fdr`` — ``-log10(pvalue_fdr)`` for visualizing corrected
-          results.
+        - ``neglogp_fdr`` — ``-log10(pvalue_fdr)`` within the valid mask.
 
-        - ``sig_uncorrected`` — Thresholded **delta** map where ``pvalue < fdr_alpha``
-          (voxels failing the threshold are set to NaN).
+        - ``sig_uncorrected`` — ``delta`` at voxels satisfying
+          ``pvalue < fdr_alpha``. Non-significant voxels inside the mask are
+          NaN; voxels outside the mask are zero.
 
-        - ``sig_fdr`` — Thresholded **delta** map where ``pvalue_fdr < fdr_alpha``
-          (recommended for reporting significant decoding).
-
-    All images are written as NIfTI files that share the header/affine of
-    ``ref_img``. Filenames follow ``<base_path>_<mapname>.nii.gz``.
+        - ``sig_fdr`` — ``delta`` at voxels satisfying
+          ``pvalue_fdr < fdr_alpha``. Non-significant voxels inside the mask
+          are NaN; voxels outside the mask are zero.
 
     Parameters
     ----------
-    base_path : str
-        Output prefix. If ``base_path == '/tmp/sub-01_searchlight'``, the p-map
-        is written to ``/tmp/sub-01_searchlight_pvalue.nii.gz`` (and so on).
-    ref_img : :class:`nibabel.Nifti1Image`
-        Reference image defining the target grid and affine for all outputs
-        (typically the resampled mask in beta space).
+    base_path : str or os.PathLike
+        Output prefix. For example, if
+        ``base_path == '/tmp/sub-01_searchlight'``, the p-value map is
+        written to ``/tmp/sub-01_searchlight_pvalue.nii.gz``.
+
+    ref_img : nibabel.spatialimages.SpatialImage
+        Reference image defining the shape, affine, and header for all
+        output maps. Typically this is the final binary FOV mask in beta
+        space.
+
     observed_map : ndarray, shape (X, Y, Z)
-        Observed (true-label) mean CV score per center.
+        Observed decoding score per searchlight center.
+
     null_mean_map : ndarray, shape (X, Y, Z)
-        Mean permuted-label CV score (empirical null) per center.
+        Mean permuted-label decoding score per center.
+
     delta_map : ndarray, shape (X, Y, Z)
         Difference ``observed_map - null_mean_map``.
+
     pvalue_map : ndarray, shape (X, Y, Z)
-        Uncorrected voxelwise permutation p-values in [0, 1].
+        Uncorrected voxelwise permutation p-values.
+
     nfeatures_map : ndarray, shape (X, Y, Z)
-        Number of features included in each sphere.
+        Number of features included in each searchlight sphere.
+
     nperms_run : ndarray, shape (X, Y, Z)
-        Number of permutations actually executed per voxel (diagnostic).
+        Number of permutations actually executed per voxel.
+
     stopped : ndarray, shape (X, Y, Z)
-        0/1 map indicating whether early stopping triggered (diagnostic).
+        Binary map indicating whether early stopping triggered.
+
     stop_code : ndarray, shape (X, Y, Z)
-        0 = not stopped; 1 = ``p_min > alpha``; 2 = ``p_max < alpha`` (diagnostic).
-    mask_img : :class:`nibabel.Nifti1Image`, optional
-        Binary ROI/brain mask. If provided, FDR correction is applied only
-        within this mask; otherwise across all finite p-values.
-    n_perms : int or None:
-        Number of label permutations performed for the null distribution.
-        Used to calculate the percentage of permutations runs based on ``nperms_run``
+        Early-stopping reason code.
+
+    mask_img : nibabel.spatialimages.SpatialImage, optional
+        Binary mask defining valid searchlight/FOV voxels. It must already
+        have the same shape and affine as ``ref_img``. No resampling is
+        performed.
+
+        Voxels outside this mask are excluded from statistical correction
+        and written as zero in ordinary output maps.
+
+        If ``None``, all voxels on the reference grid are considered part
+        of the spatial mask; finite p-values determine validity for
+        statistical operations.
+
     fdr_alpha : float, optional
-        Target FDR level for both ``pvalue_fdr`` and significance masking
-        (default = 0.05).
+        Significance level used for Benjamini-Hochberg FDR correction and
+        thresholded significance maps. Default is 0.05.
+
+    n_perms : int or None, optional
+        Maximum/requested number of permutations. If provided,
+        ``nperms_run_frac = nperms_run / n_perms`` is saved.
 
     Returns
     -------
     out_files : dict
-        Mapping from map name to output path for all saved images. Always
-        includes: ``'observed'``, ``'null_mean'``, ``'delta'``, ``'pvalue'``,
-        ``'nfeatures'``, ``'nperms_run'``, ``'stopped'``, ``'stop_code'``;
-        and, when applicable: ``nperms_run_frac``, ``'pvalue_fdr'``, ``'neglogp'``,
-        ``'neglogp_fdr'``.
+        Mapping from map name to output filename.
+
+        Always contains:
+        ``observed``, ``null_mean``, ``delta``, ``pvalue``,
+        ``nfeatures``, ``nperms_run``, ``stopped``, ``stop_code``.
+
+        When ``n_perms`` is provided, also contains
+        ``nperms_run_frac``.
+
+        When at least one finite p-value exists inside the valid mask,
+        additionally contains:
+        ``pvalue_fdr``, ``neglogp``, ``neglogp_fdr``,
+        ``sig_uncorrected``, and ``sig_fdr``.
 
     Notes
     -----
-    - P-values are empirical; the smallest attainable value is
+    - ``ref_img`` supplies spatial metadata only. It does not itself mask
+      array values.
+
+    - ``mask_img`` is therefore applied explicitly before maps are written.
+
+    - No interpolation or resampling is performed in this function.
+      Searchlight result arrays and ``mask_img`` are expected to already be
+      on the same grid as ``ref_img``.
+
+    - Outside-mask values are written as zero. This is done only for the
+      saved maps; statistical calculations use the original p-value array
+      together with the boolean validity mask, so outside-mask zeros can
+      never be interpreted as significant p-values.
+
+    - Empirical p-values generally have a minimum attainable value of
       ``1 / (n_permutations_run + 1)`` at each voxel.
-    - ``delta`` is convenient for effect visualization; use ``pvalue_fdr`` (or
-      ``sig_fdr``) for inferential statements.
-    - Early-stopping diagnostics help quantify computational savings and verify
-      that stopping criteria behaved as expected.
 
     Examples
     --------
-    >>> ref = mf.mask_resampled_to_betas
-    >>> base = os.path.join(output_dir, "searchlight")
     >>> out = save_searchlight_maps(
-    ...     base,
-    ...     ref_img=ref,
+    ...     base_path=os.path.join(output_dir, "searchlight"),
+    ...     ref_img=mf.fov_mask,
     ...     observed_map=obs_map,
     ...     null_mean_map=null_map,
     ...     delta_map=delta_map,
@@ -916,74 +1177,321 @@ def save_searchlight_maps(
     ...     nperms_run=nperms_run_map,
     ...     stopped=stopped_map,
     ...     stop_code=stop_code_map,
-    ...     mask_img=brain_mask,
+    ...     mask_img=mf.fov_mask,
     ...     n_perms=n_perms,
     ...     fdr_alpha=0.05,
     ... )
-    >>> out["sig_fdr"]
-    '/tmp/searchlight/sub-01_searchlight_sig_fdr.nii.gz'
     """
 
-    os.makedirs(os.path.dirname(base_path), exist_ok=True)
+    # ------------------------------------------------------------------
+    # 0) Basic validation
+    output_dir = os.path.dirname(os.fspath(base_path))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
-    # 1) Save primary maps
+    ref_shape = tuple(ref_img.shape[:3])
+
+    arrays = {
+        "observed_map": observed_map,
+        "null_mean_map": null_mean_map,
+        "delta_map": delta_map,
+        "pvalue_map": pvalue_map,
+        "nfeatures_map": nfeatures_map,
+        "nperms_run": nperms_run,
+        "stopped": stopped,
+        "stop_code": stop_code,
+    }
+
+    for name, arr in arrays.items():
+        arr = np.asarray(arr)
+
+        if arr.shape != ref_shape:
+            raise ValueError(
+                f"{name} has shape {arr.shape}, but reference image "
+                f"has spatial shape {ref_shape}."
+            )
+
+    if not (0.0 < fdr_alpha < 1.0):
+        raise ValueError(
+            f"fdr_alpha must lie between 0 and 1; got {fdr_alpha}."
+        )
+
+    if n_perms is not None:
+        if not isinstance(n_perms, (int, np.integer)) or n_perms <= 0:
+            raise ValueError(
+                f"n_perms must be a positive integer; got {n_perms!r}."
+            )
+
+    # ------------------------------------------------------------------
+    # 1) Build the spatial/FOV mask.
+    #
+    # mask_img is expected to ALREADY be on the ref_img grid.
+    # Do not resample here.
+    if mask_img is not None:
+        if tuple(mask_img.shape[:3]) != ref_shape:
+            raise ValueError(
+                "mask_img and ref_img are not on the same grid: "
+                f"mask shape={mask_img.shape[:3]}, "
+                f"reference shape={ref_shape}."
+            )
+
+        if not np.allclose(
+            mask_img.affine,
+            ref_img.affine,
+            rtol=1e-5,
+            atol=1e-5,
+        ):
+            raise ValueError(
+                "mask_img and ref_img have different affines. "
+                "The mask must already be in the searchlight/reference "
+                "space; this function does not resample masks."
+            )
+
+        spatial_mask = (
+            np.asarray(mask_img.get_fdata(dtype=np.float32)) > 0.5
+        )
+
+    else:
+        spatial_mask = np.ones(ref_shape, dtype=bool)
+
+    if not np.any(spatial_mask):
+        raise ValueError("mask_img contains no non-zero voxels.")
+
+    # Convert here so all subsequent calculations use predictable arrays.
+    observed_map = np.asarray(observed_map, dtype=np.float32)
+    null_mean_map = np.asarray(null_mean_map, dtype=np.float32)
+    delta_map = np.asarray(delta_map, dtype=np.float32)
+    pvalue_map = np.asarray(pvalue_map, dtype=np.float32)
+    nfeatures_map = np.asarray(nfeatures_map)
+    nperms_run = np.asarray(nperms_run)
+    stopped = np.asarray(stopped)
+    stop_code = np.asarray(stop_code)
+
+    # Validate finite p-values where present.
+    finite_p = np.isfinite(pvalue_map)
+    bad_p = finite_p & (
+        (pvalue_map < 0.0) |
+        (pvalue_map > 1.0)
+    )
+
+    if np.any(bad_p):
+        vals = pvalue_map[bad_p]
+        raise ValueError(
+            "pvalue_map contains finite values outside [0, 1]. "
+            f"Observed range among invalid values: "
+            f"{vals.min():.6g} to {vals.max():.6g}."
+        )
+
+    # ------------------------------------------------------------------
+    # Helper: explicitly zero values outside the final FOV.
+    #
+    # This is what actually performs masking. new_img_like() by itself
+    # only transfers spatial metadata.
+    def masked_zero(data, dtype=np.float32):
+        out = np.zeros(ref_shape, dtype=dtype)
+        out[spatial_mask] = np.asarray(data)[spatial_mask]
+        return out
+
+    # ------------------------------------------------------------------
+    # 2) Save primary and diagnostic maps.
     imgs = {
-        "observed":   image.new_img_like(ref_img, observed_map.astype(np.float32),  copy_header=True),
-        "null_mean":  image.new_img_like(ref_img, null_mean_map.astype(np.float32), copy_header=True),
-        "delta":      image.new_img_like(ref_img, delta_map.astype(np.float32),     copy_header=True),
-        "pvalue":     image.new_img_like(ref_img, pvalue_map.astype(np.float32),    copy_header=True),
-        "nfeatures":  image.new_img_like(ref_img, nfeatures_map.astype(np.float32), copy_header=True),
-        "nperms_run": image.new_img_like(ref_img, nperms_run.astype(np.float32), copy_header=True),
-        "stopped":    image.new_img_like(ref_img, stopped.astype(np.float32),    copy_header=True),
-        "stop_code":  image.new_img_like(ref_img, stop_code.astype(np.float32),  copy_header=True),        
+        "observed": image.new_img_like(
+            ref_img,
+            masked_zero(observed_map, np.float32),
+            copy_header=True,
+        ),
+        "null_mean": image.new_img_like(
+            ref_img,
+            masked_zero(null_mean_map, np.float32),
+            copy_header=True,
+        ),
+        "delta": image.new_img_like(
+            ref_img,
+            masked_zero(delta_map, np.float32),
+            copy_header=True,
+        ),
+        "pvalue": image.new_img_like(
+            ref_img,
+            masked_zero(pvalue_map, np.float32),
+            copy_header=True,
+        ),
+        "nfeatures": image.new_img_like(
+            ref_img,
+            masked_zero(nfeatures_map, np.float32),
+            copy_header=True,
+        ),
+        "nperms_run": image.new_img_like(
+            ref_img,
+            masked_zero(nperms_run, np.float32),
+            copy_header=True,
+        ),
+        "stopped": image.new_img_like(
+            ref_img,
+            masked_zero(stopped, np.uint8),
+            copy_header=True,
+        ),
+        "stop_code": image.new_img_like(
+            ref_img,
+            masked_zero(stop_code, np.uint8),
+            copy_header=True,
+        ),
     }
 
     if n_perms is not None:
-        nperms_run_frac = nperms_run/n_perms
-        imgs["nperms_run_frac"] = image.new_img_like(ref_img, nperms_run_frac.astype(np.float32), copy_header=True)
+        nperms_run_frac = (
+            nperms_run.astype(np.float32) /
+            float(n_perms)
+        )
+
+        imgs["nperms_run_frac"] = image.new_img_like(
+            ref_img,
+            masked_zero(nperms_run_frac, np.float32),
+            copy_header=True,
+        )
 
     out_files = {}
-    for k, v in imgs.items():
-        f = f"{base_path}_{k}.nii.gz"
-        v.to_filename(f)
-        out_files[k] = f
 
-    # 2) Build mask for correction (resample to ref grid if provided)
-    if mask_img is not None:
-        m = image.resample_to_img(
-            mask_img,
+    for name, img in imgs.items():
+        filename = f"{base_path}_{name}.nii.gz"
+        img.to_filename(filename)
+        out_files[name] = filename
+
+    # ------------------------------------------------------------------
+    # 3) Define valid voxels for statistical operations.
+    #
+    # IMPORTANT:
+    # We use the ORIGINAL p-value array here, not the zero-masked p-value
+    # saved above. Thus outside-FOV zeros cannot enter FDR correction.
+    mask_valid = spatial_mask & np.isfinite(pvalue_map)
+    p_vec = pvalue_map[mask_valid]
+
+    if p_vec.size == 0:
+        return out_files
+
+    # ------------------------------------------------------------------
+    # 4) Benjamini-Hochberg FDR correction.
+    reject_fdr, p_fdr_vec = fdrcorrection(
+        p_vec,
+        alpha=fdr_alpha,
+    )
+
+    # Internal representation:
+    # NaN everywhere except valid statistical voxels.
+    p_fdr = np.full(
+        ref_shape,
+        np.nan,
+        dtype=np.float32,
+    )
+    p_fdr[mask_valid] = p_fdr_vec.astype(np.float32)
+
+    # Saved p_FDR image:
+    # zero outside the FOV, corrected values inside.
+    p_fdr_out = np.zeros(
+        ref_shape,
+        dtype=np.float32,
+    )
+    p_fdr_out[mask_valid] = p_fdr[mask_valid]
+
+    # ------------------------------------------------------------------
+    # 5) -log10(p) maps.
+    #
+    # Construct these directly only at valid voxels. This prevents the
+    # zero values used outside the FOV in the saved p-map from turning
+    # into enormous -log10(p) values.
+    eps = np.finfo(np.float32).tiny
+
+    neglogp = np.zeros(
+        ref_shape,
+        dtype=np.float32,
+    )
+    neglogp[mask_valid] = -np.log10(
+        np.clip(
+            pvalue_map[mask_valid],
+            eps,
+            1.0,
+        )
+    )
+
+    valid_fdr = spatial_mask & np.isfinite(p_fdr)
+
+    neglogp_fdr = np.zeros(
+        ref_shape,
+        dtype=np.float32,
+    )
+    neglogp_fdr[valid_fdr] = -np.log10(
+        np.clip(
+            p_fdr[valid_fdr],
+            eps,
+            1.0,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 6) Thresholded delta/effect maps.
+    #
+    # Outside FOV: 0
+    # Inside FOV but non-significant: NaN
+    # Significant: delta
+    sig_uncorrected = np.zeros(
+        ref_shape,
+        dtype=np.float32,
+    )
+    sig_uncorrected[spatial_mask] = np.nan
+
+    sig_unc_mask = (
+        mask_valid &
+        (pvalue_map < fdr_alpha)
+    )
+    sig_uncorrected[sig_unc_mask] = delta_map[sig_unc_mask]
+
+    sig_fdr = np.zeros(
+        ref_shape,
+        dtype=np.float32,
+    )
+    sig_fdr[spatial_mask] = np.nan
+
+    sig_fdr_mask = np.zeros(
+        ref_shape,
+        dtype=bool,
+    )
+    sig_fdr_mask[mask_valid] = reject_fdr
+
+    sig_fdr[sig_fdr_mask] = delta_map[sig_fdr_mask]
+
+    # ------------------------------------------------------------------
+    # 7) Save derived maps.
+    extras = {
+        "pvalue_fdr": image.new_img_like(
             ref_img,
-            interpolation="nearest",
-            force_resample=True,
-            copy_header=True
-        ).get_fdata() > 0.5
-    else:
-        m = np.isfinite(pvalue_map)
+            p_fdr_out,
+            copy_header=True,
+        ),
+        "neglogp": image.new_img_like(
+            ref_img,
+            neglogp,
+            copy_header=True,
+        ),
+        "neglogp_fdr": image.new_img_like(
+            ref_img,
+            neglogp_fdr,
+            copy_header=True,
+        ),
+        "sig_uncorrected": image.new_img_like(
+            ref_img,
+            sig_uncorrected,
+            copy_header=True,
+        ),
+        "sig_fdr": image.new_img_like(
+            ref_img,
+            sig_fdr,
+            copy_header=True,
+        ),
+    }
 
-    # 3) FDR correction within mask
-    p = pvalue_map
-    mask_valid = m & np.isfinite(p)
-    p_vec = p[mask_valid]
-
-    if p_vec.size > 0:
-        rej, p_fdr_vec = fdrcorrection(p_vec, alpha=fdr_alpha)
-        p_fdr = np.full_like(p, np.nan, dtype=np.float32)
-        p_fdr[mask_valid] = p_fdr_vec
-
-        # 4) -log10 versions (nice for visualization)
-        eps = np.finfo(np.float32).tiny
-        neglogp     = -np.log10(np.clip(p.astype(np.float32),     eps, 1.0))
-        neglogp_fdr = -np.log10(np.clip(p_fdr.astype(np.float32), eps, 1.0))
-
-        # 5) Save derived maps
-        extras = {
-            "pvalue_fdr": image.new_img_like(ref_img, p_fdr,       copy_header=True),
-            "neglogp":    image.new_img_like(ref_img, neglogp,     copy_header=True),
-            "neglogp_fdr":image.new_img_like(ref_img, neglogp_fdr, copy_header=True),
-        }
-        for k, v in extras.items():
-            f = f"{base_path}_{k}.nii.gz"
-            v.to_filename(f)
-            out_files[k] = f
+    for name, img in extras.items():
+        filename = f"{base_path}_{name}.nii.gz"
+        img.to_filename(filename)
+        out_files[name] = filename
 
     return out_files
+
