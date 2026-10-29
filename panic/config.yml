@@ -10,25 +10,25 @@ label_dict:
 #   USo: 4
 #   USm: 5
 
-roi_dict:
-  lat:  377         # Lateral nucleus
+roi_dict: 
+  # lat:  377         # Lateral nucleus
   bl:   216         # Basolateral (basal) nucleus
-  bm:   217         # Basomedial nucleus
-  cen:  [277, 278]  # Central nucleus
-  med:  279         # Medial nucleus
-  pl:   240         # Paralaminar nucleus
+  # bm:   217         # Basomedial nucleus
+  # cen:  [277, 278]  # Central nucleus
+  # med:  279         # Medial nucleus
+  # pl:   240         # Paralaminar nucleus
 
-  aaa:  215         # Anterior amygdaloid area
-  coa:  238         # Cortical amygdaloid nucleus
-  cat:  242         # Corticoamygdaloid transition area
-  asta: 295         # Amygdalostriatal transition area
-  aha:  301         # Amygdalohippocampal area
+  # aaa:  215         # Anterior amygdaloid area
+  # coa:  238         # Cortical amygdaloid nucleus
+  # cat:  242         # Corticoamygdaloid transition area
+  # asta: 295         # Amygdalostriatal transition area
+  # aha:  301         # Amygdalohippoc ampal area
   ahta: 320         # Amygdalohippocampal transition area
 
-  nuc: [216, 217, 240, 277, 278, 279, 377]
-  trans: [242, 295, 301, 320]
+  # nuc: [216, 217, 240, 277, 278, 279, 377]
+  # trans: [242, 295, 301, 320]
 
-  total: [215, 216, 217, 238, 240, 242, 277, 278, 279, 295, 301, 320, 377]
+  # total: [215, 216, 217, 238, 240, 242, 277, 278, 279, 295, 301, 320, 377]
 
 roi_settings:                   # kwargs passed to data.PrepareROIs()
   src: "freesurfer"             # used in conjunction with {project_dir} below
@@ -42,17 +42,17 @@ general_settings:
   # save_dir: "/mnt/d/fMRI/Development/HRA/derivatives/panic"
   save_dir: /tmp/test_panic
   tmp_dir: "~/.joblib_cache"    # stores temp memmaps
-  method: LSA                   # or LSS, if you have GLMsingle: use 'lss', 'lsa'
+  method: LSS                   # or LSS, if you have GLMsingle: use 'lss', 'lsa'
   source: stglm                 # or 'stglm', 'glmsingle'
   standardize: zscore           # best to keep this
   filters: task-HRA
-  overwrite: true
+  overwrite: false
   save_imgs: false
 
 fitted_derivative: false
 
 decoding_settings:
-  n_permutations: 5           # permutations for ROI-decoding/searchlight
+  n_permutations: 10           # permutations for ROI-decoding/searchlight
   variance_threshold: 1e-12     # avoid flat time series
   permute_both_sets: true       # false: only permute training labels
   permute_within_groups: false  # true: LOSO/LORO set up; see 'outer_cv'
@@ -64,17 +64,19 @@ decoding_settings:
     backend: "loky"             # backend for Parallel process
     prefer: "processes"         # preference for Parallel process
     verbose: 0                  # verbosity of Parallel process
-    update_interval: 100        # log progress every N completed searchlights (0 = disable)
+    update_interval: 1000        # log progress every N completed searchlights (0 = disable)
 
-  # this field pertains to panic.plugins.PLUGIN_REGISTRY
+  # # this field pertains to panic.plugins.PLUGIN_REGISTRY
   # analysis:
   #   type: vanilla_nearest_centroid
+  #   name: SVM_CSm_v_CSpu
   #   permutations: true
   #   higher_is_better: true
   #   args: {}
 
   # analysis:
   #   type: n_region_nearest_centroid
+  #   name: SVM_CSm_v_CSpu
   #   permutations: true
   #   higher_is_better: true
   #   args:
@@ -100,7 +102,7 @@ decoding_settings:
   #     run_seed_stride: 1000
 
   analysis:
-    type: scikit_decoding
+    type: scikit_svm
     name: SVM_CSm_v_CSpu
     permutations: true
     higher_is_better: true
@@ -185,6 +187,7 @@ decoding_settings:
       C: 1
       kernel: linear
       class_weight: balanced
+      max_iter: 1_000_000
 
   # select features (e.g., percentile or SelectKBest)
   feature_selection:

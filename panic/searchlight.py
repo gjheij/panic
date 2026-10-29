@@ -552,9 +552,10 @@ def permutation_searchlight(
     ----------
     betas_img : nibabel.Nifti1Image
         4D beta image with shape ``(X, Y, Z, n_samples)``.
-    mask_img : nibabel.Nifti1Image
+    mask_img : nibabel.Nifti1Image or None
         Binary ROI (or brain) mask aligned to ``betas_img`` space
-        (or resampled to it).
+        (or resampled to it). With None, use all finite, varying beta voxels
+        in the available field of view, excluding zero/constant padding.
     trial_list : sequence of str
         Trial descriptors aligned with the 4th dimension of ``betas_img``.
         Used by :class:`data.MaskAndFilterBetas` to select and order samples.

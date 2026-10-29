@@ -16,6 +16,7 @@ from collections import Counter
 from panic.logger import get_logger
 from panic.errors import EmptyMaskError
 from panic.betas import BetaLoaderMixin
+from panic.masking import beta_support_mask
 
 from pathlib import Path
 
@@ -1435,6 +1436,10 @@ class MaskAndFilterBetas:
         ensuring voxel-level intersection between the ROI mask and valid
         beta signal.
 
+        With ``mask=None``, the entire beta grid is the starting mask; finite,
+        varying beta support defines the available FOV. This is not anatomical
+        brain extraction. An explicit mask restricts that support to the ROI.
+
         This method resamples the ROI mask to match the spatial grid of
         the beta images, removes non-varying or invalid voxels, and extracts
         the resulting beta features using :class:`nilearn.maskers.NiftiMasker`.
@@ -1565,24 +1570,30 @@ class MaskAndFilterBetas:
                 betas_first_vol.header.get_zooms()[:3],
             )
 
-        # resample mask to betas
-        logger.info(f"Resampling mask {self.mask.shape} to affine of beta-image {betas_first_vol.shape}")
-
-        self.mask_resampled_to_betas = image.resample_to_img(
-            self.mask,
-            betas_first_vol,
-            interpolation=interpolation,
-            force_resample=True,
-            copy_header=True
-        )
+        if self.mask is None:
+            # No anatomical mask: use the beta grid, then restrict it to valid
+            # signal below. Construct after optional target-zoom resampling.
+            logger.info("No mask supplied; using available beta field of view")
+            self.mask_resampled_to_betas = image.new_img_like(
+                betas_first_vol,
+                np.ones(betas_first_vol.shape[:3], dtype=np.uint8),
+                copy_header=True,
+            )
+        else:
+            logger.info(f"Resampling mask {self.mask.shape} to affine of beta-image {betas_first_vol.shape}")
+            self.mask_resampled_to_betas = image.resample_to_img(
+                self.mask,
+                betas_first_vol,
+                interpolation=interpolation,
+                force_resample=True,
+                copy_header=True,
+            )
 
         # find intersection with betas
         logger.info(f"Identifying valid voxels (var>{var_thr})")
         B = self.betas.get_fdata(dtype=np.float32)
 
-        eps = max(float(var_thr), np.finfo(np.float32).eps)
-        varying = B.var(axis=3) > eps
-        support = np.isfinite(B).all(axis=3) & varying
+        support = beta_support_mask(B, variance_threshold=var_thr)
 
         support_img = image.new_img_like(
             self.mask_resampled_to_betas,
@@ -1629,7 +1640,8 @@ class MaskAndFilterBetas:
         )
 
         self.roi_metrics = self._compute_roi_metrics(
-            mask_img=self.mask,
+            mask_img=(self.mask if self.mask is not None
+                      else self.mask_resampled_to_betas),
             resampled_mask=self.mask_resampled_to_betas,
             valid_mask=roi_mask_data,
         )

@@ -775,7 +775,7 @@ class ClassifySubject(data.PrepareBetas):
         # append subject to save_dir
         self.gen_settings = self.cfg["general_settings"]
         self.dec_settings = self.cfg["decoding_settings"]
-        self.roi_settings = self.cfg["roi_settings"]
+        self.roi_settings = self.cfg.get("roi_settings") or {}
 
         # Searchlight uses local spherical neighborhoods as the feature definition.
         # Disable ROI-level feature selection and grid search so each center uses
@@ -1200,15 +1200,21 @@ class ClassifySubject(data.PrepareBetas):
         #   1. directory -> *.nii.gz files
         #   2. dict -> FreeSurfer labels
         #   3. file -> assume mask
+        #   4. None -> available beta FOV (searchlight only)
 
         is_labels = False
-        roi_dict = self.cfg["roi_dict"]
+        roi_dict = self.cfg.get("roi_dict")
         run_dict = {}
+        if roi_dict is None:
+            if not self.searchlight:
+                raise ValueError("roi_dict=None is only supported in searchlight mode")
+            logger.info("Searchlight mask not specified; selecting available beta FOV")
+            return {"fov": None}, False
         if isinstance(roi_dict, str):
             assert os.path.exists(roi_dict), FileNotFoundError(f"Input ROI-directory '{roi_dict}' does not exist")
             if os.path.isdir(roi_dict):
                 logger.info(f"Defining ROIs from directory: '{roi_dict}'")
-                extension = self.cfg["roi_settings"].get("extension", ".nii.gz")
+                extension = self.roi_settings.get("extension", ".nii.gz")
                 mask_files = FindFiles(
                     roi_dict,
                     extension=extension,
@@ -1442,7 +1448,7 @@ class ClassifySubject(data.PrepareBetas):
                 # Optional resampled mask output
                 fname = None
 
-                if self.save_imgs:
+                if self.save_imgs or (self.searchlight and r_val is None):
                     resampled_dir = opj(
                         self.save_dir,
                         "rois",
@@ -1916,6 +1922,12 @@ class ClassifySubject(data.PrepareBetas):
             roi_labels,
             roi_name=None
         ):
+
+        if roi_labels is None:
+            if not self.searchlight:
+                raise ValueError("A mask or ROI definition is required for ROI decoding")
+            # Preserve None until beta extraction, where the valid FOV is known.
+            return None, {"uni": ["fov", None]}
 
         # prepare ROIs
         obj = data.PrepareROIs(
