@@ -26,11 +26,15 @@ def load_functions(path, names, namespace):
     assert len(nodes) == len(names), names
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
 
-factory_ns = dict(inspect=inspect, _CV_REGISTRY={name: getattr(model_selection, name) for name in
-    ['StratifiedKFold', 'RepeatedStratifiedKFold', 'KFold']})
-load_functions(ROOT / 'panic/factory.py', ['cv_from_config'], factory_ns)
+CV_NAMES = ['StratifiedKFold', 'RepeatedStratifiedKFold', 'KFold',
+            'GroupKFold', 'StratifiedGroupKFold', 'LeaveOneGroupOut', 'LeavePGroupsOut']
+factory_ns = dict(inspect=inspect, _CV_REGISTRY={name: getattr(model_selection, name) for name in CV_NAMES},
+                  **{name: getattr(model_selection, name) for name in CV_NAMES})
+load_functions(ROOT / 'panic/factory.py',
+               ['cv_from_config', '_splitter_accepts_groups', '_splitter_requires_groups'], factory_ns)
 factory = types.SimpleNamespace(cv_from_config=factory_ns['cv_from_config'],
-    _splitter_accepts_groups=lambda cv: False, scorer_from_config=get_scorer)
+    _splitter_accepts_groups=factory_ns['_splitter_accepts_groups'],
+    _splitter_requires_groups=factory_ns['_splitter_requires_groups'], scorer_from_config=get_scorer)
 ns = dict(np=np, factory=factory, logger=logging.getLogger(__name__), Any=Any, Optional=Optional,
     FoldScoreFunction=object, errors=types.SimpleNamespace(NoFeaturesSelectedError=ValueError),
     BaseSearchCV=BaseSearchCV, has_fit_parameter=has_fit_parameter,
@@ -47,6 +51,42 @@ class StratifiedCVTests(unittest.TestCase):
 
     def folds(self, y=None, cfg=None):
         return ns['create_outer_folds'](cfg or self.cfg, self.y if y is None else y)
+
+    def test_optional_groups_are_not_required_for_stratified_splitter(self):
+        cv = model_selection.StratifiedKFold(3)
+        self.assertTrue(factory._splitter_accepts_groups(cv))
+        self.assertFalse(factory._splitter_requires_groups(cv))
+        # Reproduce the searchlight path after permutation groups are cleared.
+        y = np.array([0]*8 + [1]*6)
+        folds = ns['create_outer_folds'](self.cfg, y, groups=None)
+        self.assertEqual(len(folds), 3)
+        for train, test in folds:
+            self.assertEqual(set(y[train]), {0,1})
+            self.assertEqual(set(y[test]), {0,1})
+
+    def test_group_splitters_still_require_real_groups(self):
+        for name, args in [('GroupKFold', {'n_splits':2}),
+                           ('StratifiedGroupKFold', {'n_splits':2}),
+                           ('LeaveOneGroupOut', {}), ('LeavePGroupsOut', {'n_groups':1})]:
+            cfg = {'outer_cv': {'mode':'sklearn', 'name':name, 'args':args}}
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, 'requires `groups`'):
+                    self.folds(cfg=cfg)
+                groups = np.tile(np.arange(2),11)
+                folds = ns['create_outer_folds'](cfg, self.y, groups=groups)
+                self.assertTrue(folds)
+                for train, test in folds:
+                    self.assertFalse(set(groups[train]) & set(groups[test]))
+
+    def test_required_custom_groups_parameter_is_detected(self):
+        class Required:
+            def split(self, X, y, groups):
+                pass
+        class OptionalGroups:
+            def split(self, X, y, groups=None):
+                pass
+        self.assertTrue(factory._splitter_requires_groups(Required()))
+        self.assertFalse(factory._splitter_requires_groups(OptionalGroups()))
 
     def test_barcelona_folds_have_two_minority_test_trials(self):
         folds = self.folds()

@@ -534,3 +534,11 @@ def _splitter_accepts_groups(cv):
     """Return whether ``cv.split`` accepts a groups argument."""
     signature = inspect.signature(cv.split)
     return "groups" in signature.parameters
+
+
+def _splitter_requires_groups(cv):
+    """Distinguish group splitters from splitters accepting optional groups."""
+    if isinstance(cv, (GroupKFold, StratifiedGroupKFold, LeaveOneGroupOut, LeavePGroupsOut)):
+        return True
+    parameter = inspect.signature(cv.split).parameters.get("groups")
+    return parameter is not None and parameter.default is inspect.Parameter.empty

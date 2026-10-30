@@ -1006,7 +1006,7 @@ def create_outer_folds(cfg, labels, groups=None):
         )
 
         # check if splitter requires groups (e.g., LeaveOneGroupOut)
-        requires_groups = factory._splitter_accepts_groups(cv)
+        requires_groups = factory._splitter_requires_groups(cv)
         groups_arr = None
         if requires_groups:
 
