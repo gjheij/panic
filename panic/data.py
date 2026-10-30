@@ -17,6 +17,7 @@ from panic.logger import get_logger
 from panic.errors import EmptyMaskError
 from panic.betas import BetaLoaderMixin
 from panic.masking import beta_support_mask
+from panic.resampling import resample_to_voxel_size
 
 from pathlib import Path
 
@@ -1453,7 +1454,9 @@ class MaskAndFilterBetas:
         :param float var_thr:
             Minimum voxelwise variance threshold (in beta space). Voxels with
             variance ≤ ``var_thr`` are excluded. Default: ``0.0``.
-        :param list zooms:
+        :param float | list | tuple | numpy.ndarray zooms:
+            Explicit target voxel sizes; preserves affine axis directions/origin
+            and computes the output shape from the original voxel-center bounds.
             Instead of using beta images as default for resampling, allow custom
             zoom. This is particularly useful for searchlight, where you may
             want to downsample the data to reduce the number of centers evalua-
@@ -1528,37 +1531,16 @@ class MaskAndFilterBetas:
         if zooms is not None:
             logger.info(f"Applying custom zoom to beta images: {zooms}")
             
-            if isinstance(zooms, list):
-                if len(zooms)<3:
-                    raise ValueError(f"A list of zooms must contain 3 elements, not {len(zooms)}: {zooms}")
-                zooms = np.array(zooms)
-            elif isinstance(zooms, (int, float)):
-                zooms = np.full(3, float(zooms))
-            elif isinstance(zooms, np.ndarray):
-                pass
-            else:
-                raise TypeError(f"zooms must be a list of 3 elements, an integer/float, or a numpy array, not type {type(zooms)}")
-            
-            assert isinstance(zooms, np.ndarray) and len(zooms)==3, f"zooms must be a list of 3 elements, an integer/float, or a numpy array, not {zooms}"
-
             logger.info(
                 "Original beta shape=%s, zooms=%s",
                 betas_first_vol.shape,
                 betas_first_vol.header.get_zooms()[:3],
             )
 
-            target_affine = nib.affines.rescale_affine(
-                betas_first_vol.affine,
-                betas_first_vol.shape[:3],
-                zooms,
-            )
-
-            self.betas = image.resample_img(
+            self.betas = resample_to_voxel_size(
                 self.betas,
-                target_affine=target_affine,
+                target_vox_size=zooms,
                 interpolation="continuous",
-                force_resample=True,
-                copy_header=True
             )
 
             # set new template
