@@ -25,6 +25,7 @@ from panic.logger import get_logger, tqdm_joblib
 from panic.searchlight import permutation_searchlight
 from panic.errors import (
     PanicAnalysisError,
+    EmptyMaskError,
     NoFeaturesSelectedError,
 )
 from panic.plugins import core
@@ -1021,16 +1022,22 @@ class ClassifySubject(data.PrepareBetas):
                     mask_settings=getattr(self, "mask_settings", {}),
                     roi_name=roi_name,
                 )
+            except EmptyMaskError as e:
+                logger.warning("ROI extraction skipped [%s]: %s", type(e).__name__, e)
+                return self._empty_mask_result(e), None
             except PanicAnalysisError as e:
                 logger.warning(
                     "ROI extraction failed [%s]: %s",
                     type(e).__name__,
                     e,
                 )
-                return None, None
+                return self._failed_result(e), None
             except ValueError as e:
                 logger.warning("ROI extraction failed [ValueError]: %s", e)
-                return None, None
+                return self._failed_result(e), None
+            except Exception as e:
+                logger.exception("ROI extraction failed unexpectedly")
+                return self._failed_result(e), None
 
             # outer folds
             folds = create_outer_folds(
@@ -1402,23 +1409,10 @@ class ClassifySubject(data.PrepareBetas):
                     **kwargs,
                 )
 
-                # Extraction failed: there is no valid ROI feature object from which
-                # to obtain n_samples, n_features, roi_metrics, etc.
-                if extracted is None and not self.searchlight:
-                    logger.warning(
-                        "ROI extraction failed; no result row will be written: "
-                        "roi=%s | %s=%s",
-                        roi_label,
-                        hemi_key,
-                        hemi_label,
-                    )
-                    continue
-
-                # Extraction succeeded, but the subsequent analysis returned nothing.
+                # Every requested ROI/hemisphere gets a row, including an empty
+                # mask or extraction failure that has no feature matrix.
                 if ddict is None and not self.searchlight:
-                    ddict = self._failed_result(
-                        PanicAnalysisError("Analysis returned no result")
-                    )
+                    ddict = self._failed_result(PanicAnalysisError("Analysis returned no result"))
 
                 # ROI results
                 if not self.searchlight:
@@ -1432,7 +1426,7 @@ class ClassifySubject(data.PrepareBetas):
                         "roi": roi_label,
                         "source": source,
                         "method": method,
-                        **extracted.roi_metrics,
+                        **(extracted.roi_metrics if extracted is not None else ddict.get("roi_metrics", {})),
                     }
 
                     results_dict = self._extend_results_dict(
@@ -1694,7 +1688,7 @@ class ClassifySubject(data.PrepareBetas):
         such as feature matrices, fitted estimators, masks, permutation arrays,
         and full configuration dictionaries are deliberately excluded.
         """
-        labels = np.asarray(extracted.labels)
+        labels = np.asarray(extracted.labels) if extracted is not None else np.array([])
         outer_cfg = self.cfg["decoding_settings"].get("outer_cv", {})
         inner_cfg = self.cfg["decoding_settings"].get("inner_cv", {})
         estimator_cfg = self.cfg["decoding_settings"].get("estimator", {})
@@ -1711,11 +1705,12 @@ class ClassifySubject(data.PrepareBetas):
             "status": str(ddict.get("status", "ok")),
             "error_type": ddict.get("error_type"),
             "error": ddict.get("error"),
+            "reason_code": ddict.get("reason_code"),
 
             "cv_permutation_policy": cv_permutation_policy(self.dec_settings),
-            "n_samples": int(extracted.X.shape[0]),
-            "n_features": int(extracted.X.shape[1]),
-            "n_classes": int(np.unique(labels).size),
+            "n_samples": int(extracted.X.shape[0]) if extracted is not None else np.nan,
+            "n_features": int(extracted.X.shape[1]) if extracted is not None else ddict.get("n_features", np.nan),
+            "n_classes": int(np.unique(labels).size) if extracted is not None else np.nan,
         })
 
         # Store included labels and class counts.
@@ -1811,7 +1806,7 @@ class ClassifySubject(data.PrepareBetas):
 
         # --------------------------------------------------------------
         # Convenient ROI QC flags
-        metrics = extracted.roi_metrics
+        metrics = extracted.roi_metrics if extracted is not None else ddict.get("roi_metrics", {})
 
         n_voxels = metrics.get("n_voxels")
         coverage = metrics.get("volume_coverage_ratio")
@@ -1864,6 +1859,17 @@ class ClassifySubject(data.PrepareBetas):
         roi_masks = obj.return_masks()
 
         return obj, roi_masks
+
+
+    def _empty_mask_result(self, error):
+        result = self._failed_result(error)
+        allowed = {"empty_native_mask", "empty_mask_after_resampling",
+                   "empty_mask_after_erosion", "empty_mask_after_support_filtering"}
+        # Unknown mask errors remain failures; only diagnosed empty masks skip.
+        if error.reason_code in allowed:
+            result.update(status="skipped", reason_code=error.reason_code,
+                          roi_metrics=error.roi_metrics, n_features=0)
+        return result
 
 
     def _failed_result(self, error=None):

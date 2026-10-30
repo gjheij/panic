@@ -1598,9 +1598,6 @@ class MaskAndFilterBetas:
             before, after = int(resampled_mask_data.sum()), int(processed.sum())
             logger.info("Erosion ROI=%s | mode=%s | amount=%s | voxels=%d -> %d",
                         roi_name, erosion_mode, erosion_amount, before, after)
-            if after == 0:
-                raise EmptyMaskError("Erosion emptied mask {!r}: {} {} ({} voxels before erosion)".format(
-                    roi_name, erosion_amount, erosion_mode, before))
             if before == after:
                 logger.warning("Requested erosion removed no voxels on this grid: ROI=%s", roi_name)
         self.mask_processed = image.new_img_like(self.mask_resampled_to_betas, processed.astype(np.uint8), copy_header=True)
@@ -1642,12 +1639,6 @@ class MaskAndFilterBetas:
             vox_before,
         )
 
-        if vox_after == 0:
-            raise EmptyMaskError(
-                "Invalid mask after filtering: "
-                f"voxel count in mask = {vox_after}"
-            )
-
         roi_linidx = np.flatnonzero(
             roi_mask_data.ravel()
         )
@@ -1671,6 +1662,20 @@ class MaskAndFilterBetas:
             "erosion_retained_fraction": n_after / n_before if n_before else 0.0,
             "valid_voxel_fraction_after_erosion": vox_after / n_after if n_after else 0.0,
         })
+        if vox_after == 0:
+            if self.roi_metrics["n_voxels_native"] == 0:
+                reason = "empty_native_mask"
+            elif n_before == 0:
+                reason = "empty_mask_after_resampling"
+            elif erosion_amount > 0 and n_after == 0:
+                reason = "empty_mask_after_erosion"
+            else:
+                reason = "empty_mask_after_support_filtering"
+            raise EmptyMaskError(
+                "Invalid mask after filtering: voxel count in mask = 0 ({})".format(reason),
+                reason_code=reason, roi_metrics=self.roi_metrics,
+            )
+
         if output_file is not None and erosion_amount > 0:
             path = Path(output_file)
             eroded_name = path.name.replace("_desc-valid_mask", "_desc-eroded_mask")
@@ -1802,5 +1807,5 @@ class MaskAndFilterBetas:
             "voxel_volume_mm3": beta_voxel_volume,
             "expected_voxels": expected_voxels,
             "volume_coverage_ratio": coverage_ratio,
-            "valid_voxel_fraction": n_voxels / n_voxels_resampled
+            "valid_voxel_fraction": n_voxels / n_voxels_resampled if n_voxels_resampled else 0.0
         }

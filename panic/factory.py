@@ -1,6 +1,8 @@
 # cv_factory.py
 import numpy as np
 
+from panic.feature_selection import SelectPercentileMinFeatures
+
 from sklearn.decomposition import PCA
 from sklearn.model_selection import (
     StratifiedKFold,
@@ -163,7 +165,8 @@ _SEARCH_REGISTRY = {
 
 _FS_REGISTRY = {
     "SelectKBest": SelectKBest,
-    "SelectPercentile": SelectPercentile,
+    "SelectPercentile": SelectPercentileMinFeatures,
+    "SelectPercentileMinFeatures": SelectPercentileMinFeatures,
     "SelectFromModel": SelectFromModel,
     "RFE": RFE,
     "RFECV": RFECV,
@@ -488,6 +491,9 @@ def selector_from_config(cfg, estimator_factory=None, *, task=None, random_state
         args:
           k: 300
           score_func: f_classif
+
+    SelectPercentile retains at least one scored feature by default for a
+    positive percentile; args.min_features=0 restores sklearn's selection.
 
     For SelectFromModel/RFE/RFECV, include:
         args:

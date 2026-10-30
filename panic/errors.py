@@ -4,8 +4,12 @@ class PanicAnalysisError(RuntimeError):
 
 
 class EmptyMaskError(PanicAnalysisError):
-    """ROI mask ended up empty after resampling/support filtering."""
-    pass
+    """ROI mask ended up empty; retain its QC evidence for a skipped row."""
+
+    def __init__(self, message, *, reason_code=None, roi_metrics=None):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.roi_metrics = dict(roi_metrics or {})
 
 
 class NoTrialsFoundError(PanicAnalysisError):
