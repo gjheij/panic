@@ -430,6 +430,9 @@ def sklearn_pipeline_score(
         else np.asarray(groups)[train_idx]
     )
 
+    if isinstance(clf, BaseSearchCV):
+        _validate_stratified_counts(clf.cv, y_train, context="inner_cv in outer training set")
+
     supports_groups = (
         isinstance(clf, BaseSearchCV)
         or has_fit_parameter(clf, "groups")
@@ -871,6 +874,35 @@ def _save_pipeline(model, X, test_idx, train_idx, output_dir, roi_linidx=None):
         np.save(opj(output_dir, "roi_linidx.npy"), roi_linidx)
 
 
+def _validate_stratified_counts(cv, labels, context="outer_cv"):
+    """Reject missing-class folds instead of accepting sklearn warnings."""
+    if type(cv).__name__ not in {"StratifiedKFold", "RepeatedStratifiedKFold"}:
+        return
+    classes, counts = np.unique(labels, return_counts=True)
+    n_splits = getattr(cv, "n_splits", None)
+    if n_splits is None:
+        n_splits = cv.cvargs["n_splits"]
+    if len(classes) < 2 or counts.min() < n_splits:
+        inventory = dict(zip(classes.tolist(), counts.tolist()))
+        raise ValueError(
+            f"{context}: {type(cv).__name__}(n_splits={n_splits}) requires "
+            f"at least {n_splits} trials in every class; got {inventory}. "
+            "Reduce n_splits or exclude this participant/contrast."
+        )
+
+
+def _stratified_outer_cv(cfg):
+    cv = (cfg or {}).get("outer_cv", {})
+    return cv.get("mode", "sklearn") == "sklearn" and cv.get("name") in {
+        "StratifiedKFold", "RepeatedStratifiedKFold"
+    }
+
+
+def cv_permutation_policy(cfg):
+    """Describe built-in plugin fold handling for provenance and cache checks."""
+    return "rebuild_stratified_v1" if _stratified_outer_cv(cfg) else "fixed"
+
+
 def create_outer_folds(cfg, labels, groups=None):
     """Construct outer train/test folds from the decoding configuration.
 
@@ -916,44 +948,10 @@ def create_outer_folds(cfg, labels, groups=None):
 
     Notes
     -----
-    The outer CV folds are constructed once from the original labels and are
-    kept fixed for the observed analysis and all permutation realizations.
-
-    This is particularly important for ``outer_cv.mode == "nth_trial"``.
-    That splitter assigns test samples by taking every k-th trial separately
-    within each original class. The resulting train/test assignments therefore
-    represent the fixed Bach-style CV design.
-
-    Permutation inference changes only the association between samples and
-    class labels; it does not reconstruct the CV folds from the permuted
-    labels. Reconstructing folds for every permutation would simultaneously
-    alter both the labels and the train/test partition and would therefore
-    evaluate a different CV design from the observed statistic.
-
-    The intended scheme is::
-
-        original labels y
-            |
-            +----> create_outer_folds(y) ----> fixed folds F
-            |                                   |
-            |                                   +--> observed:
-            |                                   |      CV(X, y, F)
-            |                                   |
-            +----> permutation 1: y_perm_1 -----+--> CV(X, y_perm_1, F)
-            |
-            +----> permutation 2: y_perm_2 -----+--> CV(X, y_perm_2, F)
-            |
-            ...
-            |
-            +----> permutation P: y_perm_P -----+--> CV(X, y_perm_P, F)
-
-    Each ``y_perm`` is generated once and is used consistently across all
-    folds. Thus each permutation produces one coherent cross-validated null
-    score.
-
-    When ``groups`` are supplied and ``permute_within_groups=True``, labels
-    are shuffled within those exchangeability blocks before the fixed folds
-    are evaluated.        
+    Stratified sklearn folds are label-dependent and are rebuilt from each
+    permuted label vector by the shared scoring loop. Randomized stratified
+    splitters require an integer random_state for the same deterministic
+    procedure on observed and null data. Other designs retain supplied folds.
     """
     labs = np.asarray(labels)
 
@@ -987,12 +985,20 @@ def create_outer_folds(cfg, labels, groups=None):
             "args": cv_cfg.get("args", {}),
         }
 
-        logger.info(
+        logger.debug(
             "Creating outer folds with scikit-learn: %s",
             sklearn_cv_cfg,
         )
 
         cv = factory.cv_from_config(sklearn_cv_cfg)
+
+        if _stratified_outer_cv(cfg):
+            args = sklearn_cv_cfg["args"]
+            randomized = args.get("shuffle", False) or cv_cfg["name"] == "RepeatedStratifiedKFold"
+            seed = args.get("random_state")
+            if randomized and (isinstance(seed, bool) or not isinstance(seed, (int, np.integer))):
+                raise ValueError("Randomized stratified outer_cv requires an integer random_state.")
+            _validate_stratified_counts(cv, labs)
 
         dummy_X = np.zeros(
             (n_samples, 1),
@@ -1324,63 +1330,16 @@ def cv_mean_function_score(
     groups=None,
     permute: bool = False,
     permute_within_groups: bool = True,
+    cv_config=None,
     rng: Optional[np.random.Generator] = None,
     **score_kwargs: Any,
 ) -> float:
     """
     Compute the mean cross-validated score for one observed or permuted dataset.
 
-    Labels are permuted once per call and the resulting label vector is used
-    consistently across all fixed CV folds.
-
-    Before fitting, every training fold is checked to ensure that it still
-    contains all classes represented in the original label vector. This is
-    mainly a safeguard for permutation analyses, where a rare shuffle could
-    otherwise produce a single-class training set and cause the classifier to
-    fail during fitting.
-
-    Scheme
-    ------
-
-    Observed::
-
-        original y
-            |
-            +---- fixed fold 1 ----> score_1
-            |
-            +---- fixed fold 2 ----> score_2
-            |
-            ...
-            |
-            +---- fixed fold K ----> score_K
-                                      |
-                                      v
-                                  mean score
-
-
-    Permutation::
-
-        original y
-            |
-            | permute ONCE
-            v
-         y_perm
-            |
-            | validate all training folds
-            |
-            +---- fixed fold 1 ----> score_1
-            |
-            +---- fixed fold 2 ----> score_2
-            |
-            ...
-            |
-            +---- fixed fold K ----> score_K
-                                      |
-                                      v
-                               permutation score
-
-    A complete permutation test repeats this function with independent random
-    seeds, producing one cross-validated null score per permutation.
+    Labels are permuted once per call. With stratified sklearn outer_cv,
+    folds are reconstructed from evaluated labels using the configured seed.
+    Other designs retain supplied folds. No permutations are dropped or retried.
 
     Parameters
     ----------
@@ -1391,7 +1350,7 @@ def cv_mean_function_score(
         Original labels aligned with rows of ``X``.
 
     folds : iterable of tuple(ndarray, ndarray)
-        Fixed outer-CV splits represented as ``(train_idx, test_idx)``.
+        Observed outer-CV splits represented as ``(train_idx, test_idx)``.
 
     score_fn : FoldScoreFunction
         Function that fits and evaluates one train/test fold.
@@ -1403,7 +1362,7 @@ def cv_mean_function_score(
 
     permute : bool, default=False
         If True, construct one permutation of ``labels`` before evaluating the
-        fixed folds.
+        applicable folds.
 
     permute_within_groups : bool, default=True
         Restrict permutation to groups when ``groups`` is provided.
@@ -1411,6 +1370,10 @@ def cv_mean_function_score(
     rng : numpy.random.Generator, optional
         Random-number generator used for permutation and downstream stochastic
         model operations.
+
+    cv_config : dict, optional
+        Decoding settings for stratified reconstruction; defaults to cfg in
+        score_kwargs for existing sklearn plugin callers.
 
     **score_kwargs
         Additional arguments forwarded to ``score_fn``.
@@ -1459,6 +1422,13 @@ def cv_mean_function_score(
         y_eval = y
 
     # ---------------------------------------------------------------
+    # Stratification is part of the statistic, including under permutation.
+    cv_config = cv_config if cv_config is not None else score_kwargs.get("cfg", {})
+    if _stratified_outer_cv(cv_config):
+        folds = create_outer_folds(cv_config, y_eval, groups=groups)
+    else:
+        folds = list(folds)
+
     # Validate training folds before fitting.
     #
     # This is especially useful for permutation testing: a pathological

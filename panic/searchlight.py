@@ -23,7 +23,7 @@ from panic.monitor import (
     worker_mark_completed,
     worker_task_started,
 )
-from panic.pipeline import create_outer_folds
+from panic.pipeline import create_outer_folds, cv_permutation_policy
 from panic.plugins import core
 from panic.utils import tqdm_disabled, load_feature_matrix
 
@@ -983,6 +983,7 @@ def permutation_searchlight(
             "radius_mm": float(radius_mm),
             "n_permutations": int(n_perms),
             "cv": cfg.get("outer_cv", {}),
+            "cv_permutation_policy": cv_permutation_policy(cfg),
             "permute_within_groups": bool(cfg.get("permute_within_groups", False)),
             "estimator": cfg.get("estimator", {}),
             "feature_selection": cfg.get("feature_selection", {}),

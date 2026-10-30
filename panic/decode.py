@@ -14,7 +14,7 @@ from joblib import Parallel, delayed, dump
 
 from panic import data
 from panic.masking import normalize_mask_settings, mask_erosion_request, erosion_policy_matches
-from panic.pipeline import create_outer_folds
+from panic.pipeline import create_outer_folds, cv_permutation_policy
 from panic.utils import (
     tqdm_disabled,
     load_yaml,
@@ -47,115 +47,12 @@ def run_decoding_with_permutation(
     **kwargs,
 ):
     """
-    Run ROI-level decoding with fixed-fold permutation testing.
+    Run ROI-level decoding with permutation testing.
 
-    This function computes an observed cross-validated decoding score and an
-    empirical null distribution obtained by repeatedly permuting the labels.
-
-    The outer cross-validation folds are supplied by the caller and remain
-    fixed for the observed analysis and every permutation realization. Each
-    permutation uses one permuted label vector consistently across all folds;
-    this behavior is implemented by the downstream
-    ``cv_mean_function_score(..., permute=True)``.
-
-    Scheme
-    ------
-
-    Outer folds are constructed once before calling this function::
-
-        original labels y
-               |
-               +----> create_outer_folds(y)
-                            |
-                            v
-                       fixed folds F
-
-
-    Observed analysis::
-
-        X + original y + fixed folds F
-                       |
-                       v
-                  CV fold 1
-                  CV fold 2
-                     ...
-                  CV fold K
-                       |
-                       v
-                mean observed score
-
-
-    Permutation analysis::
-
-        permutation seed 1
-               |
-               v
-        permute y ONCE
-               |
-               v
-            y_perm_1
-               |
-               +---- fixed fold 1
-               +---- fixed fold 2
-               +---- ...
-               +---- fixed fold K
-                         |
-                         v
-                   null score 1
-
-
-        permutation seed 2
-               |
-               v
-            y_perm_2
-               |
-               v
-         same fixed folds
-               |
-               v
-          null score 2
-
-               ...
-
-        permutation seed P
-               |
-               v
-          null score P
-
-               |
-               v
-       empirical null distribution
-
-
-    If ``groups`` are supplied and ``cfg["permute_within_groups"]`` is True,
-    labels are shuffled only within those exchangeability blocks.
-
-    Parallelization
-    ---------------
-    The full feature matrix is dumped once to an uncompressed joblib file
-    inside a temporary working directory. Worker processes load that matrix
-    using memory mapping rather than receiving independent full copies.
-
-    The intended resource lifetime is::
-
-        TemporaryDirectory
-        |
-        +-- X.joblib
-        |
-        +-- observed analysis
-        |
-        +-- Parallel context
-        |      |
-        |      +-- permutation workers
-        |      +-- permutation workers
-        |      +-- ...
-        |
-        +-- aggregate null distribution
-        |
-        +-- cleanup
-
-    ``Parallel`` is explicitly used as a context manager so its backend
-    lifetime is nested inside the lifetime of the temporary directory.
+    Each permutation uses one coherent label vector across all folds.
+    Built-in decoding plugins reconstruct stratified sklearn folds from that
+    vector using the configured seed. Other designs retain supplied folds.
+    No invalid permutations are silently dropped or retried.
 
     Parameters
     ----------
@@ -458,7 +355,7 @@ def run_decoding_with_permutation(
         #     seed
         #       -> plugin(... permute=True ...)
         #       -> one y_perm
-        #       -> all fixed CV folds
+        #       -> all applicable CV folds
         #       -> one null score
         def _one_perm(perm_seed):
             result = plugin(
@@ -1446,6 +1343,8 @@ class ClassifySubject(data.PrepareBetas):
                             with open(sl_files[-1]) as stream:
                                 metadata = json.load(stream)
                             all_exist = erosion_policy_matches(metadata, getattr(self, "mask_settings", {}), erosion_name)
+                            all_exist = all_exist and metadata.get("cv_permutation_policy", "fixed") == cv_permutation_policy(self.dec_settings)
+
                         except (OSError, ValueError, AttributeError):
                             all_exist = False
                     if all_exist and not overwrite:
@@ -1557,7 +1456,8 @@ class ClassifySubject(data.PrepareBetas):
                             "acc": float(a),
                             "source": source,
                             "method": method,
-                            "n_samples": int(extracted.X.shape[0]),
+                            "cv_permutation_policy": cv_permutation_policy(self.dec_settings),
+            "n_samples": int(extracted.X.shape[0]),
                             "n_features": int(extracted.X.shape[1]),
                             "outer_cv_mode": self.dec_settings.get(
                                 "outer_cv", {}
@@ -1812,6 +1712,7 @@ class ClassifySubject(data.PrepareBetas):
             "error_type": ddict.get("error_type"),
             "error": ddict.get("error"),
 
+            "cv_permutation_policy": cv_permutation_policy(self.dec_settings),
             "n_samples": int(extracted.X.shape[0]),
             "n_features": int(extracted.X.shape[1]),
             "n_classes": int(np.unique(labels).size),
