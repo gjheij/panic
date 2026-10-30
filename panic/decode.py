@@ -4,6 +4,7 @@
 
 import os
 import shutil
+import json
 import numpy as np
 import pandas as pd
 
@@ -12,6 +13,7 @@ from tqdm import tqdm
 from joblib import Parallel, delayed, dump
 
 from panic import data
+from panic.masking import normalize_mask_settings, mask_erosion_request, erosion_policy_matches
 from panic.pipeline import create_outer_folds
 from panic.utils import (
     tqdm_disabled,
@@ -776,6 +778,9 @@ class ClassifySubject(data.PrepareBetas):
         self.gen_settings = self.cfg["general_settings"]
         self.dec_settings = self.cfg["decoding_settings"]
         self.roi_settings = self.cfg.get("roi_settings") or {}
+        names = self.cfg.get("roi_dict")
+        self.mask_settings = normalize_mask_settings(self.cfg.get("mask_settings"),
+                                                     roi_names=names if isinstance(names, dict) else None)
 
         # Searchlight uses local spherical neighborhoods as the feature definition.
         # Disable ROI-level feature selection and grid search so each center uses
@@ -804,6 +809,7 @@ class ClassifySubject(data.PrepareBetas):
             source=self.gen_settings["source"],
             method=self.gen_settings["method"],
             standardize=self.gen_settings.get("standardize"),
+            mask_settings=self.mask_settings,
         )
         logger.info(f"Analysis ID: {self.analysis_id}")
 
@@ -1010,6 +1016,7 @@ class ClassifySubject(data.PrepareBetas):
             label_mapper=None,
             output_file=None,
             groups=None,
+            roi_name=None,
             **kwargs
         ):
         """
@@ -1113,7 +1120,9 @@ class ClassifySubject(data.PrepareBetas):
                     mask,
                     trial_list=trial_list,
                     label_mapper=label_mapper,
-                    output_file=output_file
+                    output_file=output_file,
+                    mask_settings=getattr(self, "mask_settings", {}),
+                    roi_name=roi_name,
                 )
             except PanicAnalysisError as e:
                 logger.warning(
@@ -1175,6 +1184,8 @@ class ClassifySubject(data.PrepareBetas):
                     self.dec_settings_searchlight,
                     groups=groups,
                     output_file=output_file,
+                    mask_settings=getattr(self, "mask_settings", {}),
+                    roi_name=roi_name,
                     **kwargs
                 )
             except PanicAnalysisError as e:
@@ -1369,6 +1380,8 @@ class ClassifySubject(data.PrepareBetas):
 
             for h_key, h_val in roi_masks.items():
                 roi_label = str(h_val[0])
+                erosion_name = str(r_key) if is_labels else roi_label
+                _, erosion_amount = mask_erosion_request(getattr(self, "mask_settings", {}), erosion_name)
                 hemi_label = str(h_key)
                 source = str(self.gen_settings["source"])
                 method = str(self.gen_settings["method"])
@@ -1428,6 +1441,13 @@ class ClassifySubject(data.PrepareBetas):
                         hemi_key=h_key,
                     )
 
+                    if all_exist:
+                        try:
+                            with open(sl_files[-1]) as stream:
+                                metadata = json.load(stream)
+                            all_exist = erosion_policy_matches(metadata, getattr(self, "mask_settings", {}), erosion_name)
+                        except (OSError, ValueError, AttributeError):
+                            all_exist = False
                     if all_exist and not overwrite:
                         logger.warning(
                             "Searchlight outputs already exist for ROI "
@@ -1445,10 +1465,10 @@ class ClassifySubject(data.PrepareBetas):
                         roi_label,
                     )
 
-                # Optional resampled mask output
+                # Save effective masks for every selected erosion, including no-op erosion.
                 fname = None
 
-                if self.save_imgs or (self.searchlight and r_val is None):
+                if self.save_imgs or (self.searchlight and r_val is None) or erosion_amount > 0:
                     resampled_dir = opj(
                         self.save_dir,
                         "rois",
@@ -1479,6 +1499,7 @@ class ClassifySubject(data.PrepareBetas):
                     save_dir=roi_dir,
                     tmpdir=self.gen_settings["tmp_dir"],
                     hemi_key=h_key,
+                    roi_name=erosion_name,
                     **kwargs,
                 )
 

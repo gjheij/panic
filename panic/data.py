@@ -16,7 +16,7 @@ from collections import Counter
 from panic.logger import get_logger
 from panic.errors import EmptyMaskError
 from panic.betas import BetaLoaderMixin
-from panic.masking import beta_support_mask
+from panic.masking import beta_support_mask, erode_binary_mask, mask_erosion_request
 from panic.resampling import resample_to_voxel_size
 
 from pathlib import Path
@@ -778,9 +778,15 @@ class PrepareROIs:
         # 3) Create a fresh image (don’t reuse header with a changed dtype)
         m = mode.lower()
         if m == "mgz":
-            out_img = nib.MGHImage(masked.astype(out_dtype, copy=False), img.affine)
+            out_img = nib.MGHImage(
+                masked.astype(out_dtype, copy=False),
+                img.affine
+            )
         elif m in ("nifti", "nii", "nii.gz"):
-            out_img = nib.Nifti1Image(masked.astype(out_dtype, copy=False), img.affine)
+            out_img = nib.Nifti1Image(
+                masked.astype(out_dtype, copy=False),
+                img.affine
+            )
             out_img.set_data_dtype(out_dtype)
         else:
             raise ValueError("mode must be 'mgz' or 'nifti'")
@@ -1430,7 +1436,9 @@ class MaskAndFilterBetas:
             var_thr=0.0,
             zooms=None,
             masker_kws={},
-            fit_kws={}
+            fit_kws={},
+            mask_settings=None,
+            roi_name=None,
         ):
         """
         Create and apply a NIfTI masker aligned with the beta images,
@@ -1461,6 +1469,11 @@ class MaskAndFilterBetas:
             zoom. This is particularly useful for searchlight, where you may
             want to downsample the data to reduce the number of centers evalua-
             ted.
+        :param dict | None mask_settings:
+            Named ROI erosion: erode_masks plus erosion_voxels or erosion_mm.
+            Applied after mask/beta resampling and before beta-support filtering.
+        :param str | None roi_name:
+            ROI dictionary key used to select erosion, independent of hemisphere.
         :param dict masker_kws:
             Additional keyword arguments passed to
             :class:`nilearn.maskers.NiftiMasker` during initialization.
@@ -1571,6 +1584,27 @@ class MaskAndFilterBetas:
                 copy_header=True,
             )
 
+        # Erode selected named masks on the final beta grid, before intersecting
+        # with beta support. Missing-data holes must not define erosion borders.
+        original_mask_data = self.mask_resampled_to_betas.get_fdata()
+        resampled_mask_data = np.isfinite(original_mask_data) & (original_mask_data > 0.5)
+        erosion_mode, erosion_amount = mask_erosion_request(mask_settings, roi_name)
+        processed = resampled_mask_data.copy()
+        if erosion_amount > 0:
+            if self.mask is None:
+                raise ValueError("Named-mask erosion requires an explicit or label-derived mask")
+            argument = {"erosion_voxels" if erosion_mode == "voxels" else "erosion_mm": erosion_amount}
+            processed = erode_binary_mask(processed, self.mask_resampled_to_betas.affine, **argument)
+            before, after = int(resampled_mask_data.sum()), int(processed.sum())
+            logger.info("Erosion ROI=%s | mode=%s | amount=%s | voxels=%d -> %d",
+                        roi_name, erosion_mode, erosion_amount, before, after)
+            if after == 0:
+                raise EmptyMaskError("Erosion emptied mask {!r}: {} {} ({} voxels before erosion)".format(
+                    roi_name, erosion_amount, erosion_mode, before))
+            if before == after:
+                logger.warning("Requested erosion removed no voxels on this grid: ROI=%s", roi_name)
+        self.mask_processed = image.new_img_like(self.mask_resampled_to_betas, processed.astype(np.uint8), copy_header=True)
+
         # find intersection with betas
         logger.info(f"Identifying valid voxels (var>{var_thr})")
         B = self.betas.get_fdata(dtype=np.float32)
@@ -1586,13 +1620,10 @@ class MaskAndFilterBetas:
         # 3) intersect: only keep ROI voxels inside beta support
         roi_in_fov = image.math_img(
             "roi & sup",
-            roi=self.mask_resampled_to_betas,
+            roi=self.mask_processed,
             sup=support_img,
         )
 
-        resampled_mask_data = (
-            self.mask_resampled_to_betas.get_fdata() > 0.5
-        )
         roi_mask_data = roi_in_fov.get_fdata() > 0.5
 
         # Final binary ROI/FOV mask
@@ -1627,6 +1658,25 @@ class MaskAndFilterBetas:
             resampled_mask=self.mask_resampled_to_betas,
             valid_mask=roi_mask_data,
         )
+
+        n_before, n_after = int(resampled_mask_data.sum()), int(processed.sum())
+        self.roi_metrics.update({
+            "erosion_applied": bool(erosion_amount > 0),
+            "erosion_mode": erosion_mode,
+            "erosion_voxels": int(erosion_amount) if erosion_mode == "voxels" else 0,
+            "erosion_mm": float(erosion_amount) if erosion_mode == "mm" else 0.0,
+            "n_voxels_before_erosion": n_before,
+            "n_voxels_after_erosion": n_after,
+            "n_voxels_eroded": n_before - n_after,
+            "erosion_retained_fraction": n_after / n_before if n_before else 0.0,
+            "valid_voxel_fraction_after_erosion": vox_after / n_after if n_after else 0.0,
+        })
+        if output_file is not None and erosion_amount > 0:
+            path = Path(output_file)
+            eroded_name = path.name.replace("_desc-valid_mask", "_desc-eroded_mask")
+            if eroded_name == path.name:
+                eroded_name = "eroded_" + path.name
+            nib.save(self.mask_processed, str(path.with_name(eroded_name)))
 
         if output_file is not None:
             logger.info(

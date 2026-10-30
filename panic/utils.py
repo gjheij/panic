@@ -133,6 +133,7 @@ def make_analysis_id(
     method,
     standardize,
     length=12,
+    mask_settings=None,
 ):
     """Create a deterministic identifier for a PANIC analysis.
 
@@ -157,8 +158,9 @@ def make_analysis_id(
     standardize : str, bool, or None
         Standardization strategy applied to the beta estimates.
 
-    dec_settings : mapping
-        Decoding configuration containing permutation settings.
+    mask_settings : mapping, optional
+        Named-mask erosion settings. Active erosion is included in the identity;
+        omitted or disabled erosion preserves legacy identifiers.
 
     length : int, default=12
         Number of hexadecimal SHA-256 characters retained.
@@ -175,6 +177,10 @@ def make_analysis_id(
         "method": str(method),
         "standardize": standardize
     }
+
+    if mask_settings and mask_settings.get("erode_masks") and (
+            mask_settings.get("erosion_voxels", 0) > 0 or mask_settings.get("erosion_mm", 0) > 0):
+        payload["mask_settings"] = mask_settings
 
     canonical = json.dumps(
         payload,

@@ -537,6 +537,8 @@ def permutation_searchlight(
         tmpdir=None,
         output_file=None,
         hemi_key=None,
+        mask_settings=None,
+        roi_name=None,
         **kwargs
     ):
     """
@@ -693,7 +695,9 @@ def permutation_searchlight(
         trial_list=trial_list,
         label_mapper=label_mapper,
         output_file=output_file,
-        zooms=sl_cfg.get("target_zooms", None)
+        zooms=sl_cfg.get("target_zooms", None),
+        mask_settings=mask_settings,
+        roi_name=roi_name,
     )
 
     X = mf.X.astype("float32", copy=False)
@@ -973,6 +977,9 @@ def permutation_searchlight(
 
         # also drop a small JSON sidecar
         meta = {
+            "mask_settings": mask_settings or {},
+            "mask_roi_name": roi_name,
+            "mask_qc": mf.roi_metrics,
             "radius_mm": float(radius_mm),
             "n_permutations": int(n_perms),
             "cv": cfg.get("outer_cv", {}),
