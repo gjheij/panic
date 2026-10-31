@@ -22,7 +22,10 @@ tree=ast.parse((ROOT/'panic/decode.py').read_text())
 original=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='ClassifySubject')
 klass=ast.ClassDef(name='Decoder',bases=[],keywords=[],decorator_list=[],
     body=[n for n in original.body if isinstance(n,ast.FunctionDef) and n.name in methods])
-namespace=dict(np=np,pd=pd,os=os,opj=os.path.join,shutil=shutil,
+store_spec=importlib.util.spec_from_file_location('roi_skip_store',ROOT/'panic/result_store.py')
+store=importlib.util.module_from_spec(store_spec)
+store_spec.loader.exec_module(store)
+namespace=dict(merge_result_tables=store.merge_result_tables,np=np,pd=pd,os=os,opj=os.path.join,shutil=shutil,
     logger=logging.getLogger(__name__),PanicAnalysisError=errors.PanicAnalysisError,
     EmptyMaskError=errors.EmptyMaskError,NoFeaturesSelectedError=errors.NoFeaturesSelectedError,
     mask_erosion_request=lambda *a:('voxels',0),cv_permutation_policy=lambda cfg:'fixed',

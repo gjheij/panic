@@ -16,6 +16,7 @@ python panic_cli.py show
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -207,8 +208,10 @@ def action_run(args):
         source = gen_settings["source"]
         method = gen_settings["method"]
 
+        log_dir = gen_settings.get("batch_metadata_dir") or save_dir
+        os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(
-            save_dir,
+            log_dir,
             f"{subj}_model-{method}_source-{source}_desc-{mode}.log",
         )
 
@@ -228,6 +231,11 @@ def action_run(args):
         )
 
         decoder._fit()
+
+
+def action_capabilities(args):
+    """Machine-readable compatibility handshake for shared batch outputs."""
+    print(json.dumps({"shared_roi_tables": 1, "batch_job_id": 1}))
 
 
 # Argparse
@@ -255,6 +263,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("capabilities", help="Report supported batch-output protocols")
+    sp.set_defaults(func=action_capabilities)
 
     # show
     sp = sub.add_parser(

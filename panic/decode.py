@@ -12,6 +12,7 @@ import tempfile, uuid
 from tqdm import tqdm
 from joblib import Parallel, delayed, dump
 
+from panic.result_store import merge_result_tables
 from panic import data
 from panic.masking import normalize_mask_settings, mask_erosion_request, erosion_policy_matches
 from panic.pipeline import create_outer_folds, cv_permutation_policy
@@ -717,8 +718,7 @@ class ClassifySubject(data.PrepareBetas):
             self.subject,
         )
 
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
+        os.makedirs(self.save_dir, exist_ok=True)
     
         logger.info(f"Decoding configuration:")
         logger.info(self.dec_settings)
@@ -898,7 +898,11 @@ class ClassifySubject(data.PrepareBetas):
         data.PrepareBetas.__init__(self, **kwargs)
 
         # save trial order csv
-        self.trial_order_file = opj(self.save_dir, f"{self.subject}_desc-trial_order.csv")
+        self.trial_order_file = self.generate_filename(
+            model=self.gen_settings["method"], source=self.gen_settings["source"],
+            mode="searchlight" if self.searchlight else "roi",
+            job=str(self.gen_settings["batch_job_id"])[:12] if self.gen_settings.get("batch_job_id") else None,
+            desc="trial_order", ext="csv")
         if hasattr(self, "events_df") and self.events_df is not None:
             self.events_df.to_csv(self.trial_order_file, index=False)
             logger.info(f"Saved trial order CSV to {self.trial_order_file}")
@@ -1375,10 +1379,13 @@ class ClassifySubject(data.PrepareBetas):
                 fname = None
 
                 if self.save_imgs or (self.searchlight and r_val is None) or erosion_amount > 0:
-                    resampled_dir = opj(
-                        self.save_dir,
-                        "rois",
-                    )
+                    resampled_dir = opj(roi_dir, "mode-roi", "rois")
+                    if self.searchlight:
+                        resampled_dir = opj(
+                            roi_dir, "mode-searchlight",
+                            self.dec_settings.get("searchlight", {}).get("basepath", "searchlight"),
+                            "rois",
+                        )
 
                     os.makedirs(
                         resampled_dir,
@@ -1444,6 +1451,7 @@ class ClassifySubject(data.PrepareBetas):
                             "analysis": str(self.analysis_name),
                             "analysis_type": str(self.dec_settings["analysis"]["type"]),
                             "analysis_id": str(self.analysis_id),
+                            "batch_job_id": self.gen_settings.get("batch_job_id", ""),
                             "roi": roi_label,
                             hemi_key: hemi_label,
                             "perm": i,
@@ -1451,7 +1459,7 @@ class ClassifySubject(data.PrepareBetas):
                             "source": source,
                             "method": method,
                             "cv_permutation_policy": cv_permutation_policy(self.dec_settings),
-            "n_samples": int(extracted.X.shape[0]),
+                            "n_samples": int(extracted.X.shape[0]),
                             "n_features": int(extracted.X.shape[1]),
                             "outer_cv_mode": self.dec_settings.get(
                                 "outer_cv", {}
@@ -1473,6 +1481,9 @@ class ClassifySubject(data.PrepareBetas):
         # Save config
         cfg_file = self.generate_filename(
             id=self.analysis_id,
+            model=self.gen_settings["method"], source=self.gen_settings["source"],
+            mode="searchlight" if self.searchlight else "roi",
+            job=str(self.gen_settings["batch_job_id"])[:12] if self.gen_settings.get("batch_job_id") else None,
             desc="config",
             ext="yml",
         )
@@ -1495,77 +1506,14 @@ class ClassifySubject(data.PrepareBetas):
 
         # Save ROI-level outputs
         if not self.searchlight:
-            new_results = pd.DataFrame(results)
-
-            if not existing_results.empty:
-                res_df = pd.concat(
-                    [
-                        existing_results,
-                        new_results,
-                    ],
-                    ignore_index=True,
-                )
-            else:
-                res_df = new_results
-
-            logger.info(
-                "Writing results to: '%s'",
-                res_file,
+            null_file = self.generate_filename(desc="null_distribution", ext="csv")
+            res_df = merge_result_tables(
+                res_file, null_file, pd.DataFrame(results), pd.DataFrame(null),
+                overwrite=overwrite, hemi_key=hemi_key,
             )
-
-            res_df.to_csv(
-                res_file,
-                index=False,
-                na_rep="NaN",
-            )
-
-            shutil.copymode(
-                self.config_file,
-                res_file,
-            )
-
-            # Null distributions
-            null_file = self.generate_filename(
-                desc="null_distribution",
-                ext="csv",
-            )
-
-            new_null = pd.DataFrame(null)
-
-            if (
-                os.path.exists(null_file)
-                and not overwrite
-            ):
-                existing_null = pd.read_csv(
-                    null_file
-                )
-
-                null_df = pd.concat(
-                    [
-                        existing_null,
-                        new_null,
-                    ],
-                    ignore_index=True,
-                )
-
-            else:
-                null_df = new_null
-
-            logger.info(
-                "Writing null-distributions to '%s'",
-                null_file,
-            )
-
-            null_df.to_csv(
-                null_file,
-                index=False,
-            )
-
-            shutil.copymode(
-                self.config_file,
-                null_file,
-            )
-
+            for path in (res_file, null_file):
+                shutil.copymode(self.config_file, path)
+                logger.info("Updated shared ROI table: '%s'", path)
             return res_df
 
         return out_files
@@ -1701,6 +1649,7 @@ class ClassifySubject(data.PrepareBetas):
             "analysis": str(self.analysis_name),
             "analysis_type": str(self.analysis_type),
             "analysis_id": str(self.analysis_id),
+            "batch_job_id": self.gen_settings.get("batch_job_id", ""),
 
             "status": str(ddict.get("status", "ok")),
             "error_type": ddict.get("error_type"),
