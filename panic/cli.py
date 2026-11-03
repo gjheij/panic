@@ -235,7 +235,7 @@ def action_run(args):
 
 def action_capabilities(args):
     """Machine-readable compatibility handshake for shared batch outputs."""
-    print(json.dumps({"shared_roi_tables": 1, "batch_job_id": 1}))
+    print(json.dumps({"shared_roi_tables": 1, "batch_job_id": 1, "roi_tsnr_qc": 2}))
 
 
 # Argparse

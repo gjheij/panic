@@ -221,6 +221,7 @@ class BetaLoaderMixin:
                 output_dir=output_dir,
             )
 
+        beta_imgs.extra["panic_beta_files"] = [img.extra["panic_source_beta"] for img in niimgs if "panic_source_beta" in img.extra]
         return beta_imgs, trials, is_standardized, groups, events_df
 
     @classmethod
@@ -568,6 +569,7 @@ class BetaLoaderMixin:
                 n_vols = int(img.shape[3]) if img.ndim == 4 else 1
                 run_id = cls._parse_run_id(file_path, groups)
 
+                img.extra["panic_source_beta"] = str(file_path)
                 niimgs.append(img)
                 trials.extend([trial_type] * n_vols)
                 groups.extend([run_id] * n_vols)

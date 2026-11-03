@@ -39,8 +39,11 @@ def test_panic(tmp_path):
         tmp_path,
         settings={
             "general_settings": {
+                "project_dir": "/mnt/d/fMRI/ENIGMA_FC_SingleTrials/site_data/acquisition/site-Amsterdam_pi-Visser_sample-01_desc-2011",
+                "source": "halfpipe",
                 "save_dir": "/tmp/test_panic",
-                "overwrite": True
+                "overwrite": True,
+                "filters": None
             },
             "decoding_settings": {
                 "n_permutations": 5,
@@ -52,7 +55,7 @@ def test_panic(tmp_path):
     )
     
     decoder = ClassifySubject(
-        "sub-016",
+        "sub-sc001",
         cfg_file,
         save_imgs=True,
     )

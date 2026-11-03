@@ -91,7 +91,7 @@ class ResultStoreTests(unittest.TestCase):
         args=namespace['build_parser']().parse_args(['capabilities'])
         output=io.StringIO()
         with contextlib.redirect_stdout(output):args.func(args)
-        self.assertEqual(json.loads(output.getvalue()),{'shared_roi_tables':1,'batch_job_id':1})
+        self.assertEqual(json.loads(output.getvalue()),{'shared_roi_tables':1,'batch_job_id':1,'roi_tsnr_qc':2})
 
 
 if __name__ == '__main__': unittest.main()

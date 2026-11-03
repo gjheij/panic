@@ -12,7 +12,8 @@ import tempfile, uuid
 from tqdm import tqdm
 from joblib import Parallel, delayed, dump
 
-from panic.result_store import merge_result_tables
+from panic.result_store import merge_result_tables, write_qc_rows
+from panic.tsnr import TsnrQC
 from panic import data
 from panic.masking import normalize_mask_settings, mask_erosion_request, erosion_policy_matches
 from panic.pipeline import create_outer_folds, cv_permutation_policy
@@ -897,6 +898,22 @@ class ClassifySubject(data.PrepareBetas):
 
         data.PrepareBetas.__init__(self, **kwargs)
 
+        self.tsnr_qc = None
+        tsnr_policy = self.cfg.get("qc_settings", {})
+        if not isinstance(tsnr_policy, dict):
+            raise ValueError("qc_settings must be a mapping")
+        tsnr_enabled = tsnr_policy.get("tsnr", True)
+        if type(tsnr_enabled) is not bool:
+            raise ValueError("qc_settings.tsnr must be true or false")
+        if tsnr_enabled and not self.searchlight and str(self.gen_settings.get("source", "")).casefold() in ("halfpipe", "stglm") and "beta_dir" in beta_input:
+            from pathlib import Path
+            candidates = tsnr_policy.get("tsnr_files")
+            if candidates is None:
+                candidates = sorted((Path(beta_input["beta_dir"]) / self.subject).rglob("*_stat-tsnr_boldmap.nii.gz"))
+            elif not isinstance(candidates, list) or not all(isinstance(path, str) for path in candidates):
+                raise ValueError("qc_settings.tsnr_files must be a list of paths")
+            self.tsnr_qc = TsnrQC(self.betas.extra.get("panic_beta_files", []), candidates)
+
         # save trial order csv
         self.trial_order_file = self.generate_filename(
             model=self.gen_settings["method"], source=self.gen_settings["source"],
@@ -1025,6 +1042,7 @@ class ClassifySubject(data.PrepareBetas):
                     output_file=output_file,
                     mask_settings=getattr(self, "mask_settings", {}),
                     roi_name=roi_name,
+                    tsnr_qc=getattr(self, "tsnr_qc", None),
                 )
             except EmptyMaskError as e:
                 logger.warning("ROI extraction skipped [%s]: %s", type(e).__name__, e)
@@ -1199,6 +1217,7 @@ class ClassifySubject(data.PrepareBetas):
         out_files = {}
         results = []
         null = []
+        tsnr_rows = []
 
         overwrite = bool(
             getattr(
@@ -1444,6 +1463,10 @@ class ClassifySubject(data.PrepareBetas):
                     )
 
                     results.append(results_dict)
+                    for row in (getattr(extracted, "tsnr_rows", []) if extracted is not None else ddict.get("tsnr_rows", [])):
+                        tsnr_rows.append({"subject":self.subject, "analysis":self.analysis_name,
+                            "analysis_id":self.analysis_id, "batch_job_id":self.gen_settings.get("batch_job_id", ""),
+                            "method":method, "source":source, "roi":roi_label, hemi_key:hemi_label, **row})
 
                     null.extend(
                         {
@@ -1511,6 +1534,11 @@ class ClassifySubject(data.PrepareBetas):
                 res_file, null_file, pd.DataFrame(results), pd.DataFrame(null),
                 overwrite=overwrite, hemi_key=hemi_key,
             )
+            if tsnr_rows:
+                tsnr_file = self.generate_filename(model=self.gen_settings["method"], source=self.gen_settings["source"],
+                    mode="roi", job=str(self.gen_settings["batch_job_id"])[:12] if self.gen_settings.get("batch_job_id") else None,
+                    desc="tsnr", ext="csv")
+                write_qc_rows(tsnr_file, tsnr_rows, hemi_key=hemi_key)
             for path in (res_file, null_file):
                 shutil.copymode(self.config_file, path)
                 logger.info("Updated shared ROI table: '%s'", path)
@@ -1817,7 +1845,7 @@ class ClassifySubject(data.PrepareBetas):
         # Unknown mask errors remain failures; only diagnosed empty masks skip.
         if error.reason_code in allowed:
             result.update(status="skipped", reason_code=error.reason_code,
-                          roi_metrics=error.roi_metrics, n_features=0)
+                          roi_metrics=error.roi_metrics, n_features=0, tsnr_rows=getattr(error, "tsnr_rows", []))
         return result
 
 

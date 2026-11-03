@@ -1299,6 +1299,7 @@ class MaskAndFilterBetas:
             mask,
             trial_list=None,
             label_mapper=None,
+            tsnr_qc=None,
             **kwargs
         ):
         
@@ -1308,7 +1309,18 @@ class MaskAndFilterBetas:
         self.label_mapper = label_mapper
 
         # extract betas from mask
-        self.betas_in_mask, self.roi_linidx = self._masker(**kwargs)
+        self.tsnr_rows = []
+        try:
+            self.betas_in_mask, self.roi_linidx = self._masker(**kwargs)
+        except EmptyMaskError as error:
+            if tsnr_qc is not None:
+                metrics, rows = tsnr_qc.extract(self.fov_mask)
+                error.roi_metrics.update(metrics)
+                error.tsnr_rows = rows
+            raise
+        if tsnr_qc is not None:
+            metrics, self.tsnr_rows = tsnr_qc.extract(self.fov_mask)
+            self.roi_metrics.update(metrics)
 
         # filter trials and set labels
         self.X, self.trials, self.labels = self.filter_trials()

@@ -67,3 +67,16 @@ def merge_result_tables(result_path, null_path, results, null, *, overwrite=Fals
             _atomic(path, all_columns, merged)
         return pd.read_csv(result_path, dtype={key: str for key in
             ("subject", "roi", "hemi", "source", "method", "analysis", "analysis_type", "analysis_id", "batch_job_id")})
+
+
+def write_qc_rows(path, rows, hemi_key='hemi'):
+    """Update per-run QC without touching decoding results or null draws."""
+    keys = ['subject', 'analysis', 'method', 'source', 'roi', hemi_key]
+    scope = {tuple(row.get(key, '') for key in keys) for row in rows}
+    path = Path(path)
+    with (path.parent/'.tables.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        columns, existing = _read(path)
+        columns = list(dict.fromkeys(columns + [key for row in rows for key in row]))
+        retained = [row for row in existing if tuple(row.get(key, '') for key in keys) not in scope]
+        _atomic(path, columns, retained + rows)
