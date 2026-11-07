@@ -210,6 +210,7 @@ decoding_settings:
     alpha: 0.05                   # value for FDR correction
     radius_mm: 6                  # radius around center
     target_zooms: null            # downsample data to reduce number of centers; e.g., [2.0, 2.0, 2.0]
+    checkpoint: true              # save intermediate results to avoid losing progress
     basepath: "searchlight"       # subfolder within {save_dir} to save searchlight results
     locked:                       # disable gridsearch within searchlight
       clf__C: 1.0

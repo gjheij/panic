@@ -352,3 +352,36 @@ _ALIASES = {
 | **[LeavePGroupsOut](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.LeavePGroupsOut.html)**                 | `"LeavePGroupsOut"`              | Multi-run holdout                              | Similar to LeaveOneGroupOut but can leave out multiple groups per fold (set `p` accordingly).                       |
 | **[TimeSeriesSplit](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html)**                 | `"TimeSeriesSplit"`              | Sequential / trial-order–dependent decoding    | Maintains temporal order; use for learning-curve or habituation analyses.                                           |
 | **[PredefinedSplit](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.PredefinedSplit.html)**                 | `"PredefinedSplit"`              | Custom or nested CV setups                     | Allows manual assignment of fold indices; useful when outer folds are fixed or defined per subject/run.             |
+### Resuming interrupted searchlights
+
+Enable checkpoints in your configuration:
+
+```yaml
+decoding_settings:
+  parallel:
+    update_interval: 1000
+  searchlight:
+    checkpoint: true
+```
+
+PANIC atomically saves completed center results every `update_interval` centers,
+plus the final partial interval, to `searchlight_checkpoint.joblib` alongside the
+searchlight maps (separate files for each hemisphere). Checkpointing is disabled
+by default and requires a positive `update_interval`. It works with serial runs,
+streaming joblib backends, and `multiprocessing`; the latter submits bounded
+chunks because it cannot stream results.
+
+After an interruption, rerun the same analysis with checkpointing enabled and the
+same output directory. Saved centers are skipped, and their original random seeds
+are reused for the remaining centers. At most the work since the last saved
+interval must be repeated. Final NIfTI maps are written once all centers finish.
+The checkpoint is retained so map writing can also be retried.
+
+Inputs, geometry, labels, CV folds, seeds, and analysis settings must match;
+incompatible checkpoints raise an error rather than mixing results. Parallel
+execution settings such as `n_jobs` and `batch_size` can change. To recompute an
+analysis from scratch, remove its checkpoint first (even when `overwrite` is
+true). Use a persistent output directory for cluster jobs, and do not run multiple
+jobs writing the same checkpoint. Joblib files should only be loaded from trusted
+sources. Checkpoints made by different PANIC or dependency versions are not
+guaranteed to be compatible.

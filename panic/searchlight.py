@@ -8,12 +8,13 @@ import tempfile
 import uuid
 
 import numpy as np
-from joblib import Parallel, delayed, dump
+from joblib import Parallel, delayed, dump, hash as joblib_hash
 from nilearn import image
 from statsmodels.stats.multitest import fdrcorrection
 from tqdm import tqdm
 
 from panic import data
+from panic.checkpoint import SearchlightCheckpoint
 from panic.logger import get_logger
 from panic.monitor import (
     SearchlightMonitor,
@@ -571,6 +572,8 @@ def permutation_searchlight(
         - ``n_permutations`` (int, default=100)
         - ``n_jobs`` (int, default=1)
         - ``locked`` (dict of fixed estimator parameters)
+        - ``checkpoint`` (bool, default=False): atomically save and resume
+          results every positive ``parallel.update_interval`` centers.
 
         Top-level keys reused from the ROI path include:
         - ``outer_cv``
@@ -747,6 +750,32 @@ def permutation_searchlight(
         if "save_dir" in kwargs:
             save_dir = opj(kwargs.pop("save_dir"), sl_base)
 
+        # Keep each hemisphere's checkpoint alongside its final maps.
+        base = opj(save_dir, "searchlight")
+        if hemi_key is not None and hemi_key != "uni":
+            base += f"_hemi-{hemi_key}"
+        update_interval = int(par_cfg.get("update_interval", 0))
+        checkpoint = None
+        if sl_cfg.get("checkpoint", False):
+            if update_interval <= 0:
+                raise ValueError("Searchlight checkpointing requires parallel.update_interval > 0")
+            # Execution tuning and output locations may change on restart;
+            # analysis settings, actual data, geometry and CV folds may not.
+            identity_cfg = {k: v for k, v in cfg.items() if k != "parallel"}
+            identity_cfg["searchlight"] = {
+                k: v for k, v in sl_cfg.items() if k not in ("checkpoint", "basepath")
+            }
+            fingerprint = joblib_hash((
+                X, y, groups, centers, mf.fov_mask.affine, offs, folds,
+                identity_cfg, seed, plugin, plugin_kwargs, kwargs,
+            ))
+            checkpoint = SearchlightCheckpoint(
+                f"{base}_checkpoint.joblib", fingerprint, center_seeds, len(centers)
+            )
+            center_seeds = checkpoint.seeds
+            # Save the random seeds even before the first interval is reached.
+            checkpoint.save()
+
         logger.info(f"Storing searchlight information in {save_dir}")
         n_perms = cfg.get("n_permutations", 1000)
         n_jobs = par_cfg.get("n_jobs", 1)
@@ -810,13 +839,27 @@ def permutation_searchlight(
             "monitor_resource_every": monitor_resource_every,
         }
 
-        update_interval = int(par_cfg.get("update_interval", 0))
         monitor_log_every = update_interval if update_interval > 0 else 5000
-        out = [None] * len(centers)
+        out = checkpoint.results if checkpoint is not None else [None] * len(centers)
+        pending = [i for i, row in enumerate(out) if row is None]
+        n_completed = len(centers) - len(pending)
+        if n_completed:
+            logger.info("Resuming searchlight: %d/%d centers restored", n_completed, len(centers))
+
+        def record_result(result_ix, result):
+            nonlocal n_completed
+            out[result_ix] = result
+            n_completed += 1
+            if checkpoint is not None and (
+                n_completed % update_interval == 0 or n_completed == len(centers)
+            ):
+                checkpoint.save()
+                logger.info("Saved checkpoint: %d/%d centers", n_completed, len(centers))
 
         if n_jobs == 1:
             for i in tqdm(
-                range(len(centers)),
+                pending,
+                initial=n_completed,
                 total=len(centers),
                 disable=tqdm_disabled(),
             ):
@@ -824,7 +867,7 @@ def permutation_searchlight(
                     i,
                     **worker_kwargs,
                 )
-                out[result_ix] = result
+                record_result(result_ix, result)
 
         else:
             # Deliberately consume results directly rather than monkey-patching
@@ -844,6 +887,10 @@ def permutation_searchlight(
 
             backend_name = par_cfg.get("backend", "loky")
 
+            for i, row in enumerate(out):
+                if row is not None:
+                    monitor.mark_completed(i)
+
             with monitor:
                 parallel_kwargs = dict(
                     n_jobs=n_jobs,
@@ -857,18 +904,18 @@ def permutation_searchlight(
                 # return modes. Its workers still journal exact completions, so
                 # the watchdog remains informative while the parent blocks.
                 if backend_name == "multiprocessing":
+                    # This backend cannot stream results. Bound submissions so
+                    # completed batches can be checkpointed during the run.
+                    chunk_size = update_interval if checkpoint is not None else max(1, len(pending))
                     with Parallel(**parallel_kwargs) as parallel:
-                        result_pairs = parallel(
-                            delayed(_run_searchlight_center)(
-                                i,
-                                **worker_kwargs,
+                        for start in range(0, len(pending), chunk_size):
+                            result_pairs = parallel(
+                                delayed(_run_searchlight_center)(i, **worker_kwargs)
+                                for i in pending[start:start + chunk_size]
                             )
-                            for i in range(len(centers))
-                        )
-
-                    for result_ix, result in result_pairs:
-                        out[result_ix] = result
-                        monitor.mark_completed(result_ix)
+                            for result_ix, result in result_pairs:
+                                record_result(result_ix, result)
+                                monitor.mark_completed(result_ix)
 
                 else:
                     with Parallel(
@@ -880,15 +927,16 @@ def permutation_searchlight(
                                 i,
                                 **worker_kwargs,
                             )
-                            for i in range(len(centers))
+                            for i in pending
                         )
 
                         with tqdm(
+                            initial=n_completed,
                             total=len(centers),
                             disable=tqdm_disabled(),
                         ) as pbar:
                             for result_ix, result in result_gen:
-                                out[result_ix] = result
+                                record_result(result_ix, result)
                                 monitor.mark_completed(result_ix)
                                 pbar.update(1)
 
@@ -937,10 +985,6 @@ def permutation_searchlight(
 
         # 7) save NIfTIs
         os.makedirs(save_dir, exist_ok=True)
-        base = opj(save_dir or tmpdir, "searchlight")
-        
-        if hemi_key is not None and hemi_key != "uni":
-            base += f"_hemi-{hemi_key}"
 
         ref = mf.fov_mask  # SAME grid/affine as vol_shape
         out_files = save_searchlight_maps(
