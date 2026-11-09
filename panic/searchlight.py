@@ -5,6 +5,7 @@
 import json
 import os
 import tempfile
+import time
 import uuid
 
 import numpy as np
@@ -846,15 +847,35 @@ def permutation_searchlight(
         if n_completed:
             logger.info("Resuming searchlight: %d/%d centers restored", n_completed, len(centers))
 
+        progress_start = time.monotonic()
+        initial_completed = n_completed
+
         def record_result(result_ix, result):
             nonlocal n_completed
             out[result_ix] = result
             n_completed += 1
+            checkpoint_saved = False
             if checkpoint is not None and (
                 n_completed % update_interval == 0 or n_completed == len(centers)
             ):
                 checkpoint.save()
-                logger.info("Saved checkpoint: %d/%d centers", n_completed, len(centers))
+                checkpoint_saved = True
+
+            if n_completed % monitor_log_every == 0 or n_completed == len(centers):
+                elapsed = time.monotonic() - progress_start
+                rate = (n_completed - initial_completed) / elapsed if elapsed > 0 else 0.0
+                eta_seconds = (len(centers) - n_completed) / rate if rate > 0 else float("nan")
+                logger.info(
+                    "Progress: %d/%d (%.1f%%) | %.2f centers/s | "
+                    "%selapsed %.1f min | ETA %.1f min",
+                    n_completed,
+                    len(centers),
+                    100.0 * n_completed / len(centers),
+                    rate,
+                    "checkpoint saved | " if checkpoint_saved else "",
+                    elapsed / 60.0,
+                    eta_seconds / 60.0,
+                )
 
         if n_jobs == 1:
             for i in tqdm(
@@ -880,7 +901,9 @@ def permutation_searchlight(
                 snapshot_dir=monitor_snapshot_dir,
                 logger=logger,
                 interval=monitor_interval,
-                log_every=monitor_log_every,
+                # Progress is logged after results are collected and any
+                # checkpoint write succeeds, so it produces one combined line.
+                log_every=0,
                 stuck_thresholds=(30, 120, 600),
                 signal_stuck_workers=True,
             )
@@ -1547,4 +1570,3 @@ def save_searchlight_maps(
         out_files[name] = filename
 
     return out_files
-
