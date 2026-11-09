@@ -754,9 +754,9 @@ def permutation_searchlight(
         base = opj(save_dir, "searchlight")
         if hemi_key is not None and hemi_key != "uni":
             base += f"_hemi-{hemi_key}"
-        update_interval = int(par_cfg.get("update_interval", 0))
+        update_interval = int(par_cfg.get("update_interval", 1000))
         checkpoint = None
-        if sl_cfg.get("checkpoint", False):
+        if sl_cfg.get("checkpoint", True):
             if update_interval <= 0:
                 raise ValueError("Searchlight checkpointing requires parallel.update_interval > 0")
             # Execution tuning and output locations may change on restart;
