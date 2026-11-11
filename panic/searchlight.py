@@ -3,6 +3,7 @@
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 
 import json
+import csv
 import os
 import tempfile
 import time
@@ -16,6 +17,8 @@ from tqdm import tqdm
 
 from panic import data
 from panic.checkpoint import SearchlightCheckpoint
+from panic.fit_guard import CenterFitFailure, SearchlightFitError, fit_guard_settings
+from panic.searchlight_progress import CenterProgress
 from panic.logger import get_logger
 from panic.monitor import (
     SearchlightMonitor,
@@ -170,6 +173,14 @@ def _neighbors_ball_mm(zooms, r_mm):
     return np.asarray(offs, dtype=int)
 
 
+def _call_searchlight_plugin(plugin, *args, fit_context=None, **kwargs):
+    try:
+        return plugin(*args, **kwargs)
+    except SearchlightFitError as exc:
+        exc.diagnostics.update(fit_context or {})
+        raise
+
+
 def _one_center(
         center_ijk,
         cols,
@@ -319,7 +330,7 @@ def _one_center(
     # observed
     output_kind = cfg.get("analysis", {}).get("output_kind", "scalar")
 
-    result = plugin(
+    result = _call_searchlight_plugin(plugin,
         X_center,
         labels,
         cfg=cfg,
@@ -327,6 +338,7 @@ def _one_center(
         cols=None,
         permute=False,
         return_artifacts=(output_kind == "timeseries"),
+        fit_context={"phase":"observed"},
         **plugin_kwargs,
         **kwargs,
     )
@@ -366,7 +378,7 @@ def _one_center(
             )
 
             v = float(
-                plugin(
+                _call_searchlight_plugin(plugin,
                     X_center,
                     labels,
                     cfg=cfg,
@@ -374,6 +386,7 @@ def _one_center(
                     cols=None,
                     rng=np.random.default_rng(perm_seed),
                     permute=True,
+                    fit_context={"phase":"permutation", "permutation":int(perm_ix), "perm_seed":perm_seed},
                     **plugin_kwargs,
                     **kwargs,
                 )
@@ -477,13 +490,14 @@ def _run_searchlight_center(
             task_count=int(task_count),
         )
 
+        worker_cfg = dict(cfg, _searchlight_fit_guard=fit_guard_settings(cfg.get('parallel', {})))
         result = _one_center(
             center_ijk,
             cols,
             X_path,
             labels,
             folds,
-            cfg,
+            worker_cfg,
             groups=groups,
             n_perms=n_perms,
             seed=int(center_seeds[ix]),
@@ -514,6 +528,14 @@ def _run_searchlight_center(
         worker_mark_completed(monitor_runtime_dir, ix)
         return int(ix), result
 
+    except SearchlightFitError as exc:
+        if exc.diagnostics.get('reason_code') == 'unsupported_fit_guard_config':
+            raise
+        diagnostics = dict(exc.diagnostics, error_type=type(exc).__name__, error=str(exc),
+                           center_index=int(ix), center_seed=int(center_seeds[ix]), n_features=int(len(cols)))
+        worker_heartbeat(monitor_runtime_dir, ix, "FIT_FAILED", **diagnostics)
+        worker_mark_completed(monitor_runtime_dir, ix)
+        return int(ix), CenterFitFailure(center_ijk, diagnostics)
     except BaseException as exc:
         worker_heartbeat(
             monitor_runtime_dir,
@@ -573,7 +595,7 @@ def permutation_searchlight(
         - ``n_permutations`` (int, default=100)
         - ``n_jobs`` (int, default=1)
         - ``locked`` (dict of fixed estimator parameters)
-        - ``checkpoint`` (bool, default=False): atomically save and resume
+        - ``checkpoint`` (bool, default=True): atomically save and resume
           results every positive ``parallel.update_interval`` centers.
 
         Top-level keys reused from the ROI path include:
@@ -677,6 +699,8 @@ def permutation_searchlight(
     # 0) Extract settings from cfg
     sl_cfg = cfg.get("searchlight", {})
     par_cfg = cfg.get("parallel", {})
+    guard_policy = fit_guard_settings(par_cfg)
+    logger.info("Searchlight SVC fit guard: %s", guard_policy)
     radius_mm = sl_cfg.get("radius_mm", 6)
     locked_params = sl_cfg.get("locked", None)
     alpha = sl_cfg.get("alpha", 0.05)
@@ -774,6 +798,7 @@ def permutation_searchlight(
                 f"{base}_checkpoint.joblib", fingerprint, center_seeds, len(centers)
             )
             center_seeds = checkpoint.seeds
+            checkpoint.record_guard(guard_policy)
             # Save the random seeds even before the first interval is reached.
             checkpoint.save()
 
@@ -842,24 +867,26 @@ def permutation_searchlight(
 
         monitor_log_every = update_interval if update_interval > 0 else 5000
         out = checkpoint.results if checkpoint is not None else [None] * len(centers)
-        pending = [i for i, row in enumerate(out) if row is None]
-        n_completed = len(centers) - len(pending)
+        progress = CenterProgress(out, checkpoint, guard_policy, base, update_interval,
+                                  par_cfg.get('checkpoint_interval_seconds', 60))
+        pending = progress.pending
+        n_completed = progress.completed
         if n_completed:
             logger.info("Resuming searchlight: %d/%d centers restored", n_completed, len(centers))
+        if progress.accepted_failures:
+            logger.warning('Resuming with %d previously failed centers; their scientific scores remain NaN',
+                           len(progress.accepted_failures))
 
         progress_start = time.monotonic()
         initial_completed = n_completed
 
         def record_result(result_ix, result):
             nonlocal n_completed
-            out[result_ix] = result
-            n_completed += 1
-            checkpoint_saved = False
-            if checkpoint is not None and (
-                n_completed % update_interval == 0 or n_completed == len(centers)
-            ):
-                checkpoint.save()
-                checkpoint_saved = True
+            checkpoint_saved = progress.record(result_ix, result)
+            n_completed = progress.completed
+            if isinstance(result, CenterFitFailure):
+                logger.warning('Searchlight center %d invalidated: %s; diagnostics=%s_fit_failures.csv',
+                               result_ix, result.diagnostics.get('error'), base)
 
             if n_completed % monitor_log_every == 0 or n_completed == len(centers):
                 elapsed = time.monotonic() - progress_start
@@ -877,100 +904,110 @@ def permutation_searchlight(
                     eta_seconds / 60.0,
                 )
 
-        if n_jobs == 1:
-            for i in tqdm(
-                pending,
-                initial=n_completed,
-                total=len(centers),
-                disable=tqdm_disabled(),
-            ):
-                result_ix, result = _run_searchlight_center(
-                    i,
-                    **worker_kwargs,
-                )
-                record_result(result_ix, result)
+        try:
+            if n_jobs == 1:
+                for i in tqdm(
+                    pending,
+                    initial=n_completed,
+                    total=len(centers),
+                    disable=tqdm_disabled(),
+                ):
+                    result_ix, result = _run_searchlight_center(
+                        i,
+                        **worker_kwargs,
+                    )
+                    record_result(result_ix, result)
 
+            else:
+                # Deliberately consume results directly rather than monkey-patching
+                # joblib's BatchCompletionCallBack. This makes exact task identity
+                # observable and removes the tqdm/joblib callback from the diagnostic
+                # path. Results are restored to submission order via ``result_ix``.
+                monitor = SearchlightMonitor(
+                    len(centers),
+                    runtime_dir=monitor_runtime_dir,
+                    snapshot_dir=monitor_snapshot_dir,
+                    logger=logger,
+                    interval=monitor_interval,
+                    # Progress is logged after results are collected and any
+                    # checkpoint write succeeds, so it produces one combined line.
+                    log_every=0,
+                    stuck_thresholds=(30, 120, 600),
+                    signal_stuck_workers=True,
+                )
+
+                backend_name = par_cfg.get("backend", "loky")
+
+                for i, row in enumerate(out):
+                    if row is not None or str(i) in progress.accepted_failures:
+                        monitor.mark_completed(i)
+
+                with monitor:
+                    parallel_kwargs = dict(
+                        n_jobs=n_jobs,
+                        backend=backend_name,
+                        batch_size=par_cfg.get("batch_size", 16),
+                        verbose=par_cfg.get("verbose", 0),
+                        pre_dispatch=par_cfg.get("pre_dispatch", "2*n_jobs"),
+                    )
+
+                    # joblib's MultiprocessingBackend does not support generator
+                    # return modes. Its workers still journal exact completions, so
+                    # the watchdog remains informative while the parent blocks.
+                    if backend_name == "multiprocessing":
+                        # This backend cannot stream results. Bound submissions so
+                        # completed batches can be checkpointed during the run.
+                        chunk_size = update_interval if checkpoint is not None else max(1, len(pending))
+                        with Parallel(**parallel_kwargs) as parallel:
+                            for start in range(0, len(pending), chunk_size):
+                                result_pairs = parallel(
+                                    delayed(_run_searchlight_center)(i, **worker_kwargs)
+                                    for i in pending[start:start + chunk_size]
+                                )
+                                for result_ix, result in result_pairs:
+                                    record_result(result_ix, result)
+                                    monitor.mark_completed(result_ix)
+
+                    else:
+                        with Parallel(
+                            return_as="generator_unordered",
+                            **parallel_kwargs,
+                        ) as parallel:
+                            result_gen = parallel(
+                                delayed(_run_searchlight_center)(
+                                    i,
+                                    **worker_kwargs,
+                                )
+                                for i in pending
+                            )
+
+                            with tqdm(
+                                initial=n_completed,
+                                total=len(centers),
+                                disable=tqdm_disabled(),
+                            ) as pbar:
+                                for result_ix, result in result_gen:
+                                    record_result(result_ix, result)
+                                    monitor.mark_completed(result_ix)
+                                    pbar.update(1)
+
+                missing = np.flatnonzero(
+                    np.fromiter((row is None and str(i) not in progress.accepted_failures for i,row in enumerate(out)), dtype=np.bool_, count=len(out))
+                )
+                if missing.size:
+                    raise RuntimeError(
+                        "Parallel searchlight ended without results for center indices: "
+                        f"{missing[:100].tolist()}"
+                    )
+
+        except BaseException:
+            try:
+                progress.flush()
+            except Exception:
+                logger.exception("Could not flush searchlight checkpoint after failure")
+            raise
         else:
-            # Deliberately consume results directly rather than monkey-patching
-            # joblib's BatchCompletionCallBack. This makes exact task identity
-            # observable and removes the tqdm/joblib callback from the diagnostic
-            # path. Results are restored to submission order via ``result_ix``.
-            monitor = SearchlightMonitor(
-                len(centers),
-                runtime_dir=monitor_runtime_dir,
-                snapshot_dir=monitor_snapshot_dir,
-                logger=logger,
-                interval=monitor_interval,
-                # Progress is logged after results are collected and any
-                # checkpoint write succeeds, so it produces one combined line.
-                log_every=0,
-                stuck_thresholds=(30, 120, 600),
-                signal_stuck_workers=True,
-            )
-
-            backend_name = par_cfg.get("backend", "loky")
-
-            for i, row in enumerate(out):
-                if row is not None:
-                    monitor.mark_completed(i)
-
-            with monitor:
-                parallel_kwargs = dict(
-                    n_jobs=n_jobs,
-                    backend=backend_name,
-                    batch_size=par_cfg.get("batch_size", 16),
-                    verbose=par_cfg.get("verbose", 0),
-                    pre_dispatch=par_cfg.get("pre_dispatch", "2*n_jobs"),
-                )
-
-                # joblib's MultiprocessingBackend does not support generator
-                # return modes. Its workers still journal exact completions, so
-                # the watchdog remains informative while the parent blocks.
-                if backend_name == "multiprocessing":
-                    # This backend cannot stream results. Bound submissions so
-                    # completed batches can be checkpointed during the run.
-                    chunk_size = update_interval if checkpoint is not None else max(1, len(pending))
-                    with Parallel(**parallel_kwargs) as parallel:
-                        for start in range(0, len(pending), chunk_size):
-                            result_pairs = parallel(
-                                delayed(_run_searchlight_center)(i, **worker_kwargs)
-                                for i in pending[start:start + chunk_size]
-                            )
-                            for result_ix, result in result_pairs:
-                                record_result(result_ix, result)
-                                monitor.mark_completed(result_ix)
-
-                else:
-                    with Parallel(
-                        return_as="generator_unordered",
-                        **parallel_kwargs,
-                    ) as parallel:
-                        result_gen = parallel(
-                            delayed(_run_searchlight_center)(
-                                i,
-                                **worker_kwargs,
-                            )
-                            for i in pending
-                        )
-
-                        with tqdm(
-                            initial=n_completed,
-                            total=len(centers),
-                            disable=tqdm_disabled(),
-                        ) as pbar:
-                            for result_ix, result in result_gen:
-                                record_result(result_ix, result)
-                                monitor.mark_completed(result_ix)
-                                pbar.update(1)
-
-            missing = np.flatnonzero(
-                np.fromiter((row is None for row in out), dtype=np.bool_, count=len(out))
-            )
-            if missing.size:
-                raise RuntimeError(
-                    "Parallel searchlight ended without results for center indices: "
-                    f"{missing[:100].tolist()}"
-                )
+            progress.flush()
 
         # 6) assemble maps
         logger.info(f"Saving output maps (timeseries={save_timeseries})")
@@ -986,12 +1023,12 @@ def permutation_searchlight(
         # save CS-US similarity curve
         ts_map = None
         if save_timeseries:
-            first_ts = next((row[-1] for row in out if row[-1] is not None), None)
+            first_ts = next((row[-1] for row in progress.output_rows() if row[-1] is not None), None)
             if first_ts is not None:
                 n_time = len(first_ts)
                 ts_map = np.full((*vol_shape, n_time), np.nan, dtype=np.float32)
 
-        for row in out:
+        for row in progress.output_rows():
             (ix, iy, iz), obs, nullm, dlt, p, nf, nrun, stopped, stop_code, ts = row
 
             obs_map[ix, iy, iz] = obs
@@ -1007,6 +1044,8 @@ def permutation_searchlight(
                 ts_map[ix, iy, iz, :] = ts
 
         # 7) save NIfTIs
+        if not np.isfinite(obs_map).any():
+            raise SearchlightFitError('No valid searchlight center remains; refusing an all-failed map')
         os.makedirs(save_dir, exist_ok=True)
 
         ref = mf.fov_mask  # SAME grid/affine as vol_shape
@@ -1025,6 +1064,13 @@ def permutation_searchlight(
             n_perms=n_perms,
             mask_img=ref
         )
+        failed_map = np.zeros(vol_shape, dtype=np.uint8)
+        for entry in progress.accepted_failures.values():
+            failed_map[tuple(entry['center'])] = 1
+        out_files['fit_failed'] = f'{base}_fit_failed.nii.gz'
+        image.new_img_like(ref, failed_map, copy_header=True).to_filename(out_files['fit_failed'])
+        if progress.failures:
+            out_files['fit_failures'] = base+'_fit_failures.csv'
 
         if ts_map is not None:
             f = f"{base}_cs_us_similarity_timeseries.nii.gz"
@@ -1044,6 +1090,12 @@ def permutation_searchlight(
 
         # also drop a small JSON sidecar
         meta = {
+            "status": "partial" if progress.accepted_failures else "complete",
+            "n_centers_requested": len(centers),
+            "n_centers_fit_failed": len(progress.accepted_failures),
+            "fit_guard": guard_policy,
+            "fit_guard_history": checkpoint.fit_guard_history if checkpoint is not None else [],
+            "fit_failure_policy": "invalidate_entire_center",
             "mask_settings": mask_settings or {},
             "mask_roi_name": roi_name,
             "mask_qc": mf.roi_metrics,
@@ -1066,6 +1118,9 @@ def permutation_searchlight(
 
         with open(f"{base}_desc-metadata.json", "w") as f:
             json.dump(meta, f, indent=2)
+        if progress.accepted_failures:
+            logger.warning('PARTIAL searchlight: %d/%d centers failed fitting; see %s_fit_failures.csv and fit_failed mask',
+                           len(progress.accepted_failures), len(centers), base)
 
         logger.info("Done\n")
         return out_files

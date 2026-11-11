@@ -439,6 +439,17 @@ def sklearn_pipeline_score(
     )
 
     try:
+        guard = cfg.get("_searchlight_fit_guard")
+        if guard and guard.get("enabled"):
+            from panic.fit_guard import guarded_fit, SearchlightFitError
+            fit_kwargs = {"groups":groups_train} if groups_train is not None and supports_groups else {}
+            try:
+                guarded_fit(clf, X_train, y_train, guard, **fit_kwargs)
+            except SearchlightFitError as error:
+                error.diagnostics['train_indices'] = np.asarray(train_idx).tolist()
+                error.diagnostics['test_indices'] = np.asarray(test_idx).tolist()
+                raise
+            return float(clf.score(X_test, y_test))
         # Suppress convergence warnings only for inner search candidates.
         # Plain/final estimators still emit ConvergenceWarning normally.
         if isinstance(clf, BaseSearchCV):

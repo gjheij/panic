@@ -1124,7 +1124,10 @@ class ClassifySubject(data.PrepareBetas):
             except ValueError as e:
                 logger.warning("Searchlight analysis failed [ValueError]: %s", e)
                 return None, None
-            except Exception:
+            except Exception as error:
+                if getattr(error, "fatal_searchlight_fit", False):
+                    logger.exception("Searchlight fitting failed; refusing successful completion")
+                    raise
                 logger.exception("Searchlight failed unexpectedly; skipping mask")
                 return None, None            
 
