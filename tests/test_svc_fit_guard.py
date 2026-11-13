@@ -47,6 +47,19 @@ def parallel_guard_probe(seed):
     raise AssertionError('Expected iteration exhaustion')
 
 
+def variance_plugin(X, labels, *, folds, permute=False, **kwargs):
+    # Exercise real sklearn filtering; score values isolate result collection.
+    fg.SearchlightVarianceThreshold().fit(X[folds[0][0]], labels[folds[0][0]])
+    return .5 if permute else .75
+
+
+def permutation_variance_plugin(X, labels, *, folds, permute=False, **kwargs):
+    # Model label-dependent CV choosing a different training subset on shuffle.
+    train = np.array([0, 1]) if permute else folds[0][0]
+    fg.SearchlightVarianceThreshold().fit(X[train], labels[train])
+    return .5 if permute else .75
+
+
 class FakeImage:
     def __init__(self,data):
         self.data=np.asarray(data);self.shape=self.data.shape;self.affine=np.eye(4)
@@ -89,6 +102,41 @@ class SolverGuardTests(unittest.TestCase):
         self.assertEqual(caught.exception.diagnostics['reason_code'],'solver_nonconvergence')
         self.assertTrue(caught.exception.diagnostics['warnings'])
         self.assertTrue(caught.exception.fatal_searchlight_fit)
+
+    def test_empty_training_fold_is_typed_even_with_globally_variable_features(self):
+        X = np.array([[1., 1.], [1., 1.], [2., 3.], [4., 5.]])
+        self.assertTrue(np.all(np.var(X, axis=0) > 0))
+        with self.assertRaises(fg.SearchlightFitError) as caught:
+            fg.SearchlightVarianceThreshold(threshold=1e-12).fit(X[:2])
+        self.assertEqual(caught.exception.diagnostics['reason_code'], 'no_features_after_variance_threshold')
+        self.assertEqual(caught.exception.diagnostics['n_features_retained'], 0)
+        self.assertIn('1e-12', str(caught.exception))
+
+    def test_valid_variance_filter_is_identical_to_sklearn_and_cloneable(self):
+        from sklearn.base import clone
+        from sklearn.feature_selection import VarianceThreshold
+        X = np.column_stack([np.ones(8), np.arange(8)])
+        actual = clone(fg.SearchlightVarianceThreshold(threshold=1e-12)).fit_transform(X)
+        expected = VarianceThreshold(threshold=1e-12).fit_transform(X)
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_invalid_threshold_and_nonfinite_inputs_are_not_masked_as_empty(self):
+        for threshold, X in [(-1., self.X), (0., np.full((4, 2), np.inf))]:
+            with self.subTest(threshold=threshold):
+                with self.assertRaises(ValueError):
+                    fg.SearchlightVarianceThreshold(threshold=threshold).fit(X)
+
+    def test_real_pipeline_uses_searchlight_filter_only_for_searchlights(self):
+        import test_min_features as mf
+        from sklearn.feature_selection import VarianceThreshold
+        cfg = mf.MinFeaturesTests().config()
+        with patch.dict(mf.pipeline_ns, {'SearchlightVarianceThreshold': fg.SearchlightVarianceThreshold}):
+            light = mf.pipeline_ns['pipeline_from_config'](cfg, labels=self.y, searchlight=True)
+            self.assertIsInstance(light.named_steps['var'], fg.SearchlightVarianceThreshold)
+            with self.assertRaises(fg.SearchlightFitError):
+                light.fit(np.ones_like(self.X), self.y)
+            roi = mf.pipeline_ns['pipeline_from_config'](cfg, labels=self.y)
+            self.assertIs(type(roi.estimator.named_steps['var']), VarianceThreshold)
 
     def test_status_failure_is_rejected_even_without_warning(self):
         model=SVC()
@@ -180,6 +228,21 @@ class CheckpointGuardTests(unittest.TestCase):
         progress.record(2,((2,0,0),.7,.5,.2,.02,2,250,0,0,None))
         self.assertIsNotNone(joblib.load(self.path)['results'][2])
 
+    def test_empty_center_is_checkpointed_even_with_solver_guard_disabled(self):
+        obj = self.checkpoint()
+        policy = fg.fit_guard_settings({'svc_fit_guard': {'enabled': False}})
+        progress = sp.CenterProgress(obj.results, obj, policy, self.base)
+        failure = fg.CenterFitFailure((1,0,0), {'reason_code': 'no_features_after_variance_threshold'})
+        progress.record(1, failure)
+        self.assertNotIn(1, progress.pending)
+        loaded = self.checkpoint()
+        resumed = sp.CenterProgress(loaded.results, loaded, policy, self.base)
+        self.assertNotIn(1, resumed.pending)
+        self.assertEqual(loaded.failures['1']['reason_code'], 'no_features_after_variance_threshold')
+        # Disabled solver guard must still retry old solver failures.
+        resumed.record(2, self.failure())
+        self.assertIn(2, resumed.pending)
+
     def test_failed_atomic_write_preserves_previous_checkpoint(self):
         obj=self.checkpoint();before=Path(self.path).read_bytes()
         with patch.object(cp.os,'replace',side_effect=OSError('interrupted')):
@@ -222,6 +285,34 @@ class SearchlightIntegrationTests(unittest.TestCase):
         meta=json.loads((self.folder/'maps/sl/searchlight_desc-metadata.json').read_text())
         self.assertEqual(meta['status'],'partial');self.assertEqual(meta['n_centers_fit_failed'],1)
         self.assertTrue(Path(result['fit_failed']).exists());self.assertTrue(Path(result['fit_failures']).exists())
+
+    def test_empty_variance_center_continues_and_survives_resume(self):
+        self.X[:2, :2] = 1.0
+        self.cfg['parallel']['svc_fit_guard'] = {'enabled': False}
+        self.ns['core'].get_analysis_plugin = lambda *a, **k: (variance_plugin, {})
+        result = self.run_searchlight()
+        self.assertTrue(np.isnan(self.maps['observed_map'][0,0,0]))
+        self.assertTrue(np.isnan(self.maps['pvalue_map'][0,0,0]))
+        self.assertTrue(np.isfinite(self.maps['observed_map'][1:,0,0]).all())
+        self.assertEqual(self.maps['nperms_run'][0,0,0], 0)
+        self.assertEqual(np.load(result['fit_failed'])[0,0,0], 1)
+        with open(result['fit_failures'], newline='') as stream:
+            failure = next(csv.DictReader(stream))
+        self.assertEqual(failure['reason_code'], 'no_features_after_variance_threshold')
+        self.assertEqual(failure['phase'], 'observed')
+        with patch.dict(self.ns, {'_run_searchlight_center': lambda *a, **k: self.fail('Saved center rerun')}):
+            self.run_searchlight()
+
+    def test_empty_permutation_fold_invalidates_observed_score_too(self):
+        self.X[:2, :2] = 1.0
+        self.folds[:] = [(np.array([2,3]), np.array([0,1]))]
+        self.ns['core'].get_analysis_plugin = lambda *a, **k: (permutation_variance_plugin, {})
+        self.run_searchlight()
+        self.assertTrue(np.isnan(self.maps['observed_map'][0,0,0]))
+        self.assertTrue(np.isnan(self.maps['pvalue_map'][0,0,0]))
+        state = joblib.load(self.folder/'maps/sl/searchlight_checkpoint.joblib')
+        self.assertEqual(state['failures']['0']['phase'], 'permutation')
+        self.assertEqual(state['failures']['0']['permutation'], 0)
 
     def test_original_fingerprint_and_legacy_completed_center_are_preserved(self):
         centers=np.column_stack(np.where(np.ones((4,1,1),dtype=bool)))

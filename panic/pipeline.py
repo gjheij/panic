@@ -12,6 +12,7 @@ from sklearn.model_selection._search import BaseSearchCV
 from sklearn.base import BaseEstimator, TransformerMixin
 
 from panic.logger import get_logger
+from panic.fit_guard import SearchlightVarianceThreshold
 from panic import (
     factory,
     errors
@@ -185,7 +186,7 @@ def pipeline_from_config(
     # 4) Assemble base pipeline
     thr = float(cfg.get("variance_threshold", 1e-12))
     pipe = Pipeline([
-        ("var", VarianceThreshold(threshold=thr)),
+        ("var", (SearchlightVarianceThreshold if searchlight else VarianceThreshold)(threshold=thr)),
         ("scaler", scaler if standardize else "passthrough"),
         ("select", selector if selector is not None else "passthrough"),
         ("check", FailIfNoFeatures()),

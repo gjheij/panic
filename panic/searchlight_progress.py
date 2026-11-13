@@ -20,7 +20,14 @@ class CenterProgress:
 
     @property
     def accepted_failures(self):
-        return self.failures if self.policy['enabled'] and self.policy['on_failure']=='mark_center' else {}
+        if self.policy['on_failure'] != 'mark_center':
+            return {}
+        if self.policy['enabled']:
+            return self.failures
+        # Empty neighborhoods remain invalid even when the SVC iteration
+        # safeguard is disabled; no estimator can score an empty feature set.
+        return {index: entry for index, entry in self.failures.items()
+                if entry.get('reason_code') == 'no_features_after_variance_threshold'}
 
     @property
     def pending(self):
@@ -64,7 +71,7 @@ class CenterProgress:
             self._completed += int(str(index) in self.accepted_failures)-int(before)
             self.flush()
             if self.policy['on_failure']=='raise':
-                raise SearchlightFitError('Searchlight center {} failed convergence; checkpoint retained'.format(index),self.failures[str(index)])
+                raise SearchlightFitError('Searchlight center {} could not be scored; checkpoint retained'.format(index),self.failures[str(index)])
             return self.checkpoint is not None
         self.results[index]=result
         self.failures.pop(str(index),None)

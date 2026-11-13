@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import warnings
 import numpy as np
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.feature_selection import VarianceThreshold
 from sklearn.svm import SVC
 
 
@@ -12,6 +13,30 @@ class SearchlightFitError(RuntimeError):
     def __init__(self, message, diagnostics=None):
         super().__init__(message)
         self.diagnostics = dict(diagnostics or {})
+
+
+class SearchlightVarianceThreshold(VarianceThreshold):
+    """Report an empty training-fold feature set as a center-local failure."""
+
+    def fit(self, X, y=None):
+        try:
+            return super().fit(X, y)
+        except ValueError as exc:
+            # Only translate sklearn's explicit empty-support error. Invalid
+            # thresholds, malformed arrays and other input errors must propagate.
+            if not str(exc).startswith("No feature in X meets the variance threshold"):
+                raise
+            raise SearchlightFitError(
+                "No searchlight features survive variance filtering in a training fold "
+                f"(threshold={self.threshold:g}); center will not receive a score",
+                {
+                    "reason_code": "no_features_after_variance_threshold",
+                    "variance_threshold": float(self.threshold),
+                    "shape": list(X.shape),
+                    "n_features_retained": 0,
+                    "original_error": str(exc),
+                },
+            ) from exc
 
 
 @dataclass
