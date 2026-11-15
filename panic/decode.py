@@ -1093,6 +1093,15 @@ class ClassifySubject(data.PrepareBetas):
                 )
                 return self._failed_result(e), extract
             except ValueError as e:
+                import re
+                # Only sklearn's explicit empty VarianceThreshold support is an
+                # exclusion. Other ValueErrors and all-NaN CV failures remain errors.
+                if re.fullmatch(r"No feature in X meets the variance threshold [0-9.eE+\-]+(?: \(X contains only one sample\))?\.?", str(e)):
+                    result = self._failed_result(e)
+                    result.update(status="skipped", reason_code="no_features_after_variance_filter",
+                                  n_features_after_variance_filter=0)
+                    logger.warning("ROI analysis skipped [no_features_after_variance_filter]: %s", e)
+                    return result, extract
                 logger.warning("ROI analysis failed [ValueError]: %s", e)
                 return self._failed_result(e), extract
             except Exception as e:
@@ -1686,6 +1695,7 @@ class ClassifySubject(data.PrepareBetas):
             "error_type": ddict.get("error_type"),
             "error": ddict.get("error"),
             "reason_code": ddict.get("reason_code"),
+            "n_features_after_variance_filter": ddict.get("n_features_after_variance_filter"),
 
             "cv_permutation_policy": cv_permutation_policy(self.dec_settings),
             "n_samples": int(extracted.X.shape[0]) if extracted is not None else np.nan,
