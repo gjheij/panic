@@ -81,8 +81,7 @@ def worker_heartbeat(
     try:
         _atomic_json(Path(runtime_dir) / f"worker_{pid}.json", payload)
     except OSError:
-        # Diagnostics must never make a searchlight task fail.
-        pass
+        raise  # Diagnostic writes must not conceal storage exhaustion.
 
 
 
@@ -102,7 +101,7 @@ def worker_mark_completed(runtime_dir: Optional[str], ix: int) -> None:
         fobj.write(f"{int(ix)}\n")
         fobj.flush()
     except OSError:
-        pass
+        raise
 
 def worker_task_started() -> int:
     """Increment and return this process's searchlight-task counter."""
@@ -252,6 +251,7 @@ class SearchlightMonitor:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._storage_error = None
         self._completion_offsets: Dict[str, int] = {}
         self._stuck_dumped: Dict[int, Dict[str, Any]] = {}
         self.label = str(label)
@@ -276,6 +276,8 @@ class SearchlightMonitor:
         return self
 
     def mark_completed(self, ix: int) -> int:
+        if self._storage_error is not None:
+            raise self._storage_error
         ix = int(ix)
         newly_completed = False
         with self._lock:
@@ -345,7 +347,11 @@ class SearchlightMonitor:
                         if line:
                             completed_ix.append(int(line))
                     self._completion_offsets[key] = fobj.tell()
-            except (OSError, ValueError):
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise
+            except (ValueError):
                 continue
 
         if not completed_ix:
@@ -368,7 +374,11 @@ class SearchlightMonitor:
             try:
                 with open(path, "r", encoding="utf-8") as fobj:
                     heartbeats.append(json.load(fobj))
-            except (OSError, json.JSONDecodeError):
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise
+            except (json.JSONDecodeError):
                 continue
         return heartbeats
 
@@ -429,7 +439,7 @@ class SearchlightMonitor:
             try:
                 _atomic_json(self.snapshot_dir / f"stuck_worker_{pid}.json", diag)
             except OSError:
-                pass
+                raise
         return diagnostics
 
     def dump_snapshot(self, reason: str = "watchdog") -> None:
@@ -443,7 +453,7 @@ class SearchlightMonitor:
                 os.fsync(fobj.fileno())
             os.replace(npy_tmp, npy_final)
         except OSError:
-            pass
+            raise
 
         heartbeats = self._read_heartbeats()
         now = time.time()
@@ -462,7 +472,7 @@ class SearchlightMonitor:
         try:
             _atomic_json(self.snapshot_dir / "searchlight_monitor.json", payload)
         except OSError:
-            pass
+            raise
 
         if reason == "watchdog":
             self.logger.debug(
@@ -484,16 +494,32 @@ class SearchlightMonitor:
 
     def _watchdog(self) -> None:
         while not self._stop.wait(self.interval):
-            self.dump_snapshot(reason="watchdog")
+            try:
+                self.dump_snapshot(reason="watchdog")
+            except OSError as error:
+                self._storage_error = error
+                self._stop.set()
+                return
 
     def close(self, reason: str = "complete") -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=min(self.interval, 5.0))
+        if self._storage_error is not None:
+            raise self._storage_error
         self.dump_snapshot(reason=reason)
 
     def __enter__(self) -> "SearchlightMonitor":
         return self.start()
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.close(reason="exception" if exc_type else "complete")
+        try:
+            self.close(reason="exception" if exc_type else "complete")
+        except OSError:
+            if exc is None:
+                raise
+            # The primary worker/parent failure takes precedence over cleanup.
+            try:
+                self.logger.exception("Could not close searchlight monitor after failure")
+            except OSError:
+                pass

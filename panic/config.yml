@@ -41,7 +41,7 @@ general_settings:
   project_dir: "/mnt/d/fMRI/HRA"
   # save_dir: "/mnt/d/fMRI/Development/HRA/derivatives/panic"
   save_dir: /tmp/test_panic
-  tmp_dir: "~/.joblib_cache"    # stores temp memmaps
+  tmp_dir: null                # explicit path -> TMPDIR -> Python default; disposable memmaps
   method: LSS                   # or LSS, if you have GLMsingle: use 'lss', 'lsa'
   source: stglm                 # or 'stglm', 'glmsingle'
   standardize: zscore           # best to keep this

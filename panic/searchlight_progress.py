@@ -2,9 +2,9 @@
 import csv
 import json
 import os
-import tempfile
 import time
 from .fit_guard import CenterFitFailure, SearchlightFitError
+from .result_store import atomic_csv_writer
 
 
 class CenterProgress:
@@ -17,6 +17,7 @@ class CenterProgress:
         self.save_seconds = save_seconds
         self.last_save = time.monotonic()
         self._completed = sum(row is not None or str(i) in self.accepted_failures for i,row in enumerate(results))
+        self._terminal = sum(row is not None or str(i) in self.failures for i,row in enumerate(results))
 
     @property
     def accepted_failures(self):
@@ -42,22 +43,15 @@ class CenterProgress:
             self.checkpoint.save()
         if self.failures:
             path = self.base+'_fit_failures.csv'
-            os.makedirs(os.path.dirname(os.path.abspath(path)),exist_ok=True)
-            fd,temp=tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),prefix='.checkpoint-fit-failures-')
-            try:
-                with os.fdopen(fd,'w',newline='') as stream:
-                    fields=['center_index','x','y','z','reason_code','phase','permutation','perm_seed','error','diagnostics']
-                    writer=csv.DictWriter(stream,fieldnames=fields);writer.writeheader()
-                    for index, entry in sorted(self.failures.items(),key=lambda item:int(item[0])):
-                        x,y,z=entry['center']
-                        writer.writerow(dict(center_index=int(index),x=x,y=y,z=z,
-                            reason_code=entry.get('reason_code','solver_nonconvergence'),phase=entry.get('phase'),
-                            permutation=entry.get('permutation'),perm_seed=entry.get('perm_seed'),error=entry.get('error'),
-                            diagnostics=json.dumps(entry,allow_nan=False)))
-                    stream.flush();os.fsync(stream.fileno())
-                os.replace(temp,path)
-            finally:
-                if os.path.exists(temp):os.unlink(temp)
+            with atomic_csv_writer(path, prefix='.checkpoint-fit-failures-', create_parents=True) as stream:
+                fields=['center_index','x','y','z','reason_code','phase','permutation','perm_seed','error','diagnostics']
+                writer=csv.DictWriter(stream,fieldnames=fields);writer.writeheader()
+                for index, entry in sorted(self.failures.items(),key=lambda item:int(item[0])):
+                    x,y,z=entry['center']
+                    writer.writerow(dict(center_index=int(index),x=x,y=y,z=z,
+                        reason_code=entry.get('reason_code','solver_nonconvergence'),phase=entry.get('phase'),
+                        permutation=entry.get('permutation'),perm_seed=entry.get('perm_seed'),error=entry.get('error'),
+                        diagnostics=json.dumps(entry,allow_nan=False)))
         else:
             try:os.unlink(self.base+'_fit_failures.csv')
             except FileNotFoundError:pass
@@ -65,20 +59,21 @@ class CenterProgress:
 
     def record(self,index,result):
         before = self.results[index] is not None or str(index) in self.accepted_failures
+        was_terminal = self.results[index] is not None or str(index) in self.failures
         if isinstance(result,CenterFitFailure):
             self.failures[str(index)]=dict(result.diagnostics,center=list(result.center))
             self.results[index]=None
             self._completed += int(str(index) in self.accepted_failures)-int(before)
-            self.flush()
             if self.policy['on_failure']=='raise':
+                self.flush()
                 raise SearchlightFitError('Searchlight center {} could not be scored; checkpoint retained'.format(index),self.failures[str(index)])
-            return self.checkpoint is not None
-        self.results[index]=result
-        self.failures.pop(str(index),None)
-        self._completed += 1-int(before)
-        completed=self.completed
-        if self.checkpoint is not None and (completed==len(self.results) or
-                self.update_interval>0 and completed%self.update_interval==0 or
+        else:
+            self.results[index]=result
+            self.failures.pop(str(index),None)
+            self._completed += 1-int(before)
+        self._terminal += int(not was_terminal)
+        if self.checkpoint is not None and (self._terminal==len(self.results) or
+                self.update_interval>0 and self._terminal%self.update_interval==0 or
                 time.monotonic()-self.last_save>=self.save_seconds):
             self.flush()
             return True

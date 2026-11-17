@@ -41,7 +41,9 @@ def tsnr_metadata(path):
         if not isinstance(value, dict):
             raise ValueError('sidecar must contain a JSON object')
         return value
-    except (OSError, ValueError) as error:
+    except OSError:
+        raise
+    except (ValueError,) as error:
         return {'_metadata_error': str(error)}
 
 
@@ -159,6 +161,8 @@ class TsnrQC:
                         if not matches_grid(beta_img):
                             raise ValueError('Registered tSNR ReferenceGrid does not match the selected beta grid')
                 self.cache[key] = (*resample_values(img.get_fdata(), img.affine, affine, shape), '')
+            except OSError:
+                raise
             except Exception as error:
                 logger.warning('tSNR QC could not read %s: %s', path, error)
                 self.cache[key] = (None, None, str(error))

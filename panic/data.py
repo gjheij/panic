@@ -595,6 +595,8 @@ class PrepareROIs:
         if roi_name is None:
             try:
                 bids_comps = utils.split_bids_components(i, add_elements='roi')
+            except OSError:
+                raise
             except Exception:
                 logger.warning(f"{i} is not in BIDS-format. Cannot extract 'roi-<roi_name>' key, so defaulting to 'roi' as roi_name. This can result in clashing names!")
                 roi_name = "roi"
@@ -1002,7 +1004,9 @@ class PrepareBetas(BetaLoaderMixin):
                         events_file,
                         sep=sep,
                     )
-                except (OSError, pd.errors.ParserError) as exc:
+                except OSError:
+                    raise
+                except (pd.errors.ParserError,) as exc:
                     raise ValueError(
                         f"Could not read events file '{events_file}': {exc}"
                     ) from exc

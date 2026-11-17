@@ -10,9 +10,9 @@ import pandas as pd
 
 import tempfile, uuid
 from tqdm import tqdm
-from joblib import Parallel, delayed, dump
+from joblib import Parallel, delayed, dump, parallel_config
 
-from panic.result_store import merge_result_tables, write_qc_rows
+from panic.result_store import merge_result_tables, write_qc_rows, write_dataframe_csv
 from panic.tsnr import TsnrQC
 from panic import data
 from panic.masking import normalize_mask_settings, mask_erosion_request, erosion_policy_matches
@@ -31,6 +31,7 @@ from panic.errors import (
     NoFeaturesSelectedError,
 )
 from panic.plugins import core
+from panic.storage import resolve_tmp_dir
 
 from lazyfmri.utils import FindFiles, update_kwargs
 
@@ -86,7 +87,7 @@ def run_decoding_with_permutation(
 
     tmpdir : str or path-like, optional
         Parent directory for temporary joblib files. If omitted, ``TMPDIR``
-        is used when available, otherwise ``~/.joblib_cache``.
+        is used when available, otherwise Python's default temporary directory.
 
     groups : array-like, optional
         Exchangeability-group labels aligned with samples. Used only when
@@ -165,23 +166,7 @@ def run_decoding_with_permutation(
 
     # ---------------------------------------------------------------
     # Temporary-directory configuration
-    if tmpdir is None:
-        tmpdir = os.environ.get("TMPDIR")
-
-    if not tmpdir:
-        tmpdir = os.path.join(
-            os.path.expanduser("~"),
-            ".joblib_cache",
-        )
-
-    tmpdir = os.path.abspath(
-        os.path.expanduser(tmpdir)
-    )
-
-    os.makedirs(
-        tmpdir,
-        exist_ok=True,
-    )
+    tmpdir = resolve_tmp_dir(tmpdir)
 
     logger.info(
         "Using decoding temporary directory: %s",
@@ -270,7 +255,7 @@ def run_decoding_with_permutation(
     with tempfile.TemporaryDirectory(
         dir=tmpdir,
         prefix="panic_",
-    ) as tmpd:
+    ) as tmpd, parallel_config(temp_folder=tmpd):
 
         X_path = dump(
             X,
@@ -422,6 +407,7 @@ def run_decoding_with_permutation(
             else:
 
                 with Parallel(
+                    temp_folder=tmpd,
                     n_jobs=n_jobs,
                     backend=par_cfg.get(
                         "backend",
@@ -676,6 +662,7 @@ class ClassifySubject(data.PrepareBetas):
 
         # append subject to save_dir
         self.gen_settings = self.cfg["general_settings"]
+        self._tmp_dir = resolve_tmp_dir(self.gen_settings.get("tmp_dir"))
         self.dec_settings = self.cfg["decoding_settings"]
         self.roi_settings = self.cfg.get("roi_settings") or {}
         names = self.cfg.get("roi_dict")
@@ -788,7 +775,10 @@ class ClassifySubject(data.PrepareBetas):
             self.results = self.decode_masks(**kwargs)
             logger.info(f"Decoding {self.subject} complete")
         except Exception as e:
-            logger.exception(f"Decoding failed with errors: {e}")
+            try:
+                logger.exception(f"Decoding failed with errors: {e}")
+            except OSError:
+                pass
             raise
 
 
@@ -921,7 +911,7 @@ class ClassifySubject(data.PrepareBetas):
             job=str(self.gen_settings["batch_job_id"])[:12] if self.gen_settings.get("batch_job_id") else None,
             desc="trial_order", ext="csv")
         if hasattr(self, "events_df") and self.events_df is not None:
-            self.events_df.to_csv(self.trial_order_file, index=False)
+            write_dataframe_csv(self.events_df, self.trial_order_file, index=False)
             logger.info(f"Saved trial order CSV to {self.trial_order_file}")
         else:
             logger.warning("No events_df available to save trial order CSV.")
@@ -1057,6 +1047,12 @@ class ClassifySubject(data.PrepareBetas):
             except ValueError as e:
                 logger.warning("ROI extraction failed [ValueError]: %s", e)
                 return self._failed_result(e), None
+            except OSError:
+                try:
+                    logger.exception("Filesystem operation failed; aborting decoding")
+                except OSError:
+                    pass
+                raise
             except Exception as e:
                 logger.exception("ROI extraction failed unexpectedly")
                 return self._failed_result(e), None
@@ -1104,6 +1100,12 @@ class ClassifySubject(data.PrepareBetas):
                     return result, extract
                 logger.warning("ROI analysis failed [ValueError]: %s", e)
                 return self._failed_result(e), extract
+            except OSError:
+                try:
+                    logger.exception("Filesystem operation failed; aborting decoding")
+                except OSError:
+                    pass
+                raise
             except Exception as e:
                 logger.exception("Decoding failed unexpectedly")
                 return self._failed_result(e), extract
@@ -1133,6 +1135,12 @@ class ClassifySubject(data.PrepareBetas):
             except ValueError as e:
                 logger.warning("Searchlight analysis failed [ValueError]: %s", e)
                 return None, None
+            except OSError:
+                try:
+                    logger.exception("Filesystem operation failed; aborting decoding")
+                except OSError:
+                    pass
+                raise
             except Exception as error:
                 if getattr(error, "fatal_searchlight_fit", False):
                     logger.exception("Searchlight fitting failed; refusing successful completion")
@@ -1387,7 +1395,9 @@ class ClassifySubject(data.PrepareBetas):
                             all_exist = erosion_policy_matches(metadata, getattr(self, "mask_settings", {}), erosion_name)
                             all_exist = all_exist and metadata.get("cv_permutation_policy", "fixed") == cv_permutation_policy(self.dec_settings)
 
-                        except (OSError, ValueError, AttributeError):
+                        except OSError:
+                            raise
+                        except (ValueError, AttributeError):
                             all_exist = False
                     if all_exist and not overwrite:
                         logger.warning(
@@ -1441,7 +1451,7 @@ class ClassifySubject(data.PrepareBetas):
                     label_mapper=self.cfg["label_dict"],
                     output_file=fname,
                     save_dir=roi_dir,
-                    tmpdir=self.gen_settings["tmp_dir"],
+                    tmpdir=getattr(self, "_tmp_dir", self.gen_settings.get("tmp_dir")),
                     hemi_key=h_key,
                     roi_name=erosion_name,
                     **kwargs,

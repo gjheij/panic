@@ -1,10 +1,14 @@
 """Atomic, parent-owned searchlight checkpoints (trusted local joblib files)."""
 
 import os
+import logging
+import sys
 import tempfile
 import time
 
 import joblib
+
+logger = logging.getLogger(__name__)
 
 
 class SearchlightCheckpoint:
@@ -49,11 +53,21 @@ class SearchlightCheckpoint:
 
     def save(self):
         """Replace the last checkpoint only after a complete, flushed write."""
-        directory = os.path.dirname(os.path.abspath(self.path))
-        os.makedirs(directory, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=".checkpoint-", dir=directory)
+        destination = os.path.abspath(self.path)
+        directory = os.path.dirname(destination)
+        fd, temporary = None, None
+        stage = 'log destination'
         try:
-            with os.fdopen(fd, "wb") as stream:
+            logger.info("Saving searchlight checkpoint: %s", destination)
+            stage = 'create checkpoint directory'
+            os.makedirs(directory, exist_ok=True)
+            stage = 'create temporary file'
+            fd, temporary = tempfile.mkstemp(prefix=".checkpoint-", dir=directory)
+            stage = 'open temporary file'
+            stream = os.fdopen(fd, "wb")
+            fd = None
+            with stream:
+                stage = 'serialization'
                 joblib.dump({
                     "version": 2,
                     "fingerprint": self.fingerprint,
@@ -62,9 +76,38 @@ class SearchlightCheckpoint:
                     "failures": self.failures,
                     "fit_guard_history": self.fit_guard_history,
                 }, stream)
+                stage = 'flush'
                 stream.flush()
+                stage = 'fsync'
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+                stage = 'close temporary file'
+            stage = 'replacement'
+            os.replace(temporary, destination)
+        except OSError as error:
+            message = (f"Checkpoint save failed during {stage}; temporary={temporary!r}; "
+                       f"{error.strerror or str(error)}")
+            try:
+                logger.error("%s; destination=%s; errno=%s", message, destination, error.errno)
+            except OSError:
+                pass
+            raise OSError(error.errno, message, destination) from error
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            primary_failure = sys.exc_info()[0] is not None
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    if not primary_failure:
+                        raise OSError(error.errno, f"Checkpoint temporary cleanup failed; temporary={temporary!r}", destination) from error
+                    try:
+                        logger.warning("Checkpoint cleanup failed: destination=%s; temporary=%s; %s",
+                                       destination, temporary, error)
+                    except OSError:
+                        pass

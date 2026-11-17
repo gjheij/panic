@@ -27,6 +27,7 @@ pkg=types.ModuleType(PACKAGE);pkg.__path__=[str(ROOT/'panic')];sys.modules[PACKA
 fg=importlib.import_module(PACKAGE+'.fit_guard')
 cp=importlib.import_module(PACKAGE+'.checkpoint')
 sp=importlib.import_module(PACKAGE+'.searchlight_progress')
+storage=importlib.import_module(PACKAGE+'.storage')
 
 
 def toy_plugin(X,labels,*,permute=False,**kwargs):
@@ -235,6 +236,7 @@ class CheckpointGuardTests(unittest.TestCase):
         failure = fg.CenterFitFailure((1,0,0), {'reason_code': 'no_features_after_variance_threshold'})
         progress.record(1, failure)
         self.assertNotIn(1, progress.pending)
+        progress.flush()  # mark_center failures now follow the batching policy.
         loaded = self.checkpoint()
         resumed = sp.CenterProgress(loaded.results, loaded, policy, self.base)
         self.assertNotIn(1, resumed.pending)
@@ -259,7 +261,7 @@ class SearchlightIntegrationTests(unittest.TestCase):
         self.maps={}
         def save(base,**kwargs):self.maps.update(kwargs);return {}
         mf=types.SimpleNamespace(X=self.X,labels=self.y,fov_mask=self.ref,roi_linidx=np.arange(4),roi_metrics={})
-        self.ns=dict(np=np,os=os,opj=os.path.join,json=json,csv=csv,tempfile=tempfile,time=importlib.import_module('time'),uuid=importlib.import_module('uuid'),
+        self.ns=dict(parallel_config=joblib.parallel_config,resolve_tmp_dir=storage.resolve_tmp_dir,np=np,os=os,opj=os.path.join,json=json,csv=csv,tempfile=tempfile,time=importlib.import_module('time'),uuid=importlib.import_module('uuid'),
             dump=joblib.dump,joblib_hash=joblib.hash,SearchlightCheckpoint=cp.SearchlightCheckpoint,CenterProgress=sp.CenterProgress,
             CenterFitFailure=fg.CenterFitFailure,SearchlightFitError=fg.SearchlightFitError,fit_guard_settings=fg.fit_guard_settings,
             data=types.SimpleNamespace(MaskAndFilterBetas=lambda *a,**kw:mf),logger=logging.getLogger(__name__),

@@ -10,12 +10,13 @@ import time
 import uuid
 
 import numpy as np
-from joblib import Parallel, delayed, dump, hash as joblib_hash
+from joblib import Parallel, delayed, dump, hash as joblib_hash, parallel_config
 from nilearn import image
 from statsmodels.stats.multitest import fdrcorrection
 from tqdm import tqdm
 
 from panic import data
+from panic.storage import resolve_tmp_dir
 from panic.checkpoint import SearchlightCheckpoint
 from panic.fit_guard import CenterFitFailure, SearchlightFitError, fit_guard_settings
 from panic.searchlight_progress import CenterProgress
@@ -103,6 +104,8 @@ def _voxel_radius_in_voxels(mask_img, radius_mm):
     zooms = np.array(image.get_data(mask_img).shape[:3], dtype=float)  # fallback if header missing pixdim
     try:
         zooms = np.array(mask_img.header.get_zooms()[:3], dtype=float)
+    except OSError:
+        raise
     except Exception:
         pass
     vx = float(zooms[0])
@@ -537,15 +540,18 @@ def _run_searchlight_center(
         worker_mark_completed(monitor_runtime_dir, ix)
         return int(ix), CenterFitFailure(center_ijk, diagnostics)
     except BaseException as exc:
-        worker_heartbeat(
-            monitor_runtime_dir,
-            ix,
-            "ERROR",
-            center_ijk=list(center_ijk),
-            task_count=int(task_count),
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
+        try:
+            worker_heartbeat(
+                monitor_runtime_dir,
+                ix,
+                "ERROR",
+                center_ijk=list(center_ijk),
+                task_count=int(task_count),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+        except OSError:
+            pass
         raise
 
 
@@ -609,7 +615,8 @@ def permutation_searchlight(
         Enables group-aware folds and within-group permutations.
     seed : int, default=0
         Global seed for center-wise RNG seeding.
-    tmpdir : str, default="~/.joblib_cache"
+    tmpdir : str or None
+        Explicit temporary parent; otherwise TMPDIR, then Python default.
         Directory for temporary memmaps and intermediate artifacts.
     output_file : str or None, optional
         Optional path forwarded to :class:`data.MaskAndFilterBetas` for writing
@@ -696,6 +703,9 @@ def permutation_searchlight(
     if groups is not None:
         logger.info(f"Groups = {groups}")
 
+    if kwargs.get("save_dir") is None:
+        raise ValueError("Searchlight requires an explicit persistent save_dir; tmpdir is disposable")
+
     # 0) Extract settings from cfg
     sl_cfg = cfg.get("searchlight", {})
     par_cfg = cfg.get("parallel", {})
@@ -744,13 +754,9 @@ def permutation_searchlight(
     folds = create_outer_folds(cfg, y, groups=groups)
 
     # 3) memmap X once
-    if tmpdir is None:
-        tmpdir = os.environ.get("TMPDIR", "~/.joblib_cache")
+    tmpdir = resolve_tmp_dir(tmpdir)
 
-    tmpdir = os.path.expanduser(tmpdir)
-    os.makedirs(tmpdir, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(dir=tmpdir, prefix="panic_") as tmpd:
+    with tempfile.TemporaryDirectory(dir=tmpdir, prefix="panic_") as tmpd, parallel_config(temp_folder=tmpd):
         X_path = dump(
             X,
             os.path.join(
@@ -770,10 +776,8 @@ def permutation_searchlight(
         rng = np.random.default_rng(seed)
         center_seeds = rng.integers(0, 2**32 - 1, size=len(centers), dtype=np.uint32)
 
-        save_dir = tmpdir
         sl_base = sl_cfg.get("basepath", "searchlight")
-        if "save_dir" in kwargs:
-            save_dir = opj(kwargs.pop("save_dir"), sl_base)
+        save_dir = opj(kwargs.pop("save_dir"), sl_base)
 
         # Keep each hemisphere's checkpoint alongside its final maps.
         base = opj(save_dir, "searchlight")
@@ -800,6 +804,7 @@ def permutation_searchlight(
             center_seeds = checkpoint.seeds
             checkpoint.record_guard(guard_policy)
             # Save the random seeds even before the first interval is reached.
+            logger.info("Searchlight checkpoint destination: %s", checkpoint.path)
             checkpoint.save()
 
         logger.info(f"Storing searchlight information in {save_dir}")
@@ -945,6 +950,7 @@ def permutation_searchlight(
                 with monitor:
                     parallel_kwargs = dict(
                         n_jobs=n_jobs,
+                        temp_folder=tmpd,
                         backend=backend_name,
                         batch_size=par_cfg.get("batch_size", 16),
                         verbose=par_cfg.get("verbose", 0),
@@ -1004,7 +1010,10 @@ def permutation_searchlight(
             try:
                 progress.flush()
             except Exception:
-                logger.exception("Could not flush searchlight checkpoint after failure")
+                try:
+                    logger.exception("Could not flush searchlight checkpoint after failure")
+                except OSError:
+                    pass
             raise
         else:
             progress.flush()

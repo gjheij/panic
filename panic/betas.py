@@ -627,7 +627,9 @@ class BetaLoaderMixin:
         trial_file = cls._find_trial_file(subject_betas)
         try:
             return niimgs, np.loadtxt(trial_file, dtype=str, ndmin=1)
-        except (OSError, ValueError) as exc:
+        except OSError:
+            raise
+        except (ValueError,) as exc:
             raise ValueError(
                 f"Could not read trial list '{trial_file}': {exc}"
             ) from exc
@@ -661,7 +663,9 @@ class BetaLoaderMixin:
 
         try:
             return nib.load(file_path)
-        except (OSError, nib.filebasedimages.ImageFileError, ValueError) as exc:
+        except OSError:
+            raise
+        except (nib.filebasedimages.ImageFileError, ValueError) as exc:
             logger.warning("Could not load beta image '%s': %s", file_path, exc)
             return None
 
@@ -701,7 +705,9 @@ class BetaLoaderMixin:
         try:
             with open(json_file, "r", encoding="utf-8") as fjson:
                 metadata = json.load(fjson)
-        except (OSError, json.JSONDecodeError) as exc:
+        except OSError:
+            raise
+        except (json.JSONDecodeError,) as exc:
             logger.warning("Could not read JSON file '%s': %s", json_file, exc)
             return None
 
@@ -1040,6 +1046,8 @@ class BetaLoaderMixin:
         logger.info("Concatenating %d files into a single 4D object", len(niimgs))
         try:
             return image.concat_imgs(niimgs)
+        except OSError:
+            raise
         except Exception as exc:
             raise ValueError(f"Could not concatenate beta images: {exc}") from exc
 

@@ -860,6 +860,8 @@ def _save_pipeline(model, X, test_idx, train_idx, output_dir, roi_linidx=None):
         clf = fitted.named_steps["clf"]
         if hasattr(clf, "classes_"):
             np.save(opj(output_dir, "fold_k_classes.npy"), clf.classes_)
+    except OSError:
+        raise
     except Exception:
         # pipeline might not have a "clf" step (unlikely here); ignore silently
         pass
@@ -874,6 +876,8 @@ def _save_pipeline(model, X, test_idx, train_idx, output_dir, roi_linidx=None):
         # Prefer classifier-only params to keep file small; fall back to pipeline params
         try:
             best_params = fitted.named_steps["clf"].get_params()
+        except OSError:
+            raise
         except Exception:
             best_params = fitted.get_params(deep=False)
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from stglm.cli import run_stglm_from_inputs
 from panic import noise
+from panic.result_store import write_dataframe_csv
 from lazyfmri import plotting, utils
 
 shape: tuple[int, int, int] = (10, 10, 10)
@@ -195,7 +196,7 @@ def condition_file(tmp_path_factory, events_df: pd.DataFrame) -> Path:
     tmp_path_factory.mkdir(exist_ok=True)
 
     condition_file = tmp_path_factory / "sub-01_ses-1_task-HousesFaces_run-1_events.tsv"
-    events_df.to_csv(condition_file, sep="\t", index=False)
+    write_dataframe_csv(events_df, condition_file, sep="\t", index=False)
     return condition_file
 
 def simulated_bold_file(

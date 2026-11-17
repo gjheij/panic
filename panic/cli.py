@@ -152,7 +152,14 @@ def _write_temp_config(base_cfg: Dict[str, Any]) -> Path:
     fd, temp_path = tempfile.mkstemp(prefix="panic_cfg_", suffix=".yml")
     os.close(fd)
     temp = Path(temp_path)
-    dump_yaml(base_cfg, temp)
+    try:
+        dump_yaml(base_cfg, temp)
+    except BaseException:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise
     return temp
 
 
@@ -173,64 +180,82 @@ def action_run(args):
     if args.set:
         cfg_for_run, changes = apply_assignments(base_cfg, args.set)
 
-    # Decide where to write config
-    if args.set:
-        # ephemeral temp config
-        cfg_to_use = _write_temp_config(cfg_for_run)
-        print(f"Using temporary config with overrides at: {cfg_to_use}")
-    else:
-        cfg_to_use = cfg_path
+    owned_config = None
+    try:
+        # Decide where to write config
+        if args.set:
+            # ephemeral temp config
+            cfg_to_use = _write_temp_config(cfg_for_run)
+            owned_config = cfg_to_use
+            print(f"Using temporary config with overrides at: {cfg_to_use}")
+        else:
+            cfg_to_use = cfg_path
+        
+        loaded_cfg = load_yaml(cfg_to_use)
+        if changes:
+            print("Applied overrides:")
+            for c in changes:
+                print(f" {c}")
     
-    loaded_cfg = load_yaml(cfg_to_use)
-    if changes:
-        print("Applied overrides:")
-        for c in changes:
-            print(f" {c}")
-
-    for subj in subjects:
-
-        gen_settings = loaded_cfg["general_settings"]
-        dec_settings = loaded_cfg["decoding_settings"]
-        analysis = dec_settings["analysis"]
-
-        analysis_name = analysis.get("name") or analysis.get("type")
-
-        save_dir = opj(
-            gen_settings["save_dir"],
-            analysis_name,
-            subj,
-        )
-
-        os.makedirs(save_dir, exist_ok=True)
-
-        # Build run-specific log name
-        mode = "searchlight" if args.searchlight else "roi"
-        source = gen_settings["source"]
-        method = gen_settings["method"]
-
-        log_dir = gen_settings.get("batch_metadata_dir") or save_dir
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(
-            log_dir,
-            f"{subj}_model-{method}_source-{source}_desc-{mode}.log",
-        )
-
-        log_level = logging.DEBUG if args.debug else logging.INFO
-
-        init_logging(
-            level=log_level,
-            logfile=log_file,
-            filemode="w",
-        )
-
-        decoder = ClassifySubject(
-            subj,
-            str(cfg_to_use),
-            save_imgs=args.save_imgs,
-            searchlight=args.searchlight,
-        )
-
-        decoder._fit()
+        for subj in subjects:
+    
+            gen_settings = loaded_cfg["general_settings"]
+            dec_settings = loaded_cfg["decoding_settings"]
+            analysis = dec_settings["analysis"]
+    
+            analysis_name = analysis.get("name") or analysis.get("type")
+    
+            save_dir = opj(
+                gen_settings["save_dir"],
+                analysis_name,
+                subj,
+            )
+    
+            os.makedirs(save_dir, exist_ok=True)
+    
+            # Build run-specific log name
+            mode = "searchlight" if args.searchlight else "roi"
+            source = gen_settings["source"]
+            method = gen_settings["method"]
+    
+            log_dir = gen_settings.get("batch_metadata_dir") or save_dir
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(
+                log_dir,
+                f"{subj}_model-{method}_source-{source}_desc-{mode}.log",
+            )
+    
+            log_level = logging.DEBUG if args.debug else logging.INFO
+    
+            init_logging(
+                level=log_level,
+                logfile=log_file,
+                filemode="w",
+            )
+    
+            decoder = ClassifySubject(
+                subj,
+                str(cfg_to_use),
+                save_imgs=args.save_imgs,
+                searchlight=args.searchlight,
+            )
+    
+            decoder._fit()
+    finally:
+        primary_failure = sys.exc_info()[0] is not None
+        if owned_config is not None:
+            try:
+                owned_config.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                if not primary_failure:
+                    raise
+                # Preserve the decoding failure if cleanup also fails.
+                try:
+                    logging.getLogger(__name__).exception("Could not remove temporary config %s", owned_config)
+                except OSError:
+                    pass
 
 
 def action_capabilities(args):
