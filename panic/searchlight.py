@@ -884,17 +884,21 @@ def permutation_searchlight(
 
         progress_start = time.monotonic()
         initial_completed = n_completed
+        last_progress_log = progress_start
 
         def record_result(result_ix, result):
-            nonlocal n_completed
+            nonlocal n_completed, last_progress_log
             checkpoint_saved = progress.record(result_ix, result)
             n_completed = progress.completed
             if isinstance(result, CenterFitFailure):
                 logger.warning('Searchlight center %d invalidated: %s; diagnostics=%s_fit_failures.csv',
                                result_ix, result.diagnostics.get('error'), base)
 
-            if n_completed % monitor_log_every == 0 or n_completed == len(centers):
-                elapsed = time.monotonic() - progress_start
+            now = time.monotonic()
+            if (checkpoint_saved or n_completed % monitor_log_every == 0
+                    or n_completed == len(centers) or now - last_progress_log >= 60):
+                last_progress_log = now
+                elapsed = now - progress_start
                 rate = (n_completed - initial_completed) / elapsed if elapsed > 0 else 0.0
                 eta_seconds = (len(centers) - n_completed) / rate if rate > 0 else float("nan")
                 logger.info(

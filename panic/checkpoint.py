@@ -23,6 +23,7 @@ class SearchlightCheckpoint:
         self.fit_guard_history = []
         self.loaded_version = None
         self.restored_count = 0
+        self._has_saved = False
         if os.path.exists(path):
             state = joblib.load(path)
             if (state.get("version") not in (1, 2)
@@ -58,7 +59,10 @@ class SearchlightCheckpoint:
         fd, temporary = None, None
         stage = 'log destination'
         try:
-            logger.info("Saving searchlight checkpoint: %s", destination)
+            if not self._has_saved:
+                logger.info("Saving searchlight checkpoint: %s", destination)
+            else:
+                logger.debug("Saving searchlight checkpoint: %s", destination)
             stage = 'create checkpoint directory'
             os.makedirs(directory, exist_ok=True)
             stage = 'create temporary file'
@@ -83,6 +87,7 @@ class SearchlightCheckpoint:
                 stage = 'close temporary file'
             stage = 'replacement'
             os.replace(temporary, destination)
+            self._has_saved = True
         except OSError as error:
             message = (f"Checkpoint save failed during {stage}; temporary={temporary!r}; "
                        f"{error.strerror or str(error)}")
