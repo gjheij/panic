@@ -693,16 +693,7 @@ def permutation_searchlight(
       *Proceedings of the National Academy of Sciences*, 103(10), 3863–3868.
     """
 
-    # config takes precedence over the presence of groups
-    if not cfg.get("permute_within_groups", False):
-        if groups is not None:
-            logger.info("Groups (or runs) were detected, but permute_within_groups=False, so ignoring groups..")
-
-        groups = None
-
-    if groups is not None:
-        logger.info(f"Groups = {groups}")
-
+    # CV grouping is independent of whether permutations stay within runs.
     if kwargs.get("save_dir") is None:
         raise ValueError("Searchlight requires an explicit persistent save_dir; tmpdir is disposable")
 
@@ -737,6 +728,14 @@ def permutation_searchlight(
         mask_settings=mask_settings,
         roi_name=roi_name,
     )
+
+    if groups is not None:
+        groups = np.asarray(groups).ravel()
+        if len(groups) != len(trial_list):
+            raise ValueError("Run groups must align with the input trial list")
+        groups = groups[mf.trial_indices]
+    elif cfg.get("permute_within_groups", False):
+        raise ValueError("Within-group permutations require run/group labels")
 
     X = mf.X.astype("float32", copy=False)
     y = np.asarray(mf.labels)

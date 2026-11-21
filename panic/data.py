@@ -1434,6 +1434,7 @@ class MaskAndFilterBetas:
         )
 
         # Filter beta images and corresponding trial names
+        self.trial_indices = np.asarray(trial_indices, dtype=int)
         X_filtered = self.betas_in_mask[trial_indices]
         filtered_trial_list = [self.trial_list[i] for i in trial_indices]
 

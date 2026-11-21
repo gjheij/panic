@@ -90,8 +90,8 @@ def run_decoding_with_permutation(
         is used when available, otherwise Python's default temporary directory.
 
     groups : array-like, optional
-        Exchangeability-group labels aligned with samples. Used only when
-        ``cfg["permute_within_groups"]`` is enabled.
+        Run/group labels aligned with selected samples, used for grouped CV.
+        They also restrict permutations when ``permute_within_groups`` is enabled.
 
     **kwargs
         Additional arguments forwarded to the selected analysis plugin.
@@ -189,31 +189,13 @@ def run_decoding_with_permutation(
         cfg.get("permute_within_groups", False)
     )
 
-    if not permute_within_groups:
-        if groups is not None:
-            logger.info(
-                "Groups were provided, but "
-                "permute_within_groups=False; ignoring groups."
-            )
-
-        groups = None
-
-    elif groups is not None:
-        groups = np.asarray(groups)
-
-        if groups.ndim != 1:
-            groups = groups.ravel()
-
+    # Groups define CV independently of the label permutation policy.
+    if groups is not None:
+        groups = np.asarray(groups).ravel()
         if len(groups) != len(labels):
-            raise ValueError(
-                "Number of group labels must match number of samples: "
-                f"{len(groups)} != {len(labels)}."
-            )
-
-        logger.info(
-            "Using %d permutation groups",
-            np.unique(groups).size,
-        )
+            raise ValueError("Number of group labels must match the selected samples")
+    elif permute_within_groups:
+        raise ValueError("Within-group permutations require run/group labels")
 
     # ---------------------------------------------------------------
     # Plugin / analysis configuration
@@ -848,7 +830,7 @@ class ClassifySubject(data.PrepareBetas):
             {"beta_file": self.gen_settings["beta_file"]}
             if "beta_file" in self.gen_settings
             else {
-                "beta_dir": opj(
+                "beta_dir": self.gen_settings.get("beta_dir") or opj(
                     self.gen_settings["project_dir"],
                     "derivatives",
                     self.gen_settings["source"],
@@ -869,6 +851,7 @@ class ClassifySubject(data.PrepareBetas):
 
         ddict = {
             "subject": self.subject,
+            "source": self.gen_settings["source"],
             **beta_input,
             **optional_inputs,
             "derivative": self.cfg.get("fitted_derivative", False),
@@ -1056,6 +1039,12 @@ class ClassifySubject(data.PrepareBetas):
             except Exception as e:
                 logger.exception("ROI extraction failed unexpectedly")
                 return self._failed_result(e), None
+
+            if groups is not None:
+                groups = np.asarray(groups).ravel()
+                if len(groups) != len(trial_list):
+                    raise ValueError("Run groups must align with the input trial list")
+                groups = groups[extract.trial_indices]
 
             # outer folds
             folds = create_outer_folds(

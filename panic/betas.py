@@ -17,6 +17,7 @@ import logging
 import os
 import re
 from os.path import join as opj
+from pathlib import Path
 from typing import Mapping
 
 import nibabel as nib
@@ -55,6 +56,7 @@ class BetaLoaderMixin:
         label_mapper=None,
         model="lsa",
         filters=None,
+        source=None,
         **kwargs,
     ):
         """Load, merge, sanitize, and align trialwise beta images.
@@ -152,7 +154,7 @@ class BetaLoaderMixin:
         usable events remain, chronological order cannot be reconstructed and the
         betas are returned in their discovered/source order.
         """
-        src = os.path.basename(os.path.normpath(beta_dir)).casefold()
+        src = str(source or os.path.basename(os.path.normpath(beta_dir))).casefold()
         subject_betas = opj(beta_dir, subject)
 
         cls._validate_beta_dir(subject_betas)
@@ -168,7 +170,17 @@ class BetaLoaderMixin:
             derivative=derivative,
         )
 
-        if src in {"halfpipe", "stglm"}:
+        manifest_loaded = False
+        if src == "glmsingle":
+            loaded = cls._load_glmsingle_manifest(beta_files, model, label_mapper)
+            if loaded is not None:
+                niimgs, trials, groups, events_df = loaded
+                manifest_loaded = True
+            if kwargs.get("standardize") in ("zscore", "range"):
+                raise ValueError("GLMsingle decoding requires general_settings.standardize: null; use the fold-fitted pipeline scaler")
+        if manifest_loaded:
+            pass
+        elif src in {"halfpipe", "stglm"}:
             niimgs, trials, groups, events_df = cls._load_statmap_betas(
                 beta_files,
                 label_mapper=label_mapper,
@@ -189,7 +201,7 @@ class BetaLoaderMixin:
         logger.info("Sanitizing beta image (remove NaN/inf and convert dtype)")
         beta_imgs, is_standardized = cls.sanitize_img(beta_imgs, **kwargs)
 
-        if not events_df.empty:
+        if not events_df.empty and not manifest_loaded:
             logger.info("Restoring chronological order of trial structure")
             target_order = events_df["trial_type"].tolist()
             reorder_idx = cls.get_reorder_indices(
@@ -420,11 +432,17 @@ class BetaLoaderMixin:
         search.extend(cls._normalize_filters(filters))
         logger.info("Search criteria: %s", search)
 
-        beta_files = utils.FindFiles(
-            subject_betas,
-            extension=".nii.gz",
-            filters=search,
-        ).files
+        if src == "glmsingle":
+            # New stGLM exports put stream entities in parent directories.
+            # Match filters against complete paths, including those entities.
+            beta_files = [str(path) for path in Path(subject_betas).rglob("*.nii.gz")
+                          if all(token in str(path) for token in search)]
+        else:
+            beta_files = utils.FindFiles(
+                subject_betas,
+                extension=".nii.gz",
+                filters=search,
+            ).files
         beta_files = cls._as_list(beta_files, name="beta-file query")
         beta_files = sorted(dict.fromkeys(beta_files))
 
@@ -597,6 +615,69 @@ class BetaLoaderMixin:
 
         events_df = cls._build_events_df(rows, run_durations, run_end_times)
         return niimgs, trials, groups, events_df
+
+    @classmethod
+    def _load_glmsingle_manifest(cls, beta_files, model, label_mapper=None):
+        """Load explicit beta identities; never infer run groups from trial order."""
+        model_name = cls._GLMSINGLE_MODELS[str(model).casefold()]
+        files = {str(Path(path).resolve()) for path in beta_files}
+        parents = {Path(path).resolve().parent for path in beta_files}
+        candidates = [parent / f"model-{model_name}_trial_manifest.tsv" for parent in parents]
+        present = [path for path in candidates if path.is_file()]
+        if not present:
+            logger.warning("Legacy GLMsingle betas have no trial manifest; grouped CV requires explicit run metadata")
+            return None
+        if len(present) != 1 or len(parents) != 1:
+            raise ValueError("Select exactly one GLMsingle analysis stream using filename filters")
+        manifest = present[0]
+        marker = manifest.parent / "fit_provenance.json"
+        provenance = json.loads(marker.read_text())
+        if provenance.get("status") != "complete":
+            raise ValueError("GLMsingle fit has no successful completion provenance")
+        frame = pd.read_csv(manifest, sep="\t", dtype=str, keep_default_na=False)
+        required = {"beta_index","beta_file","subject","session","run","run_index","trial_id","trial_type","onset","duration","model"}
+        if not required.issubset(frame.columns):
+            raise ValueError("GLMsingle trial manifest is missing required columns")
+        if frame.empty or frame.beta_file.duplicated().any() or frame.beta_index.duplicated().any() or frame.trial_id.duplicated().any():
+            raise ValueError("GLMsingle trial manifest has empty or duplicate beta/trial identities")
+        if set(frame.model) != {model_name}:
+            raise ValueError("GLMsingle manifest model does not match selected beta model")
+        frame['beta_index'] = pd.to_numeric(frame.beta_index, errors='raise')
+        frame = frame.sort_values('beta_index', kind='stable').reset_index(drop=True)
+        if frame.beta_index.tolist() != list(range(1, len(frame)+1)):
+            raise ValueError("GLMsingle beta indices are not consecutive and one-based")
+        resolved = [str((manifest.parent / value).resolve()) for value in frame.beta_file]
+        if len(set(resolved)) != len(resolved) or set(resolved) != files:
+            raise ValueError("Selected GLMsingle beta files do not exactly match the trial manifest")
+        saved = {item['path']: item for item in provenance['outputs']}
+        for path in [str(manifest.resolve()), *resolved]:
+            stat = Path(path).stat()
+            current = dict(path=path, size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+            if saved.get(path) != current:
+                raise ValueError("GLMsingle output differs from completion provenance: " + path)
+        images = [cls._load_nifti(path) for path in resolved]
+        if any(img is None or len(img.shape) != 3 for img in images):
+            raise ValueError("GLMsingle manifest refers to unreadable/non-3D beta maps")
+        reference = images[0]
+        if any(img.shape != reference.shape or not np.allclose(img.affine, reference.affine, rtol=0, atol=1e-5) for img in images):
+            raise ValueError("GLMsingle beta geometries differ")
+        frame['run_id'] = [f"ses-{ses}_run-{run}" if run else f"run-index-{index}" for ses,run,index in zip(frame.session,frame.run,frame.run_index)]
+        # Preserve run-relative timing explicitly while presenting chronological
+        # session-level time to existing PANIC trajectory code.
+        frame['onset_run'] = pd.to_numeric(frame.onset, errors='raise')
+        frame['duration'] = pd.to_numeric(frame.duration, errors='raise')
+        run_offsets = {}
+        elapsed = 0.
+        for run in provenance['run_order']:
+            tags = run['entities']
+            key = f"ses-{tags.get('ses','')}_run-{tags.get('run','')}" if tags.get('run') else f"run-index-{len(run_offsets)}"
+            run_offsets[key] = elapsed
+            elapsed += int(run['n_volumes']) * float(provenance['tr'])
+        frame['onset'] = frame.onset_run + frame.run_id.map(run_offsets)
+        if not np.isfinite(frame[['onset','duration']].to_numpy(float)).all():
+            raise ValueError("GLMsingle manifest has invalid run timing")
+        frame['label'] = frame.trial_type.map(label_mapper or {})
+        return images, frame.trial_type.tolist(), frame.run_id.tolist(), frame
 
     @classmethod
     def _load_beta_series(cls, beta_files, subject_betas, model):
