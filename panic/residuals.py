@@ -117,3 +117,71 @@ def load_roi_residuals(paths, reference_img, feature_indices, *, center_per_run=
     if not matrices:
         raise ValueError('No residual runs provided')
     return np.concatenate(matrices), np.concatenate(groups)
+
+
+class ResidualRunCache:
+    """Subject-scoped disk-backed residual cache; no full 4D arrays held in RAM.
+
+    Cache files are temporary uncompressed NumPy arrays indexed (time, voxel).
+    Construction streams NIfTI volumes in chunks, then ROI reads reuse the
+    same decompressed data. Call ``close()`` after finishing the subject.
+    """
+
+    def __init__(self, paths, reference_img, *, cache_dir=None, chunk_size=8):
+        import tempfile
+        self.paths = tuple(Path(p) for p in paths)
+        self.reference_img = reference_img
+        self.n_space = int(np.prod(reference_img.shape[:3]))
+        self._tempdir = tempfile.TemporaryDirectory(prefix='panic-residuals-', dir=cache_dir)
+        self._arrays = []
+        self._lengths = []
+        try:
+            self._build(int(chunk_size))
+        except BaseException:
+            self.close()
+            raise
+
+    def _build(self, chunk_size):
+        import nibabel as nib
+        if chunk_size < 1:
+            raise ValueError('chunk_size must be >= 1')
+        for run_i, path in enumerate(self.paths):
+            img = nib.load(str(path))
+            _check_grid(img, self.reference_img, str(path))
+            if len(img.shape) != 4:
+                raise ValueError(f'Expected 4D residual NIfTI: {path}')
+            n_time = img.shape[3]
+            out_path = Path(self._tempdir.name) / f'run-{run_i:02d}.npy'
+            out = np.lib.format.open_memmap(
+                out_path, mode='w+', dtype=np.float32,
+                shape=(n_time, self.n_space),
+            )
+            for start in range(0, n_time, chunk_size):
+                stop = min(start + chunk_size, n_time)
+                block = np.asarray(img.dataobj[..., start:stop], dtype=np.float32)
+                out[start:stop, :] = block.reshape(
+                    (self.n_space, stop - start), order='C'
+                ).T
+            out.flush()
+            del out
+            self._arrays.append(np.load(out_path, mmap_mode='r'))
+            self._lengths.append(n_time)
+
+    def extract(self, feature_indices, *, center_per_run=True):
+        idx = np.asarray(feature_indices, dtype=int)
+        if idx.ndim != 1 or idx.size == 0 or np.any(idx < 0) or np.any(idx >= self.n_space):
+            raise ValueError('Invalid beta feature indices')
+        matrices, groups = [], []
+        for run_i, array in enumerate(self._arrays):
+            r = np.asarray(array[:, idx], dtype=np.float64)
+            if not np.isfinite(r).all():
+                raise ValueError(f'Nonfinite residuals in selected voxels: {self.paths[run_i]}')
+            if center_per_run:
+                r -= r.mean(axis=0, keepdims=True)
+            matrices.append(r)
+            groups.append(np.full(r.shape[0], run_i, dtype=int))
+        return np.concatenate(matrices), np.concatenate(groups)
+
+    def close(self):
+        self._arrays.clear()
+        self._tempdir.cleanup()

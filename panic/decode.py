@@ -288,19 +288,12 @@ def run_decoding_with_permutation(
             )
             raise
 
-        if score_name == "rsa":
-            logger.info(
-                "RSA observed (whole dataset; %d run partitions; outer folds unused): %.4f",
-                len(np.unique(groups)) if groups is not None else 0,
-                observed_score,
-            )
-        else:
-            logger.info(
-                "%s observed after %d folds: %.4f",
-                score_name,
-                len(folds),
-                observed_score,
-            )
+        logger.info(
+            "%s observed after %d folds: %.4f",
+            score_name,
+            len(folds),
+            observed_score,
+        )
 
         # -----------------------------------------------------------
         # Save plugin-specific observed artifacts
@@ -1036,7 +1029,13 @@ class ClassifySubject(data.PrepareBetas):
                 beta_dir=self.gen_settings["beta_dir"],
                 subject=self.subject, run_ids=groups,
             )
-            valid = residual_io.common_valid_mask(residual_paths, betas)
+            # A single subject shares the same residual-valid voxels across ROIs.
+            cache_key = (tuple(map(str, residual_paths)), tuple(betas.shape[:3]),
+                         tuple(np.asarray(betas.affine).ravel()))
+            if getattr(self, "_rsa_valid_mask_key", None) != cache_key:
+                self._rsa_valid_mask = residual_io.common_valid_mask(residual_paths, betas)
+                self._rsa_valid_mask_key = cache_key
+            valid = self._rsa_valid_mask
             if mask is None:
                 raise ValueError("Residual-whitened RSA requires an ROI mask")
             mask = residual_io.restrict_roi_mask(mask, valid, betas)
@@ -1085,20 +1084,36 @@ class ClassifySubject(data.PrepareBetas):
                 groups = groups[extract.trial_indices]
 
             if residual_paths is not None:
-                residual_matrix, residual_run_ids = residual_io.load_roi_residuals(
-                    residual_paths, betas, extract.roi_linidx,
-                    center_per_run=residual_settings.get("center_per_run", True),
-                )
+                if residual_settings.get("cache", True):
+                    # One decompression per run per subject, reused across ROIs.
+                    cache = getattr(self, "_rsa_residual_cache", None)
+                    if getattr(self, "_rsa_residual_cache_key", None) != cache_key:
+                        if cache is not None:
+                            cache.close()
+                        cache_parent = getattr(self, "_tmp_dir", None)
+                        if cache_parent is not None:
+                            os.makedirs(cache_parent, exist_ok=True)
+                        cache = residual_io.ResidualRunCache(
+                            residual_paths, betas,
+                            cache_dir=cache_parent,
+                            chunk_size=residual_settings.get("cache_chunk_size", 8),
+                        )
+                        self._rsa_residual_cache = cache
+                        self._rsa_residual_cache_key = cache_key
+                        logger.info("RSA residual cache initialized: %d runs | directory=%s",
+                                    len(residual_paths), cache._tempdir.name)
+                    residual_matrix, residual_run_ids = cache.extract(
+                        extract.roi_linidx,
+                        center_per_run=residual_settings.get("center_per_run", True),
+                    )
+                else:
+                    residual_matrix, residual_run_ids = residual_io.load_roi_residuals(
+                        residual_paths, betas, extract.roi_linidx,
+                        center_per_run=residual_settings.get("center_per_run", True),
+                    )
                 if residual_matrix.shape[1] != extract.X.shape[1]:
                     raise ValueError("Beta and residual feature counts differ")
                 # Residual rows are grouped independently from trial-beta rows.
-                logger.info(
-                    "RSA GLMsingle residuals: %d/%d runs loaded | matrix=%s "
-                    "| beta features=%d | normalization=%s",
-                    len(residual_paths), len(np.unique(groups)),
-                    residual_matrix.shape, extract.X.shape[1],
-                    self.dec_settings["analysis"]["args"]["noise_normalization"],
-                )
                 kwargs["noise_residuals"] = residual_matrix
 
             # outer folds
@@ -1494,9 +1509,7 @@ class ClassifySubject(data.PrepareBetas):
                     trial_list=self.trial_list,
                     label_mapper=self.cfg["label_dict"],
                     output_file=fname,
-                    save_dir=(opj(roi_dir, f"hemi-{hemi_label}")
-                              if self.analysis_type == "rsa" and not self.searchlight
-                              else roi_dir),
+                    save_dir=roi_dir,
                     tmpdir=getattr(self, "_tmp_dir", self.gen_settings.get("tmp_dir")),
                     hemi_key=h_key,
                     roi_name=erosion_name,
