@@ -1024,6 +1024,8 @@ class ClassifySubject(data.PrepareBetas):
                 raise ValueError("Residual-whitened crossnobis requires run groups")
             if not isinstance(residual_settings, dict):
                 raise ValueError("residual_settings must be a mapping")
+            beta_run_ids = residual_io.resolve_run_numbers(residual_settings, groups)
+            logger.info("RSA beta acquisition runs: %s", beta_run_ids)
             residual_paths = residual_io.residual_paths(
                 residual_settings,
                 beta_dir=self.gen_settings["beta_dir"],
@@ -1038,7 +1040,28 @@ class ClassifySubject(data.PrepareBetas):
             valid = self._rsa_valid_mask
             if mask is None:
                 raise ValueError("Residual-whitened RSA requires an ROI mask")
-            mask = residual_io.restrict_roi_mask(mask, valid, betas)
+            try:
+                mask = residual_io.restrict_roi_mask(mask, valid, betas)
+            except ValueError as exc:
+                if str(exc) != 'No ROI voxels survive the common residual-valid mask':
+                    raise
+                qc = residual_io.residual_mask_qc(mask, residual_paths, betas)
+                logger.warning(
+                    "Skipping residual-invalid ROI: subject=%s roi=%s hemi=%s "
+                    "roi_voxels=%d common_overlap=%d",
+                    self.subject, roi_name, kwargs.get('hemi_key', 'unknown'),
+                    qc['roi_voxels'], qc['intersection'],
+                )
+                for path, nvalid, overlap in qc['per_run']:
+                    logger.warning("Residual-valid run QC: file=%s valid=%d roi_overlap=%d",
+                                   path, nvalid, overlap)
+                result = self._failed_result(exc)
+                result.update(status='skipped', reason_code='no_residual_valid_voxels',
+                              n_features=0, roi_metrics={
+                                  'residual_roi_voxels': qc['roi_voxels'],
+                                  'residual_common_overlap': qc['intersection'],
+                              })
+                return result, None
 
         # standard ROI analysis
         if not self.searchlight:
@@ -1113,7 +1136,15 @@ class ClassifySubject(data.PrepareBetas):
                     )
                 if residual_matrix.shape[1] != extract.X.shape[1]:
                     raise ValueError("Beta and residual feature counts differ")
-                # Residual rows are grouped independently from trial-beta rows.
+                # Run IDs for beta trials are preserved by extraction indexing;
+                # residual rows are ordered by the same sorted acquisition IDs.
+                if set(np.unique(groups).tolist()) != set(beta_run_ids):
+                    raise ValueError(
+                        f'Extracted beta runs {np.unique(groups).tolist()} do not match '
+                        f'residual acquisition runs {beta_run_ids}'
+                    )
+                logger.info("RSA residual-to-beta run matching: beta=%s residual=%s",
+                            np.unique(groups).tolist(), beta_run_ids)
                 kwargs["noise_residuals"] = residual_matrix
 
             # outer folds

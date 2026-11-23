@@ -11,21 +11,45 @@ DEFAULT_PATTERN = ("{beta_dir}/{subject}/task-aversivechoice_space-T1w_desc-mask
                    "space-T1w_model-typed_desc-fullnuisance_residuals.nii.gz")
 
 
-def residual_paths(settings, *, beta_dir, subject, run_ids):
-    """Resolve run NIfTIs. Sorted group IDs map to BIDS run numbers 1..N.
+def resolve_run_numbers(settings, run_ids):
+    """Resolve BIDS acquisition runs from beta trial groups without renumbering.
 
-    For nonconsecutive acquisition runs, supply ``run_numbers`` explicitly.
+    GLMsingle beta loader parses run-XX into integer groups. Explicit run_numbers
+    is allowed only when it matches those actual IDs; silent remapping is unsafe.
     """
+    ids = np.asarray(run_ids).ravel()
+    if not ids.size:
+        raise ValueError('Cannot resolve residual runs: beta groups are empty')
+    try:
+        numbers = [int(x) for x in np.unique(ids)]
+    except (TypeError, ValueError) as exc:
+        raise ValueError('Beta run groups must contain BIDS numeric acquisition run IDs') from exc
+    if any(str(raw).strip() not in (str(int(raw)), f'{int(raw):02d}') for raw in ids):
+        raise ValueError('Beta run groups must be numeric run IDs, not fold/session labels')
+    if any(x < 1 for x in numbers):
+        raise ValueError(f'Invalid BIDS acquisition run IDs: {numbers}')
+    configured = settings.get('run_numbers', 'auto')
+    if configured is not None and configured != 'auto':
+        configured = [int(x) for x in configured]
+        if len(set(configured)) != len(configured) or set(configured) != set(numbers):
+            raise ValueError(
+                f'residual_settings.run_numbers={configured} does not match '
+                f'actual beta acquisition runs={numbers}; use run_numbers: auto'
+            )
+    return numbers
+
+
+def residual_paths(settings, *, beta_dir, subject, run_ids):
+    """Resolve residual paths in sorted *actual* beta acquisition-run order."""
     pattern = settings.get('path_pattern', DEFAULT_PATTERN)
-    ids = list(np.unique(run_ids))
-    numbers = settings.get('run_numbers', list(range(1, len(ids) + 1)))
-    if len(numbers) != len(ids):
-        raise ValueError('residual_settings.run_numbers must match the number of runs')
+    numbers = resolve_run_numbers(settings, run_ids)
     paths = []
     for run in numbers:
-        path = Path(pattern.format(beta_dir=beta_dir, subject=subject, run=int(run)))
+        path = Path(pattern.format(beta_dir=beta_dir, subject=subject, run=run))
         if not path.is_file():
-            raise FileNotFoundError(f'GLMsingle residual file missing: {path}')
+            raise FileNotFoundError(
+                f'GLMsingle residual missing for beta acquisition run-{run:02d}: {path}'
+            )
         paths.append(path)
     return paths
 
@@ -59,6 +83,26 @@ def common_valid_mask(paths, reference_img):
         _check_grid(img, reference_img, str(mask_path))
         valid &= np.asarray(img.dataobj) > 0
     return valid
+
+
+def residual_mask_qc(mask_img, paths, reference_img):
+    """Report native ROI overlap with each run's validity mask and their intersection."""
+    import nibabel as nib
+    from nilearn.image import resample_to_img
+    aligned = resample_to_img(mask_img, reference_img, interpolation='nearest',
+                              copy_header=True, force_resample=True)
+    roi = np.asarray(aligned.dataobj) > 0
+    intersection = roi.copy()
+    per_run = []
+    for path in paths:
+        img = nib.load(str(valid_mask_path(path)))
+        _check_grid(img, reference_img, str(path))
+        valid = np.asarray(img.dataobj) > 0
+        overlap = int(np.count_nonzero(roi & valid))
+        per_run.append((str(path), int(np.count_nonzero(valid)), overlap))
+        intersection &= valid
+    return {'roi_voxels': int(np.count_nonzero(roi)),
+            'intersection': int(np.count_nonzero(intersection)), 'per_run': per_run}
 
 
 def restrict_roi_mask(mask_img, valid, reference_img):
