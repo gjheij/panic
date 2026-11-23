@@ -14,6 +14,7 @@ from joblib import Parallel, delayed, dump, parallel_config
 
 from panic.result_store import merge_result_tables, write_qc_rows, write_dataframe_csv
 from panic.tsnr import TsnrQC
+from panic import residuals as residual_io
 from panic import data
 from panic.masking import normalize_mask_settings, mask_erosion_request, erosion_policy_matches
 from panic.pipeline import create_outer_folds, cv_permutation_policy
@@ -1003,6 +1004,36 @@ class ClassifySubject(data.PrepareBetas):
         - If ``permute_within_groups=True``, groups must be provided.
         """
 
+        # Optional residual-whitened RSA: constrain ROI features to voxels
+        # valid in every run *before* beta extraction.
+        residual_paths = None
+        residual_settings = self.cfg.get("residual_settings", {})
+        use_residuals = (
+            self.analysis_type == "rsa"
+            and self.dec_settings.get("analysis", {}).get("args", {}).get(
+                "metric") == "crossnobis"
+            and self.dec_settings.get("analysis", {}).get("args", {}).get(
+                "noise_normalization", "identity") != "identity"
+        )
+        if use_residuals:
+            if self.searchlight:
+                raise NotImplementedError(
+                    "Residual-whitened RSA currently supports ROI analysis only"
+                )
+            if groups is None:
+                raise ValueError("Residual-whitened crossnobis requires run groups")
+            if not isinstance(residual_settings, dict):
+                raise ValueError("residual_settings must be a mapping")
+            residual_paths = residual_io.residual_paths(
+                residual_settings,
+                beta_dir=self.gen_settings["beta_dir"],
+                subject=self.subject, run_ids=groups,
+            )
+            valid = residual_io.common_valid_mask(residual_paths, betas)
+            if mask is None:
+                raise ValueError("Residual-whitened RSA requires an ROI mask")
+            mask = residual_io.restrict_roi_mask(mask, valid, betas)
+
         # standard ROI analysis
         if not self.searchlight:
 
@@ -1045,6 +1076,16 @@ class ClassifySubject(data.PrepareBetas):
                 if len(groups) != len(trial_list):
                     raise ValueError("Run groups must align with the input trial list")
                 groups = groups[extract.trial_indices]
+
+            if residual_paths is not None:
+                residual_matrix, residual_run_ids = residual_io.load_roi_residuals(
+                    residual_paths, betas, extract.roi_linidx,
+                    center_per_run=residual_settings.get("center_per_run", True),
+                )
+                if residual_matrix.shape[1] != extract.X.shape[1]:
+                    raise ValueError("Beta and residual feature counts differ")
+                # Residual rows are grouped independently from trial-beta rows.
+                kwargs["noise_residuals"] = residual_matrix
 
             # outer folds
             folds = create_outer_folds(
