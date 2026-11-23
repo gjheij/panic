@@ -288,12 +288,19 @@ def run_decoding_with_permutation(
             )
             raise
 
-        logger.info(
-            "%s observed after %d folds: %.4f",
-            score_name,
-            len(folds),
-            observed_score,
-        )
+        if score_name == "rsa":
+            logger.info(
+                "RSA observed (whole dataset; %d run partitions; outer folds unused): %.4f",
+                len(np.unique(groups)) if groups is not None else 0,
+                observed_score,
+            )
+        else:
+            logger.info(
+                "%s observed after %d folds: %.4f",
+                score_name,
+                len(folds),
+                observed_score,
+            )
 
         # -----------------------------------------------------------
         # Save plugin-specific observed artifacts
@@ -1085,6 +1092,13 @@ class ClassifySubject(data.PrepareBetas):
                 if residual_matrix.shape[1] != extract.X.shape[1]:
                     raise ValueError("Beta and residual feature counts differ")
                 # Residual rows are grouped independently from trial-beta rows.
+                logger.info(
+                    "RSA GLMsingle residuals: %d/%d runs loaded | matrix=%s "
+                    "| beta features=%d | normalization=%s",
+                    len(residual_paths), len(np.unique(groups)),
+                    residual_matrix.shape, extract.X.shape[1],
+                    self.dec_settings["analysis"]["args"]["noise_normalization"],
+                )
                 kwargs["noise_residuals"] = residual_matrix
 
             # outer folds
@@ -1480,7 +1494,9 @@ class ClassifySubject(data.PrepareBetas):
                     trial_list=self.trial_list,
                     label_mapper=self.cfg["label_dict"],
                     output_file=fname,
-                    save_dir=roi_dir,
+                    save_dir=(opj(roi_dir, f"hemi-{hemi_label}")
+                              if self.analysis_type == "rsa" and not self.searchlight
+                              else roi_dir),
                     tmpdir=getattr(self, "_tmp_dir", self.gen_settings.get("tmp_dir")),
                     hemi_key=h_key,
                     roi_name=erosion_name,
