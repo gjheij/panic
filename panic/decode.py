@@ -1462,6 +1462,11 @@ class ClassifySubject(data.PrepareBetas):
                     model_src_dir,
                     f"roi-{roi_label}",
                 )
+                # ROI-level RSA artifacts have hemisphere-agnostic filenames.
+                # Keep each hemisphere in a separate directory to prevent
+                # silent overwriting; preserve searchlight's existing layout.
+                if not self.searchlight:
+                    roi_dir = opj(roi_dir, f"hemi-{hemi_label}")
 
                 # Searchlight completion check
                 if self.searchlight:
