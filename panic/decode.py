@@ -16,6 +16,7 @@ from panic.result_store import merge_result_tables, write_qc_rows, write_datafra
 from panic.tsnr import TsnrQC
 from panic import residuals as residual_io
 from panic import data
+from panic.cache import SubjectCache
 from panic.masking import normalize_mask_settings, mask_erosion_request, erosion_policy_matches
 from panic.pipeline import create_outer_folds, cv_permutation_policy
 from panic.utils import (
@@ -162,7 +163,7 @@ def run_decoding_with_permutation(
             f"X.shape[0]={X.shape[0]} != len(labels)={len(labels)}."
         )
 
-    if not folds:
+    if not folds and cfg.get("analysis", {}).get("type") != "rsa":
         raise ValueError("No outer cross-validation folds were provided.")
 
     # ---------------------------------------------------------------
@@ -240,7 +241,7 @@ def run_decoding_with_permutation(
         prefix="panic_",
     ) as tmpd, parallel_config(temp_folder=tmpd):
 
-        X_path = dump(
+        X_path = X if score_name == "rsa" and (not do_permutations or int(cfg.get("n_permutations", 1000)) == 0) else dump(
             X,
             os.path.join(
                 tmpd,
@@ -288,12 +289,11 @@ def run_decoding_with_permutation(
             )
             raise
 
-        logger.info(
-            "%s observed after %d folds: %.4f",
-            score_name,
-            len(folds),
-            observed_score,
-        )
+        if score_name == "rsa":
+            logger.info("RSA observed (whole dataset; %d acquisition partitions): %.4f",
+                        len(np.unique(groups)) if groups is not None else 0, observed_score)
+        else:
+            logger.info("%s observed after %d folds: %.4f", score_name, len(folds), observed_score)
 
         # -----------------------------------------------------------
         # Save plugin-specific observed artifacts
@@ -741,6 +741,7 @@ class ClassifySubject(data.PrepareBetas):
         try:
             # load betas
             self._init_betas()
+            self._subject_cache = SubjectCache()
 
             # decode hemispheres
             set_kwargs = {
@@ -764,6 +765,7 @@ class ClassifySubject(data.PrepareBetas):
                 pass
             raise
         finally:
+            self._subject_cache = None
             cache = getattr(self, "_rsa_residual_cache", None)
             if cache is not None:
                 try:
@@ -1086,6 +1088,7 @@ class ClassifySubject(data.PrepareBetas):
                     mask_settings=getattr(self, "mask_settings", {}),
                     roi_name=roi_name,
                     tsnr_qc=getattr(self, "tsnr_qc", None),
+                    subject_cache=getattr(self, "_subject_cache", None),
                 )
             except EmptyMaskError as e:
                 logger.warning("ROI extraction skipped [%s]: %s", type(e).__name__, e)
@@ -1160,7 +1163,7 @@ class ClassifySubject(data.PrepareBetas):
                 kwargs["noise_residuals"] = residual_matrix
 
             # outer folds
-            folds = create_outer_folds(
+            folds = [] if self.analysis_type == "rsa" else create_outer_folds(
                 self.dec_settings,
                 extract.labels,
                 groups=groups
@@ -1588,7 +1591,8 @@ class ClassifySubject(data.PrepareBetas):
                         results_dict,
                         extracted=extracted,
                         ddict=ddict,
-                        groups=self.groups,
+                        groups=(np.asarray(self.groups)[extracted.trial_indices]
+                                if self.groups is not None and extracted is not None else None),
                     )
 
                     results.append(results_dict)
@@ -1894,10 +1898,8 @@ class ClassifySubject(data.PrepareBetas):
         # Group information
         if (
             groups is not None
-            and self.dec_settings.get(
-                "permute_within_groups",
-                False,
-            )
+            and (self.analysis_type == "rsa" or self.dec_settings.get(
+                "permute_within_groups", False))
         ):
             groups = np.asarray(groups)
 
@@ -1959,6 +1961,7 @@ class ClassifySubject(data.PrepareBetas):
             roi_labels=roi_labels,
             roi_name=roi_name,
             project_dir=self.gen_settings["project_dir"],
+            subject_cache=getattr(self, "_subject_cache", None),
             **self.roi_settings
         )
 

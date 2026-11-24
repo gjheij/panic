@@ -149,7 +149,7 @@ class TsnrQC:
                 else:
                     img = self.loader(path)
                 if acquisition_entities(path).get('desc') == 'betagrid':
-                    reference = tsnr_metadata(path)['ReferenceGrid']
+                    reference = self.metadata[path]['ReferenceGrid']
                     def matches_grid(image):
                         return (list(image.shape[:3]) == reference['Shape']
                                 and np.asarray(reference['Affine']).shape == (4, 4)
@@ -172,7 +172,8 @@ class TsnrQC:
         mask = np.asarray(mask_img.get_fdata()) > .5
         if mask.ndim != 3:
             raise ValueError('tSNR QC requires a 3D final ROI mask')
-        size = int(mask.sum())
+        indices = np.flatnonzero(mask.ravel())
+        size = len(indices)
         rows = []
         for unit in self.units:
             entities, paths = unit['entities'], unit['files']
@@ -198,7 +199,7 @@ class TsnrQC:
                 if error:
                     row.update(tsnr_status='invalid', tsnr_error=error)
                 else:
-                    selected = values[mask & valid]
+                    selected = values.ravel()[indices[valid.ravel()[indices]]]
                     count = int(selected.size)
                     row.update(tsnr_n_voxels=count, tsnr_coverage=count / size,
                                tsnr_status=('ok' if count == size else 'partial') if count else 'no_overlap')

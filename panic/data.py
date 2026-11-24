@@ -122,8 +122,10 @@ class PrepareROIs:
             roi_base="hippo-amygdala",
             src="freesurfer",
             extension="mgz",
+            subject_cache=None,
         ):
         
+        self.subject_cache = subject_cache
         self.subject = subject
         self.project_dir = project_dir
         self.roi_dir = roi_dir
@@ -484,30 +486,33 @@ class PrepareROIs:
         
         logger.info(f"Loading masks from '{mask_dir}'")
 
-        all_masks = utils.FindFiles(
-            mask_dir,
-            extension=self.extension,
-            maxdepth=0,
-        ).files
-
-        if isinstance(all_masks, str):
-            all_masks = [all_masks]
-
-        masks = self._prefer_specific_matches(
-            all_masks,
-            self.roi_src,
-        )
+        key = (str(mask_dir), self.extension, self.roi_src)
+        cache = self.subject_cache
+        if cache is not None and key in cache.discovery:
+            masks = cache.discovery[key]
+        else:
+            all_masks = utils.FindFiles(mask_dir, extension=self.extension, maxdepth=0).files
+            if isinstance(all_masks, str):
+                all_masks = [all_masks]
+            masks = self._prefer_specific_matches(all_masks, self.roi_src)
+            if cache is not None:
+                cache.discovery[key] = masks
 
         return_masks = {}
         for ix, m in enumerate(masks, start=1):
             logger.info(f" #{ix}: {m}")
             # Create a binary mask from labeled mgz
-            tmp_mask = self.select_labels_from_mgh(
-                input_file=m,
-                labels=self.roi_labels,
-                mode="nifti",
-                binary=True,
-            )
+            if cache is not None:
+                seg, affine = cache.segmentation(m, self._sanitize)
+                labels = np.asarray(sorted(set(int(l) for l in self.roi_labels)), dtype=np.int32)
+                tmp_mask = nib.Nifti1Image(np.isin(seg, labels).astype(np.uint8), affine)
+            else:
+                tmp_mask = self.select_labels_from_mgh(
+                    input_file=m,
+                    labels=self.roi_labels,
+                    mode="nifti",
+                    binary=True,
+                )
 
             lbl, roi_n = self._fetch_key(m, roi_name=self.roi_name)
             return_masks[lbl] = [roi_n, tmp_mask]
@@ -1304,9 +1309,11 @@ class MaskAndFilterBetas:
             trial_list=None,
             label_mapper=None,
             tsnr_qc=None,
+            subject_cache=None,
             **kwargs
         ):
         
+        self.subject_cache = subject_cache
         self.betas = betas
         self.mask = mask
         self.trial_list = trial_list
@@ -1623,7 +1630,10 @@ class MaskAndFilterBetas:
         logger.info(f"Identifying valid voxels (var>{var_thr})")
         B = self.betas.get_fdata(dtype=np.float32)
 
-        support = beta_support_mask(B, variance_threshold=var_thr)
+        if self.subject_cache is not None and zooms is None:
+            support = self.subject_cache.support(self.betas, B, var_thr)
+        else:
+            support = beta_support_mask(B, variance_threshold=var_thr)
 
         support_img = image.new_img_like(
             self.mask_resampled_to_betas,
@@ -1723,16 +1733,14 @@ class MaskAndFilterBetas:
             "Extract betas with resampled/validated mask"
         )
 
-        masker = maskers.NiftiMasker(
-            mask_img=self.fov_mask,
-            dtype="float32",
-            **masker_kws,
-        )
-
-        X = masker.fit_transform(
-            self.betas,
-            **fit_kws,
-        )
+        if (self.subject_cache is not None and not masker_kws and not fit_kws
+                and zooms is None and tuple(self.fov_mask.shape) == tuple(B.shape[:3])
+                and np.array_equal(self.fov_mask.affine, self.betas.affine)):
+            logger.info("Direct beta extraction on validated grid")
+            X = np.ascontiguousarray(B[roi_mask_data, :].T)
+        else:
+            masker = maskers.NiftiMasker(mask_img=self.fov_mask, dtype="float32", **masker_kws)
+            X = masker.fit_transform(self.betas, **fit_kws)
 
         # Strong consistency check.
         if X.shape[1] != len(roi_linidx):

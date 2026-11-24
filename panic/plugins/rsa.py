@@ -212,7 +212,7 @@ def _precision_matrix(n_features: int, noise_normalization: str,
         return np.diag(1.0 / variances)
     started = perf_counter()
     logger.debug("RSA Ledoit-Wolf fitting: residuals=%s", noise_residuals.shape)
-    estimator = LedoitWolf(assume_centered=True).fit(noise_residuals)
+    estimator = LedoitWolf(assume_centered=True, store_precision=False).fit(noise_residuals)
     covariance = estimator.covariance_
     logger.debug("RSA covariance fitted: shrinkage=%.6g elapsed=%.3fs",
                  estimator.shrinkage_, perf_counter() - started)
