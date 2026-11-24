@@ -164,3 +164,39 @@ def write_qc_rows(path, rows, hemi_key='hemi'):
         columns = list(dict.fromkeys(columns + [key for row in rows for key in row]))
         retained = [row for row in existing if tuple(row.get(key, '') for key in keys) not in scope]
         _atomic(path, columns, retained + rows)
+
+
+def primary_row_identity(result):
+    """Identify the scalar null distribution without duplicating its draws."""
+    keys = result.get('plugin_row_keys', ())
+    primary = result.get('plugin_primary_key')
+    return dict(zip(keys, primary)) if primary is not None else {}
+
+
+def expand_result_rows(base, result):
+    """Broadcast QC, never broadcast scalar inference to secondary rows."""
+    import json
+    rows = result.get('plugin_rows')
+    if rows is None:
+        return [dict(base, observed=base['observed_acc'])]
+    keys = result['plugin_row_keys']
+    primary = result['plugin_primary_key']
+    reserved = set(base) | {'is_primary', 'plugin_row_keys', 'perm', 'acc'}
+    expanded = []
+    for row in rows:
+        collisions = reserved.intersection(row)
+        if collisions:
+            raise ValueError(f'Plugin columns collide with core columns: {sorted(collisions)}')
+        is_primary = tuple(row[k] for k in keys) == primary
+        out = dict(base, **row)
+        out['observed_acc'] = row['observed']
+        out['is_primary'] = is_primary
+        out['plugin_row_keys'] = json.dumps(keys)
+        if not is_primary:
+            for name in ('null_mean', 'delta', 'p_value'):
+                out[name] = float('nan')
+            for name in ('n_perms', 'n_run'):
+                if name in out:
+                    out[name] = 0
+        expanded.append(out)
+    return expanded

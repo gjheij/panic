@@ -159,6 +159,8 @@ import numpy as np
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
+from .result import PluginResult, normalize_plugin_result
+
 from .decoding import (
     decoding_plugin,
     vanilla_nearest_centroid_plugin,
@@ -175,7 +177,7 @@ opj = os.path.join
 ArrayLike = Union[np.ndarray, Any]
 PathLike = Union[str, os.PathLike[str], Path]
 ArtifactDict = Dict[str, np.ndarray]
-PluginReturn = Union[float, Tuple[float, ArtifactDict]]
+PluginReturn = Union[float, Tuple[float, ArtifactDict], PluginResult]
 PluginCallable = Callable[..., PluginReturn]
 
 
@@ -335,11 +337,8 @@ def unpack_plugin_result(result: PluginReturn) -> Tuple[float, ArtifactDict]:
     artifacts : dict
         Artifact dictionary. Empty when the plugin returned only a scalar.
     """
-    if isinstance(result, tuple) and len(result) == 2:
-        score, artifacts = result
-        return float(score), dict(artifacts)
-
-    return float(result), {}
+    normalized = normalize_plugin_result(result)
+    return normalized.score, normalized.artifacts
 
 
 def save_analysis_artifacts(

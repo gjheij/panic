@@ -39,6 +39,7 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.covariance import LedoitWolf
 
 from panic.utils import load_feature_matrix
+from .result import PluginResult
 
 # PANIC configures root handlers and subject context centrally.
 # get_logger() would reinitialize those handlers, so do not call it here.
@@ -47,7 +48,7 @@ logger = logging.getLogger(__name__)
 ArrayLike = Union[np.ndarray, Any]
 PathLike = Union[str, os.PathLike[str], Path]
 ArtifactDict = Dict[str, np.ndarray]
-PluginReturn = Union[float, Tuple[float, ArtifactDict]]
+PluginReturn = Union[float, Tuple[float, ArtifactDict], PluginResult]
 
 
 def estimate_beta_noise_covariance(
@@ -554,4 +555,11 @@ def rsa_plugin(
         artifacts["rsa_model_scores"] = np.asarray(list(model_scores.values()), dtype=float)
         for name, mat in model_mats.items():
             artifacts[f"rsa_model_rdm_{name}"] = mat
-    return score, artifacts
+    if not model_scores:
+        return score, artifacts
+    rows = [dict(model=str(name), observed=float(value), metric=metric,
+                 compare=compare, noise_normalization=noise_normalization,
+                 rsa_n_finite_pairs=int(np.isfinite(neural_vec).sum()),
+                 rsa_n_negative_pairs=int((neural_vec < 0).sum()))
+            for name, value in model_scores.items()]
+    return PluginResult(score, artifacts, rows, ("model",), (str(target_model),))

@@ -12,7 +12,7 @@ import tempfile, uuid
 from tqdm import tqdm
 from joblib import Parallel, delayed, dump, parallel_config
 
-from panic.result_store import merge_result_tables, write_qc_rows, write_dataframe_csv
+from panic.result_store import merge_result_tables, write_qc_rows, write_dataframe_csv, expand_result_rows, primary_row_identity
 from panic.tsnr import TsnrQC
 from panic import residuals as residual_io
 from panic import data
@@ -277,9 +277,8 @@ def run_decoding_with_permutation(
                 **kwargs,
             )
 
-            observed_score, artifacts = (
-                core.unpack_plugin_result(result)
-            )
+            result = core.normalize_plugin_result(result)
+            observed_score, artifacts = result.score, result.artifacts
 
         except NoFeaturesSelectedError as exc:
             logger.warning(
@@ -494,6 +493,9 @@ def run_decoding_with_permutation(
         return {
             "analysis": score_name,
             "observed": float(observed_score),
+            "plugin_rows": result.rows,
+            "plugin_row_keys": result.row_keys,
+            "plugin_primary_key": result.primary_key,
             "permuted": permuted,
             "mean_permuted": mean_permuted,
             "delta": delta,
@@ -1595,7 +1597,7 @@ class ClassifySubject(data.PrepareBetas):
                                 if self.groups is not None and extracted is not None else None),
                     )
 
-                    results.append(results_dict)
+                    results.extend(expand_result_rows(results_dict, ddict))
                     for row in (getattr(extracted, "tsnr_rows", []) if extracted is not None else ddict.get("tsnr_rows", [])):
                         tsnr_rows.append({"subject":self.subject, "analysis":self.analysis_name,
                             "analysis_id":self.analysis_id, "batch_job_id":self.gen_settings.get("batch_job_id", ""),
@@ -1610,6 +1612,7 @@ class ClassifySubject(data.PrepareBetas):
                             "batch_job_id": self.gen_settings.get("batch_job_id", ""),
                             "roi": roi_label,
                             hemi_key: hemi_label,
+                            **primary_row_identity(ddict),
                             "perm": i,
                             "acc": float(a),
                             "source": source,

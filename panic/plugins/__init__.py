@@ -1,3 +1,4 @@
+from .result import PluginResult, normalize_plugin_result
 from .core import (
     get_analysis_plugin,
     unpack_plugin_result,
@@ -10,6 +11,7 @@ from .similarity import cosine_similarity_plugin
 from .dimensionality import dimensionality_plugin
 
 __all__ = [
+    "PluginResult", "normalize_plugin_result",
     "get_analysis_plugin",
     "unpack_plugin_result",
     "save_analysis_artifacts",
