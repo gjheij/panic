@@ -489,7 +489,7 @@ def rsa_plugin(
         residuals = None
         if noise_residuals is not None and noise_normalization != "identity":
             residuals = _load_noise_residuals(noise_residuals, cols, X.shape[1])
-        logger.log(log_level, "RSA crossnobis: normalization=%s residuals=%s min_partitions=%d normalize_by_features=%s",
+        logger.log(log_level, "RSA crossnobis: normalization=%s | residuals=%s | min_partitions=%d | normalize_by_features=%s",
                    noise_normalization, None if residuals is None else residuals.shape,
                    min_partitions, normalize_by_features)
         neural_rdm, pair_counts, trial_counts, run_patterns = crossnobis_rdm(
@@ -506,10 +506,10 @@ def rsa_plugin(
 
     neural_vec = _rdm_vector(neural_rdm)
     if logger.isEnabledFor(log_level):
-        logger.log(log_level, "RSA RDM: finite_pairs=%d/%d negative_pairs=%d",
+        logger.log(log_level, "RSA RDM: finite_pairs=%d/%d | negative_pairs=%d",
                    np.isfinite(neural_vec).sum(), neural_vec.size, (neural_vec < 0).sum())
         if trial_counts is not None:
-            logger.log(log_level, "RSA partition QC: missing_run_condition_cells=%d/%d ordered_pair_counts=%s",
+            logger.log(log_level, "RSA partition QC: missing_run_condition_cells=%d/%d | ordered_pair_counts=%s",
                        (trial_counts == 0).sum(), trial_counts.size,
                        np.unique(_rdm_vector(pair_counts)).astype(int).tolist())
     model_scores: Dict[str, float] = {}
@@ -535,7 +535,7 @@ def rsa_plugin(
             )
         score = float(model_scores[target_model])
 
-    logger.log(log_level, "RSA complete: target=%s score=%.6g models=%s elapsed=%.3fs",
+    logger.log(log_level, "RSA complete: target=%s | score=%.6g | models=%s | elapsed=%.3fs",
                target_model, score, model_scores, perf_counter() - started)
     if not return_artifacts:
         return score

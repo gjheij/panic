@@ -763,6 +763,16 @@ class ClassifySubject(data.PrepareBetas):
             except OSError:
                 pass
             raise
+        finally:
+            cache = getattr(self, "_rsa_residual_cache", None)
+            if cache is not None:
+                try:
+                    cache.close()
+                except OSError:
+                    logger.exception("RSA residual cache cleanup failed")
+                finally:
+                    self._rsa_residual_cache = None
+                    self._rsa_residual_cache_key = None
 
 
     def _init_betas(self, **kwargs):
@@ -1113,9 +1123,11 @@ class ClassifySubject(data.PrepareBetas):
                     if getattr(self, "_rsa_residual_cache_key", None) != cache_key:
                         if cache is not None:
                             cache.close()
-                        cache_parent = getattr(self, "_tmp_dir", None)
-                        if cache_parent is not None:
-                            os.makedirs(cache_parent, exist_ok=True)
+                        self._rsa_residual_cache = None
+                        self._rsa_residual_cache_key = None
+                        cache_parent = residual_io.resolve_cache_dir(
+                            residual_settings, getattr(self, "_tmp_dir", None))
+                        logger.info("RSA residual cache root: %s", cache_parent)
                         cache = residual_io.ResidualRunCache(
                             residual_paths, betas,
                             cache_dir=cache_parent,

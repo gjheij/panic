@@ -3,8 +3,30 @@
 Residuals and beta maps must share a voxel grid and affine. The caller must
 supply the final beta feature indices, in their original NumPy C-order.
 """
+import logging
+import os
+import shutil
+import tempfile
+from time import perf_counter
 from pathlib import Path
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_cache_dir(settings, existing_dir=None):
+    """Resolve temporary storage; explicit override takes precedence."""
+    location = settings.get("cache_location", "local")
+    if location not in {"local", "disk"}:
+        raise ValueError("cache_location must be local or disk")
+    root = settings.get("cache_dir")
+    if not root:
+        root = (os.environ.get("SLURM_TMPDIR") or os.environ.get("TMPDIR")
+                or tempfile.gettempdir()) if location == "local" else existing_dir
+    root = Path(root or tempfile.gettempdir()).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
 
 DEFAULT_PATTERN = ("{beta_dir}/{subject}/task-aversivechoice_space-T1w_desc-masked/"
                    "residuals/model-typed/{subject}_task-aversivechoice_run-{run:02d}_"
@@ -172,15 +194,17 @@ class ResidualRunCache:
     """
 
     def __init__(self, paths, reference_img, *, cache_dir=None, chunk_size=8):
-        import tempfile
         self.paths = tuple(Path(p) for p in paths)
         self.reference_img = reference_img
         self.n_space = int(np.prod(reference_img.shape[:3]))
+        started = perf_counter()
         self._tempdir = tempfile.TemporaryDirectory(prefix='panic-residuals-', dir=cache_dir)
         self._arrays = []
         self._lengths = []
         try:
             self._build(int(chunk_size))
+            logger.info("RSA residual cache build: directory=%s elapsed=%.3fs",
+                        self._tempdir.name, perf_counter() - started)
         except BaseException:
             self.close()
             raise
@@ -189,8 +213,19 @@ class ResidualRunCache:
         import nibabel as nib
         if chunk_size < 1:
             raise ValueError('chunk_size must be >= 1')
-        for run_i, path in enumerate(self.paths):
-            img = nib.load(str(path))
+        images = [nib.load(str(path)) for path in self.paths]
+        for path, img in zip(self.paths, images):
+            _check_grid(img, self.reference_img, str(path))
+            if len(img.shape) != 4:
+                raise ValueError(f"Expected a 4D residual NIfTI: {path}")
+        required = sum(img.shape[3] * self.n_space * 4 + 4096 for img in images)
+        free = shutil.disk_usage(self._tempdir.name).free
+        logger.info("RSA residual cache capacity: required=%.3f GiB free=%.3f GiB",
+                    required / 2**30, free / 2**30)
+        if required > free:
+            raise OSError(f"Insufficient residual cache space: need {required} bytes, available {free}")
+        for run_i, (path, img) in enumerate(zip(self.paths, images)):
+            started = perf_counter()
             _check_grid(img, self.reference_img, str(path))
             if len(img.shape) != 4:
                 raise ValueError(f'Expected 4D residual NIfTI: {path}')
@@ -210,22 +245,32 @@ class ResidualRunCache:
             del out
             self._arrays.append(np.load(out_path, mmap_mode='r'))
             self._lengths.append(n_time)
+            logger.info("RSA residual cache run: file=%s shape=%s elapsed=%.3fs",
+                        path.name, (n_time, self.n_space), perf_counter() - started)
 
     def extract(self, feature_indices, *, center_per_run=True):
         idx = np.asarray(feature_indices, dtype=int)
         if idx.ndim != 1 or idx.size == 0 or np.any(idx < 0) or np.any(idx >= self.n_space):
             raise ValueError('Invalid beta feature indices')
+        started = perf_counter()
         matrices, groups = [], []
         for run_i, array in enumerate(self._arrays):
+            read_started = perf_counter()
             r = np.asarray(array[:, idx], dtype=np.float64)
+            logger.debug("RSA residual cache read: file=%s shape=%s elapsed=%.3fs",
+                         self.paths[run_i].name, r.shape, perf_counter() - read_started)
             if not np.isfinite(r).all():
                 raise ValueError(f'Nonfinite residuals in selected voxels: {self.paths[run_i]}')
             if center_per_run:
                 r -= r.mean(axis=0, keepdims=True)
             matrices.append(r)
             groups.append(np.full(r.shape[0], run_i, dtype=int))
-        return np.concatenate(matrices), np.concatenate(groups)
+        result = np.concatenate(matrices), np.concatenate(groups)
+        logger.info("RSA residual cache extract: shape=%s elapsed=%.3fs",
+                    result[0].shape, perf_counter() - started)
+        return result
 
     def close(self):
         self._arrays.clear()
         self._tempdir.cleanup()
+        logger.debug("RSA residual cache removed: %s", self._tempdir.name)
