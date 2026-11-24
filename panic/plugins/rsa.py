@@ -28,6 +28,8 @@ estimate of the voxelwise measurement-noise covariance.
 from __future__ import annotations
 
 import os
+import logging
+from time import perf_counter
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -37,6 +39,10 @@ from scipy.stats import pearsonr, spearmanr
 from sklearn.covariance import LedoitWolf
 
 from panic.utils import load_feature_matrix
+
+# PANIC configures root handlers and subject context centrally.
+# get_logger() would reinitialize those handlers, so do not call it here.
+logger = logging.getLogger(__name__)
 
 ArrayLike = Union[np.ndarray, Any]
 PathLike = Union[str, os.PathLike[str], Path]
@@ -204,9 +210,18 @@ def _precision_matrix(n_features: int, noise_normalization: str,
         if not np.isfinite(variances).all() or np.any(variances <= 0):
             raise ValueError("Residual variances must be finite and positive.")
         return np.diag(1.0 / variances)
-    covariance = LedoitWolf(assume_centered=True).fit(noise_residuals).covariance_
+    started = perf_counter()
+    logger.debug("RSA Ledoit-Wolf fitting: residuals=%s", noise_residuals.shape)
+    estimator = LedoitWolf(assume_centered=True).fit(noise_residuals)
+    covariance = estimator.covariance_
+    logger.debug("RSA covariance fitted: shrinkage=%.6g elapsed=%.3fs",
+                 estimator.shrinkage_, perf_counter() - started)
     try:
-        return np.linalg.inv(covariance)
+        started = perf_counter()
+        precision = np.linalg.inv(covariance)
+        logger.debug("RSA precision inversion: features=%d elapsed=%.3fs",
+                     n_features, perf_counter() - started)
+        return precision
     except np.linalg.LinAlgError as exc:
         raise ValueError("Shrinkage noise covariance is not invertible.") from exc
 
@@ -303,6 +318,8 @@ def crossnobis_rdm(
             if mask.any():
                 run_patterns[ri, ci] = X[mask].mean(axis=0)
 
+    logger.debug("RSA run-condition counts: runs=%s conditions=%s counts=%s",
+                 runs.tolist(), conds, trial_counts.tolist())
     # Use residual-derived precision, never infer it from the target betas.
     precision = _precision_matrix(n_features, noise_normalization, noise_residuals)
 
@@ -429,6 +446,10 @@ def rsa_plugin(
     * Model fits are descriptive correlations. Their statistical comparison
       should be conducted across independent subjects.
     """
+    started = perf_counter()
+    # Artifact-producing observed calls are normally ROI analyses; keep
+    # permutation and searchlight calls quiet at INFO level.
+    log_level = logging.INFO if return_artifacts and not permute and cols is None else logging.DEBUG
     X = np.asarray(load_feature_matrix(X_path, cols=cols), dtype=float)
     y = np.asarray(labels).reshape(-1).copy()
     if X.ndim != 2 or X.shape[0] != len(y) or X.shape[1] == 0:
@@ -458,6 +479,8 @@ def rsa_plugin(
     if absent:
         raise ValueError(f"Requested RSA conditions absent from data: {absent}")
     patterns = np.vstack([X[y == c].mean(axis=0) for c in conds])
+    logger.log(log_level, "RSA input: X=%s metric=%s compare=%s runs=%s conditions=%s permute=%s",
+               X.shape, metric, compare, None if g is None else np.unique(g).tolist(), conds, permute)
 
     pair_counts = trial_counts = run_patterns = None
     if metric == "crossnobis":
@@ -466,6 +489,9 @@ def rsa_plugin(
         residuals = None
         if noise_residuals is not None and noise_normalization != "identity":
             residuals = _load_noise_residuals(noise_residuals, cols, X.shape[1])
+        logger.log(log_level, "RSA crossnobis: normalization=%s residuals=%s min_partitions=%d normalize_by_features=%s",
+                   noise_normalization, None if residuals is None else residuals.shape,
+                   min_partitions, normalize_by_features)
         neural_rdm, pair_counts, trial_counts, run_patterns = crossnobis_rdm(
             X, y, g, conds,
             noise_residuals=residuals,
@@ -479,6 +505,13 @@ def rsa_plugin(
         neural_rdm = squareform(pdist(patterns, metric=metric))
 
     neural_vec = _rdm_vector(neural_rdm)
+    if logger.isEnabledFor(log_level):
+        logger.log(log_level, "RSA RDM: finite_pairs=%d/%d negative_pairs=%d",
+                   np.isfinite(neural_vec).sum(), neural_vec.size, (neural_vec < 0).sum())
+        if trial_counts is not None:
+            logger.log(log_level, "RSA partition QC: missing_run_condition_cells=%d/%d ordered_pair_counts=%s",
+                       (trial_counts == 0).sum(), trial_counts.size,
+                       np.unique(_rdm_vector(pair_counts)).astype(int).tolist())
     model_scores: Dict[str, float] = {}
     model_mats: Dict[str, np.ndarray] = {}
     if not model_rdms:
@@ -502,6 +535,8 @@ def rsa_plugin(
             )
         score = float(model_scores[target_model])
 
+    logger.log(log_level, "RSA complete: target=%s score=%.6g models=%s elapsed=%.3fs",
+               target_model, score, model_scores, perf_counter() - started)
     if not return_artifacts:
         return score
     artifacts: ArtifactDict = {
