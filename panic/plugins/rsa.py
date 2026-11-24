@@ -107,7 +107,7 @@ def estimate_beta_noise_covariance(
     residuals = np.vstack(residuals)
 
     if shrinkage:
-        return LedoitWolf().fit(residuals).covariance_
+        return LedoitWolf(store_precision=False).fit(residuals).covariance_
 
     return np.cov(residuals, rowvar=False)
 
